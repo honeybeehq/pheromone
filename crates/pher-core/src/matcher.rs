@@ -1,8 +1,10 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use std::collections::HashMap;
+
 use crate::envelope::Envelope;
-use crate::expr::{eval_bool, EvalCtx};
+use crate::expr::{eval_bool, BoundPath, EvalCtx, Expr, Field, PathCache};
 use crate::subject::SubjectTrie;
 use crate::subscription::Subscription;
 
@@ -71,14 +73,19 @@ pub fn check(sub: &Subscription, event: &Envelope, origin: Option<&Envelope>) ->
     if !sub.on.iter().any(|p| p.matches(&event.subject)) {
         return Check::RejectOn;
     }
+    check_after_subject(sub, &EvalCtx::new(event, origin))
+}
+
+/// Tiers 1b–2 only — for candidates that already passed the subject trie,
+/// where re-verifying `on` would be pure waste.
+fn check_after_subject<'a>(sub: &'a Subscription, ctx: &EvalCtx<'a>) -> Check {
     if let Some(from) = &sub.from {
-        if !from.matches(&event.source) && !from.matches(&event.node) {
+        if !from.matches(&ctx.event.source) && !from.matches(&ctx.event.node) {
             return Check::RejectFrom;
         }
     }
     if let Some(expr) = &sub.where_expr {
-        let ctx = EvalCtx { event, origin };
-        if !matches!(eval_bool(expr, &ctx), Ok(true)) {
+        if !matches!(eval_bool(expr, ctx), Ok(true)) {
             return Check::RejectWhere;
         }
     }
@@ -136,7 +143,7 @@ pub fn evaluate(
     // Tier 2 — where.
     let mut where_rec = None;
     if let Some(expr) = &sub.where_expr {
-        let ctx = EvalCtx { event, origin };
+        let ctx = EvalCtx::new(event, origin);
         match eval_bool(expr, &ctx) {
             Ok(true) => {
                 where_rec = Some(WhereRecord {
@@ -212,22 +219,25 @@ struct Entry {
     sub: Subscription,
 }
 
-/// A set of registered subscriptions with a subject-trie prefilter.
+/// A set of registered subscriptions with a subject-trie prefilter and a
+/// path interner: every distinct non-`$origin` where-path gets a slot so it
+/// resolves at most once per event across all candidates.
 #[derive(Default)]
 pub struct Matcher {
     entries: Vec<Entry>,
     trie: SubjectTrie<usize>,
+    path_slots: HashMap<(Field, Vec<String>), u32>,
 }
 
 impl Matcher {
     pub fn new() -> Self {
-        Matcher {
-            entries: Vec::new(),
-            trie: SubjectTrie::new(),
-        }
+        Matcher::default()
     }
 
-    pub fn insert(&mut self, id: impl Into<String>, sub: Subscription) {
+    pub fn insert(&mut self, id: impl Into<String>, mut sub: Subscription) {
+        if let Some(expr) = &mut sub.where_expr {
+            assign_slots(expr, &mut self.path_slots);
+        }
         let idx = self.entries.len();
         for p in &sub.on {
             self.trie.insert(p, idx);
@@ -280,14 +290,46 @@ impl Matcher {
 
     /// Hot path: ids of subscriptions whose tier 1–2 cascade passes, with no
     /// explanation allocation for the (vast) non-matching majority.
+    /// Convenience wrapper; sustained ingest loops should hold a [`Scratch`]
+    /// and call [`Matcher::match_ids_with`].
     pub fn match_ids(&self, event: &Envelope) -> Vec<&str> {
-        self.candidate_idxs(event)
-            .iter()
-            .filter_map(|&i| {
-                let e = &self.entries[i];
-                (check(&e.sub, event, None) == Check::Matched).then_some(e.id.as_str())
-            })
-            .collect()
+        let mut scratch = Scratch::new();
+        let mut out = Vec::new();
+        self.match_ids_with(event, &mut scratch, &mut out);
+        out
+    }
+
+    /// Zero-allocation-per-event matching: candidates are deduplicated with an
+    /// epoch-stamped seen table and both buffers are reused across calls.
+    pub fn match_ids_with<'m>(
+        &'m self,
+        event: &Envelope,
+        scratch: &mut Scratch,
+        out: &mut Vec<&'m str>,
+    ) {
+        out.clear();
+        scratch.begin(self.entries.len());
+        let epoch = scratch.epoch;
+        scratch.idxs.clear();
+        {
+            let idxs = &mut scratch.idxs;
+            let seen = &mut scratch.seen;
+            self.trie.for_each_match(&event.subject, |&i| {
+                if seen[i] != epoch {
+                    seen[i] = epoch;
+                    idxs.push(i);
+                }
+            });
+        }
+        let cache = PathCache::new();
+        let mut ctx = EvalCtx::new(event, None);
+        ctx.cache = Some(&cache);
+        for &i in &scratch.idxs {
+            let e = &self.entries[i];
+            if check_after_subject(&e.sub, &ctx) == Check::Matched {
+                out.push(e.id.as_str());
+            }
+        }
     }
 
     fn candidate_idxs(&self, event: &Envelope) -> Vec<usize> {
@@ -300,6 +342,64 @@ impl Matcher {
         idxs.sort_unstable();
         idxs.dedup();
         idxs
+    }
+}
+
+/// Reusable per-consumer buffers for [`Matcher::match_ids_with`].
+#[derive(Default)]
+pub struct Scratch {
+    idxs: Vec<usize>,
+    seen: Vec<u32>,
+    epoch: u32,
+}
+
+impl Scratch {
+    pub fn new() -> Self {
+        Scratch::default()
+    }
+
+    fn begin(&mut self, entries: usize) {
+        if self.seen.len() < entries {
+            self.seen.resize(entries, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // Wrapped: clear stale stamps and restart at 1.
+            self.seen.fill(0);
+            self.epoch = 1;
+        }
+    }
+}
+
+/// Walk a where-expression and assign interned slots to every cacheable
+/// (non-`$origin`) path.
+fn assign_slots(expr: &mut Expr, interner: &mut HashMap<(Field, Vec<String>), u32>) {
+    let mut slot_of = |bp: &mut BoundPath| {
+        if bp.origin {
+            return; // origin-relative paths vary per timer; never cached
+        }
+        let next = interner.len() as u32;
+        let id = *interner.entry((bp.field, bp.segs.clone())).or_insert(next);
+        bp.slot = Some(id);
+    };
+    match expr {
+        Expr::Path(bp) | Expr::Has(bp) => slot_of(bp),
+        Expr::Not(e) | Expr::Size(e) => assign_slots(e, interner),
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::In(a, b) => {
+            assign_slots(a, interner);
+            assign_slots(b, interner);
+        }
+        Expr::Cmp(_, a, b) => {
+            assign_slots(a, interner);
+            assign_slots(b, interner);
+        }
+        Expr::Matches(a, _) => assign_slots(a, interner),
+        Expr::List(items) => {
+            for e in items {
+                assign_slots(e, interner);
+            }
+        }
+        Expr::Lit(_) => {}
     }
 }
 

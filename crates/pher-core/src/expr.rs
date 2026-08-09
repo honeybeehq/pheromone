@@ -14,8 +14,8 @@ use crate::ParseError;
 pub enum Expr {
     Lit(Value),
     List(Vec<Expr>),
-    /// Dotted path; first segment is a bound root (`payload`, `type`, …, `$origin`).
-    Path(Vec<String>),
+    /// Dotted path; root resolved at parse time (`payload`, `type`, …, `$origin`).
+    Path(BoundPath),
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
@@ -23,8 +23,113 @@ pub enum Expr {
     In(Box<Expr>, Box<Expr>),
     /// Pattern compiled at parse time and cached for the hot path.
     Matches(Box<Expr>, CachedRegex),
-    Has(Vec<String>),
+    Has(BoundPath),
     Size(Box<Expr>),
+}
+
+/// An envelope field a path can be rooted at. Resolved at parse time so the
+/// per-event hot loop never does root-name string comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Field {
+    Type,
+    Subject,
+    Source,
+    Node,
+    Ts,
+    Correlation,
+    Payload,
+}
+
+impl Field {
+    fn parse(s: &str) -> Option<Field> {
+        Some(match s {
+            "type" => Field::Type,
+            "subject" => Field::Subject,
+            "source" => Field::Source,
+            "node" => Field::Node,
+            "ts" => Field::Ts,
+            "correlation" => Field::Correlation,
+            "payload" => Field::Payload,
+            _ => return None,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Field::Type => "type",
+            Field::Subject => "subject",
+            Field::Source => "source",
+            Field::Node => "node",
+            Field::Ts => "ts",
+            Field::Correlation => "correlation",
+            Field::Payload => "payload",
+        }
+    }
+}
+
+/// A parse-time-resolved dotted path: optional `$origin` prefix, the envelope
+/// field, and any remaining segments (meaningful only under `payload`).
+#[derive(Debug, Clone)]
+pub struct BoundPath {
+    pub origin: bool,
+    pub field: Field,
+    pub segs: Vec<String>,
+    /// Per-matcher interned path id, assigned at registration; enables the
+    /// resolve-once-per-event cache. Ignored by equality and printing.
+    pub slot: Option<u32>,
+}
+
+impl PartialEq for BoundPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.origin == other.origin && self.field == other.field && self.segs == other.segs
+    }
+}
+
+impl BoundPath {
+    fn from_segments(path: Vec<String>) -> Result<BoundPath, ParseError> {
+        let (origin, rest) = if path[0] == "$origin" {
+            if path.len() < 2 {
+                return Err(ParseError::new(
+                    "unknown field '$origin' (use $origin.type/.subject/.source/.node/.ts/.correlation/.payload)",
+                ));
+            }
+            (true, &path[1..])
+        } else {
+            (false, &path[..])
+        };
+        let field = Field::parse(&rest[0]).ok_or_else(|| {
+            if origin {
+                ParseError::new(format!(
+                    "unknown field '$origin.{}' (use $origin.type/.subject/.source/.node/.ts/.correlation/.payload)",
+                    rest[0]
+                ))
+            } else {
+                ParseError::new(format!(
+                    "unknown identifier '{}' (bound: type, subject, source, node, ts, correlation, payload, $origin)",
+                    rest[0]
+                ))
+            }
+        })?;
+        Ok(BoundPath {
+            origin,
+            field,
+            segs: rest[1..].to_vec(),
+            slot: None,
+        })
+    }
+}
+
+impl std::fmt::Display for BoundPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.origin {
+            write!(f, "$origin.")?;
+        }
+        write!(f, "{}", self.field.name())?;
+        for seg in &self.segs {
+            write!(f, ".{seg}")?;
+        }
+        Ok(())
+    }
 }
 
 /// A regex validated and compiled once at parse time. Equality is on the
@@ -86,17 +191,6 @@ impl CmpOp {
     }
 }
 
-const ROOTS: &[&str] = &[
-    "type",
-    "subject",
-    "source",
-    "node",
-    "ts",
-    "correlation",
-    "payload",
-    "$origin",
-];
-
 impl Expr {
     pub fn parse_str(input: &str) -> Result<Expr, ParseError> {
         let toks = lex(input)?;
@@ -140,14 +234,14 @@ impl Expr {
                 let inner: Vec<String> = items.iter().map(|e| e.print(0)).collect();
                 format!("[{}]", inner.join(", "))
             }
-            Expr::Path(p) => p.join("."),
+            Expr::Path(p) => p.to_string(),
             Expr::Not(e) => format!("!{}", e.print(4)),
             Expr::And(a, b) => format!("{} && {}", a.print(2), b.print(2)),
             Expr::Or(a, b) => format!("{} || {}", a.print(1), b.print(1)),
             Expr::Cmp(op, a, b) => format!("{} {} {}", a.print(4), op.sym(), b.print(4)),
             Expr::In(a, b) => format!("{} in {}", a.print(4), b.print(4)),
             Expr::Matches(a, re) => format!("{} matches {}", a.print(4), quote(re.pattern())),
-            Expr::Has(p) => format!("has({})", p.join(".")),
+            Expr::Has(p) => format!("has({p})"),
             Expr::Size(e) => format!("size({})", e.print(0)),
         };
         if self.prec() < parent_prec {
@@ -307,8 +401,7 @@ fn parse_primary(cur: &mut Cursor) -> Result<Expr, ParseError> {
                     _ => break,
                 }
             }
-            validate_root(&path)?;
-            Ok(Expr::Path(path))
+            Ok(Expr::Path(BoundPath::from_segments(path)?))
         }
         other => Err(ParseError::new(format!(
             "expected expression, found {}",
@@ -317,7 +410,7 @@ fn parse_primary(cur: &mut Cursor) -> Result<Expr, ParseError> {
     }
 }
 
-fn parse_path(cur: &mut Cursor, func: &str) -> Result<Vec<String>, ParseError> {
+fn parse_path(cur: &mut Cursor, func: &str) -> Result<BoundPath, ParseError> {
     let mut path = Vec::new();
     loop {
         match cur.next() {
@@ -336,24 +429,7 @@ fn parse_path(cur: &mut Cursor, func: &str) -> Result<Vec<String>, ParseError> {
             break;
         }
     }
-    validate_root(&path)?;
-    Ok(path)
-}
-
-fn validate_root(path: &[String]) -> Result<(), ParseError> {
-    let root = path[0].as_str();
-    if !ROOTS.contains(&root) {
-        return Err(ParseError::new(format!(
-            "unknown identifier '{root}' (bound: type, subject, source, node, ts, correlation, payload, $origin)"
-        )));
-    }
-    if root == "$origin" && path.len() >= 2 && !ROOTS[..7].contains(&path[1].as_str()) {
-        return Err(ParseError::new(format!(
-            "unknown field '$origin.{}' (use $origin.type/.subject/.source/.node/.ts/.correlation/.payload)",
-            path[1]
-        )));
-    }
-    Ok(())
+    BoundPath::from_segments(path)
 }
 
 fn number_value(n: f64) -> Value {
@@ -375,6 +451,81 @@ fn number_value(n: f64) -> Value {
 pub struct EvalCtx<'a> {
     pub event: &'a Envelope,
     pub origin: Option<&'a Envelope>,
+    /// Optional per-event resolve cache (see [`PathCache`]). When present,
+    /// slotted non-`$origin` paths resolve at most once per event no matter
+    /// how many subscriptions reference them.
+    pub cache: Option<&'a PathCache<'a>>,
+}
+
+impl<'a> EvalCtx<'a> {
+    pub fn new(event: &'a Envelope, origin: Option<&'a Envelope>) -> Self {
+        EvalCtx {
+            event,
+            origin,
+            cache: None,
+        }
+    }
+}
+
+/// Per-event memo of slotted path resolutions, shared across all candidate
+/// subscriptions evaluated against one event. Stack-inline: real events touch
+/// a handful of distinct paths, so a small linear-scan table beats a heap
+/// allocation per event; overflow simply falls back to direct resolution.
+pub struct PathCache<'a> {
+    entries: std::cell::RefCell<InlineCache<'a>>,
+}
+
+const PATH_CACHE_CAP: usize = 16;
+
+struct InlineCache<'a> {
+    keys: [u32; PATH_CACHE_CAP],
+    vals: [Option<Option<Cow<'a, Value>>>; PATH_CACHE_CAP],
+    len: usize,
+}
+
+impl<'a> PathCache<'a> {
+    pub fn new() -> Self {
+        PathCache {
+            entries: std::cell::RefCell::new(InlineCache {
+                keys: [0; PATH_CACHE_CAP],
+                vals: [const { None }; PATH_CACHE_CAP],
+                len: 0,
+            }),
+        }
+    }
+}
+
+impl<'a> Default for PathCache<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[inline]
+fn resolve_cached<'a>(
+    bp: &'a BoundPath,
+    ctx: &EvalCtx<'a>,
+) -> Result<Option<Cow<'a, Value>>, EvalError> {
+    let (Some(slot), Some(cache)) = (bp.slot, ctx.cache) else {
+        return resolve(bp, ctx);
+    };
+    {
+        let entries = cache.entries.borrow();
+        for i in 0..entries.len {
+            if entries.keys[i] == slot {
+                return Ok(entries.vals[i].as_ref().unwrap().clone());
+            }
+        }
+    }
+    let resolved = resolve(bp, ctx)?;
+    let mut entries = cache.entries.borrow_mut();
+    if entries.len < PATH_CACHE_CAP {
+        let i = entries.len;
+        entries.keys[i] = slot;
+        entries.vals[i] = Some(resolved.clone());
+        entries.len += 1;
+    }
+    Ok(resolved)
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -390,84 +541,48 @@ pub enum EvalError {
 /// Resolve a bound path. `None` means "absent" (missing payload field or
 /// unset correlation) — distinct from JSON null only for `has()`.
 /// Payload paths borrow from the envelope; scalar roots clone small strings.
-fn resolve<'a>(path: &[String], ctx: &EvalCtx<'a>) -> Result<Option<Cow<'a, Value>>, EvalError> {
-    let (env, rest) = if path[0] == "$origin" {
-        let origin = ctx.origin.ok_or(EvalError::NoOrigin)?;
-        (origin, &path[1..])
+#[inline]
+fn resolve<'a>(path: &BoundPath, ctx: &EvalCtx<'a>) -> Result<Option<Cow<'a, Value>>, EvalError> {
+    let env = if path.origin {
+        ctx.origin.ok_or(EvalError::NoOrigin)?
     } else {
-        (ctx.event, path)
+        ctx.event
     };
-    if rest.is_empty() {
-        // Bare `$origin` — not addressable as a value.
-        return Err(EvalError::TypeMismatch(
-            "$origin must be followed by a field".to_string(),
-        ));
-    }
     let scalar = |s: &str| Some(Cow::Owned(Value::String(s.to_string())));
-    match rest[0].as_str() {
-        "type" => {
-            return Ok(if rest.len() == 1 {
-                scalar(&env.event_type)
-            } else {
-                None
-            })
+    let field: &'a str = match path.field {
+        Field::Type => &env.event_type,
+        Field::Subject => &env.subject,
+        Field::Source => &env.source,
+        Field::Node => &env.node,
+        Field::Ts => &env.ts,
+        Field::Correlation => match &env.correlation {
+            Some(c) => c,
+            None => return Ok(None),
+        },
+        Field::Payload => {
+            let mut cur: &'a Value = &env.payload;
+            for seg in &path.segs {
+                match cur {
+                    Value::Object(map) => match map.get(seg.as_str()) {
+                        Some(v) => cur = v,
+                        None => return Ok(None),
+                    },
+                    Value::Array(arr) => match seg.parse::<usize>() {
+                        Ok(i) if i < arr.len() => cur = &arr[i],
+                        _ => return Ok(None),
+                    },
+                    _ => return Ok(None),
+                }
+            }
+            return Ok(Some(Cow::Borrowed(cur)));
         }
-        "subject" => {
-            return Ok(if rest.len() == 1 {
-                scalar(&env.subject)
-            } else {
-                None
-            })
-        }
-        "source" => {
-            return Ok(if rest.len() == 1 {
-                scalar(&env.source)
-            } else {
-                None
-            })
-        }
-        "node" => {
-            return Ok(if rest.len() == 1 {
-                scalar(&env.node)
-            } else {
-                None
-            })
-        }
-        "ts" => {
-            return Ok(if rest.len() == 1 {
-                scalar(&env.ts)
-            } else {
-                None
-            })
-        }
-        "correlation" => {
-            return Ok(match (&env.correlation, rest.len()) {
-                (Some(c), 1) => scalar(c),
-                _ => None,
-            })
-        }
-        "payload" => {}
-        other => {
-            return Err(EvalError::TypeMismatch(format!(
-                "unknown root identifier '{other}'"
-            )))
-        }
-    }
-    let mut cur: &'a Value = &env.payload;
-    for seg in &rest[1..] {
-        match cur {
-            Value::Object(map) => match map.get(seg.as_str()) {
-                Some(v) => cur = v,
-                None => return Ok(None),
-            },
-            Value::Array(arr) => match seg.parse::<usize>() {
-                Ok(i) if i < arr.len() => cur = &arr[i],
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        }
-    }
-    Ok(Some(Cow::Borrowed(cur)))
+    };
+    // Scalar envelope fields have no sub-paths; `ts.year` is simply absent.
+    Ok(if path.segs.is_empty() {
+        scalar(field)
+    } else {
+        None
+    })
 }
 
 const NULL: Value = Value::Null;
@@ -486,7 +601,7 @@ fn eval_value<'a>(expr: &'a Expr, ctx: &EvalCtx<'a>) -> Result<Cow<'a, Value>, E
             }
             Ok(owned(Value::Array(out)))
         }
-        Expr::Path(p) => Ok(resolve(p, ctx)?.unwrap_or(Cow::Borrowed(&NULL))),
+        Expr::Path(p) => Ok(resolve_cached(p, ctx)?.unwrap_or(Cow::Borrowed(&NULL))),
         Expr::Not(e) => match eval_value(e, ctx)?.as_ref() {
             Value::Bool(b) => Ok(owned(Value::Bool(!b))),
             other => Err(EvalError::TypeMismatch(format!(
@@ -558,7 +673,7 @@ fn eval_value<'a>(expr: &'a Expr, ctx: &EvalCtx<'a>) -> Result<Cow<'a, Value>, E
             };
             Ok(owned(Value::Bool(re.regex().is_match(s))))
         }
-        Expr::Has(p) => Ok(owned(Value::Bool(resolve(p, ctx)?.is_some()))),
+        Expr::Has(p) => Ok(owned(Value::Bool(resolve_cached(p, ctx)?.is_some()))),
         Expr::Size(e) => {
             let v = eval_value(e, ctx)?;
             let n = match v.as_ref() {
@@ -578,7 +693,7 @@ fn eval_value<'a>(expr: &'a Expr, ctx: &EvalCtx<'a>) -> Result<Cow<'a, Value>, E
 }
 
 /// Evaluate an expression that must produce a boolean (a `where` clause).
-pub fn eval_bool(expr: &Expr, ctx: &EvalCtx) -> Result<bool, EvalError> {
+pub fn eval_bool<'a>(expr: &'a Expr, ctx: &EvalCtx<'a>) -> Result<bool, EvalError> {
     match eval_value(expr, ctx)?.as_ref() {
         Value::Bool(b) => Ok(*b),
         _ => Err(EvalError::NotBool),
@@ -606,9 +721,13 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
+#[inline]
 fn values_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
+            (Some(i), Some(j)) => i == j,
+            _ => x.as_f64() == y.as_f64(),
+        },
         _ => a == b,
     }
 }
@@ -667,13 +786,7 @@ mod tests {
     fn eval_str(expr: &str, payload: Value) -> Result<bool, EvalError> {
         let e = Expr::parse_str(expr).expect("parse");
         let envelope = env(payload);
-        eval_bool(
-            &e,
-            &EvalCtx {
-                event: &envelope,
-                origin: None,
-            },
-        )
+        eval_bool(&e, &EvalCtx::new(&envelope, None))
     }
 
     #[test]
@@ -734,22 +847,9 @@ mod tests {
         let e = Expr::parse_str("correlation == $origin.correlation").unwrap();
         let event = env(json!({}));
         let origin = env(json!({}));
-        assert!(eval_bool(
-            &e,
-            &EvalCtx {
-                event: &event,
-                origin: Some(&origin)
-            }
-        )
-        .unwrap());
+        assert!(eval_bool(&e, &EvalCtx::new(&event, Some(&origin))).unwrap());
         assert_eq!(
-            eval_bool(
-                &e,
-                &EvalCtx {
-                    event: &event,
-                    origin: None
-                }
-            ),
+            eval_bool(&e, &EvalCtx::new(&event, None)),
             Err(EvalError::NoOrigin)
         );
     }

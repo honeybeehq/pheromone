@@ -90,8 +90,17 @@ impl SubjectPattern {
     }
 
     pub fn matches(&self, subject: &str) -> bool {
-        let parts: Vec<&str> = subject.split('.').collect();
-        Self::match_toks(&self.toks, &parts)
+        let mut parts = [""; 16];
+        let mut n = 0;
+        for part in subject.split('.') {
+            if n == parts.len() {
+                let all: Vec<&str> = subject.split('.').collect();
+                return Self::match_toks(&self.toks, &all);
+            }
+            parts[n] = part;
+            n += 1;
+        }
+        Self::match_toks(&self.toks, &parts[..n])
     }
 
     fn match_toks(toks: &[PatTok], parts: &[&str]) -> bool {
@@ -185,23 +194,46 @@ impl<T> SubjectTrie<T> {
 
     /// Collect all values whose pattern matches the concrete subject.
     pub fn matches(&self, subject: &str) -> Vec<&T> {
-        let parts: Vec<&str> = subject.split('.').collect();
         let mut out = Vec::new();
-        Self::walk(&self.root, &parts, &mut out);
+        self.for_each_match(subject, |v| out.push(v));
         out
     }
 
-    fn walk<'a>(node: &'a TrieNode<T>, parts: &[&str], out: &mut Vec<&'a T>) {
+    /// Visit every value whose pattern matches, without allocating a result
+    /// vector. The hot ingest path uses this with caller-owned scratch.
+    pub fn for_each_match<'a>(&'a self, subject: &str, mut f: impl FnMut(&'a T)) {
+        let mut parts = [""; 16];
+        let mut n = 0;
+        for part in subject.split('.') {
+            if n == parts.len() {
+                // Absurdly deep subject: fall back to the allocating path.
+                let all: Vec<&str> = subject.split('.').collect();
+                Self::visit(&self.root, &all, &mut f);
+                return;
+            }
+            parts[n] = part;
+            n += 1;
+        }
+        Self::visit(&self.root, &parts[..n], &mut f);
+    }
+
+    fn visit<'a>(node: &'a TrieNode<T>, parts: &[&str], f: &mut impl FnMut(&'a T)) {
         match parts.first() {
-            None => out.extend(node.vals.iter()),
+            None => {
+                for v in &node.vals {
+                    f(v);
+                }
+            }
             Some(part) => {
                 // `**` here consumes the (non-empty) remainder.
-                out.extend(node.dstar_vals.iter());
+                for v in &node.dstar_vals {
+                    f(v);
+                }
                 if let Some(child) = node.children.get(*part) {
-                    Self::walk(child, &parts[1..], out);
+                    Self::visit(child, &parts[1..], f);
                 }
                 if let Some(star) = &node.star {
-                    Self::walk(star, &parts[1..], out);
+                    Self::visit(star, &parts[1..], f);
                 }
             }
         }

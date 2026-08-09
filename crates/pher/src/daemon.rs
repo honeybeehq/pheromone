@@ -485,10 +485,7 @@ impl State {
                 None => true,
                 Some(w) => pher_core::expr::eval_bool(
                     w,
-                    &pher_core::EvalCtx {
-                        event,
-                        origin: Some(&timer.origin),
-                    },
+                    &pher_core::EvalCtx::new(event, Some(&timer.origin)),
                 )
                 .unwrap_or(false),
             };

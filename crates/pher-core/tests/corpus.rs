@@ -291,14 +291,8 @@ fn expect_join_binds_origin() {
     let sealed_same = ev("hive.seal", "tap.hive", Some("HE.42"), json!({}));
     let sealed_other = ev("hive.seal", "tap.hive", Some("HE.99"), json!({}));
 
-    let ctx_ok = pher_core::EvalCtx {
-        event: &sealed_same,
-        origin: Some(&origin),
-    };
-    let ctx_no = pher_core::EvalCtx {
-        event: &sealed_other,
-        origin: Some(&origin),
-    };
+    let ctx_ok = pher_core::EvalCtx::new(&sealed_same, Some(&origin));
+    let ctx_no = pher_core::EvalCtx::new(&sealed_other, Some(&origin));
     let w = expect.where_expr.as_ref().unwrap();
     assert!(pher_core::expr::eval_bool(w, &ctx_ok).unwrap());
     assert!(!pher_core::expr::eval_bool(w, &ctx_no).unwrap());
