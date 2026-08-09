@@ -78,7 +78,7 @@ struct PendingWindow {
 /// Evaporation bound for batch queues (principle 6: no unbounded buffers).
 const MAX_BATCH_QUEUE: usize = 1000;
 
-struct State {
+pub(crate) struct State {
     paths: Paths,
     node: String,
     matcher: Matcher,
@@ -93,6 +93,7 @@ struct State {
     judge_tx: Option<mpsc::Sender<JudgeJob>>,
     judge_budgets: HashMap<String, JudgeBudget>,
     verdict_cache: HashMap<String, crate::judge::Verdict>,
+    conditions: crate::conditions::Conditions,
 }
 
 /// Per-subscription judge budget window. Persisted; fail-closed on exhaustion.
@@ -184,6 +185,17 @@ impl State {
             }
         }
 
+        let conditions = crate::conditions::Conditions::from_json(
+            std::fs::read_to_string(paths.conditions())
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or(Value::Null),
+            std::fs::read_to_string(paths.condition_state())
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or(Value::Null),
+        );
+
         let semantic = crate::semantic::Semantic::new(paths.clone());
         let mut state = State {
             paths,
@@ -200,6 +212,7 @@ impl State {
             judge_tx: None,
             judge_budgets,
             verdict_cache,
+            conditions,
         };
         let has_judge_subs = state
             .matcher
@@ -374,7 +387,7 @@ impl State {
 
     // -- ingest ------------------------------------------------------------
 
-    fn ingest(&mut self, partial: PartialEvent, hops: u32) -> Result<Value, String> {
+    pub(crate) fn ingest(&mut self, partial: PartialEvent, hops: u32) -> Result<Value, String> {
         let pattern = SubjectPattern::parse(&partial.subject).map_err(|e| e.to_string())?;
         if !pattern.is_concrete() {
             return Err(format!(
@@ -602,6 +615,54 @@ impl State {
             );
         }
         allowed
+    }
+
+    fn persist_conditions(&self) -> anyhow::Result<()> {
+        write_json_atomic(
+            &self.paths.conditions(),
+            &serde_json::to_value(&self.conditions.defs)?,
+        )?;
+        self.persist_condition_state()
+    }
+
+    fn persist_condition_state(&self) -> anyhow::Result<()> {
+        write_json_atomic(
+            &self.paths.condition_state(),
+            &serde_json::to_value(&self.conditions.states)?,
+        )
+    }
+
+    /// Datapoint intake: evaluate conditions here at the edge; only the
+    /// transitions become events. Returns what was emitted.
+    pub(crate) fn ingest_metric(
+        &mut self,
+        metric: &str,
+        value: f64,
+        labels: &HashMap<String, String>,
+    ) -> Vec<Value> {
+        let transitions = self.conditions.ingest(metric, value, labels, now_unix());
+        let mut emitted = Vec::new();
+        for t in &transitions {
+            let subject = if t.entered {
+                "metric.condition.entered"
+            } else {
+                "metric.condition.cleared"
+            };
+            let payload = self.conditions.event_payload(t);
+            let _ = self.ingest(
+                PartialEvent {
+                    subject: subject.to_string(),
+                    payload: Some(payload),
+                    event_type: None,
+                    source: Some("tap.metrics".to_string()),
+                    correlation: None,
+                },
+                0,
+            );
+            emitted.push(json!({ "condition": t.condition, "transition": subject }));
+        }
+        let _ = self.persist_condition_state();
+        emitted
     }
 
     /// Deliver a tier-4 match: extend the block with meaning + judge records.
@@ -1232,6 +1293,10 @@ fn gc_jsonl(path: &std::path::Path, keep: impl Fn(&Value) -> bool) -> anyhow::Re
 // ---------------------------------------------------------------------------
 
 pub fn run(paths: Paths) -> anyhow::Result<()> {
+    // Fail fast on ingress misconfiguration (e.g. public bind without token)
+    // before any socket exists or lifecycle events fire.
+    let http_cfg = crate::http::resolve_config()?;
+
     let sock_path = paths.sock();
     if sock_path.exists() {
         // Stale socket from a crashed daemon, or a live one. Try connecting.
@@ -1305,6 +1370,11 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    // HTTP ingress (webhooks, remote emit, metric intake) if configured.
+    if let Some(http_cfg) = http_cfg {
+        crate::http::start(Arc::clone(&state), http_cfg)?;
     }
 
     // Housekeeping: expect-timer expiry every second, GC sweep every 10 minutes.
@@ -1402,6 +1472,7 @@ fn handle_request(
                     "tails": s.tails.len(),
                     "retention": format!("{}s", s.retention_secs),
                     "semantic": s.semantic.status(),
+                    "conditions": s.conditions.defs.len(),
                     "judge": match &s.judge_cfg {
                         Some(c) => json!({
                             "configured": true,
@@ -1414,6 +1485,30 @@ fn handle_request(
                     "home": s.paths.home.display().to_string(),
                 })),
             )?;
+        }
+        Request::ConditionAdd { def } => {
+            let result = serde_json::from_value::<crate::conditions::ConditionDef>(def)
+                .map_err(|e| format!("invalid condition: {e}"))
+                .and_then(|d| {
+                    let mut s = state.lock().unwrap();
+                    s.conditions.add(d)?;
+                    s.persist_conditions().map_err(|e| e.to_string())?;
+                    Ok(())
+                });
+            match result {
+                Ok(()) => respond(stream, &ok(json!({})))?,
+                Err(e) => respond(stream, &err(e))?,
+            }
+        }
+        Request::ConditionLs => {
+            let s = state.lock().unwrap();
+            respond(stream, &ok(json!({ "conditions": s.conditions.status() })))?;
+        }
+        Request::ConditionRm { name } => {
+            let mut s = state.lock().unwrap();
+            let removed = s.conditions.remove(&name);
+            let _ = s.persist_conditions();
+            respond(stream, &ok(json!({ "removed": removed })))?;
         }
         Request::Why { delivery_id } => {
             let s = state.lock().unwrap();

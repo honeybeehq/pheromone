@@ -33,6 +33,13 @@ pub enum Request {
         event: String,
     },
     Status,
+    ConditionAdd {
+        def: Value,
+    },
+    ConditionLs,
+    ConditionRm {
+        name: String,
+    },
 }
 
 /// Envelope fields a producer may supply; the daemon fills id/ts/node/seq.

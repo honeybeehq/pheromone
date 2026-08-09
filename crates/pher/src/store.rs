@@ -62,6 +62,14 @@ impl Paths {
     pub fn judge_budgets(&self) -> PathBuf {
         self.home.join("judge_budgets.json")
     }
+
+    pub fn conditions(&self) -> PathBuf {
+        self.home.join("conditions.json")
+    }
+
+    pub fn condition_state(&self) -> PathBuf {
+        self.home.join("condition_state.json")
+    }
 }
 
 /// Atomic-ish JSON write: temp file + rename, so kill -9 never leaves a torn file.

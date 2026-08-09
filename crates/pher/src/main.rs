@@ -1,5 +1,7 @@
 mod client;
+mod conditions;
 mod daemon;
+mod http;
 mod judge;
 mod protocol;
 mod semantic;
@@ -123,6 +125,42 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TapCmd,
     },
+    /// Manage metric conditions (datapoints in, transitions out)
+    Condition {
+        #[command(subcommand)]
+        cmd: ConditionCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConditionCmd {
+    /// Add a condition, e.g.: pher condition add p95_high --metric p95_latency --gt 800 --for 5m --label env=prod
+    Add {
+        name: String,
+        #[arg(long)]
+        metric: String,
+        #[arg(long)]
+        gt: Option<f64>,
+        #[arg(long)]
+        lt: Option<f64>,
+        #[arg(long)]
+        ge: Option<f64>,
+        #[arg(long)]
+        le: Option<f64>,
+        /// Predicate must hold this long before entering (e.g. 5m)
+        #[arg(long = "for", default_value = "0s")]
+        hold: String,
+        /// Required labels, repeatable: --label env=prod
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    /// List conditions with live state
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a condition
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -357,6 +395,78 @@ fn run() -> anyhow::Result<()> {
         } => {
             tap::run_hive_tap(&paths, &since)?;
         }
+        Cmd::Condition { cmd } => match cmd {
+            ConditionCmd::Add {
+                name,
+                metric,
+                gt,
+                lt,
+                ge,
+                le,
+                hold,
+                labels,
+            } => {
+                let ops = [("gt", gt), ("lt", lt), ("ge", ge), ("le", le)];
+                let set: Vec<_> = ops.iter().filter(|(_, v)| v.is_some()).collect();
+                let (op, threshold) = match set.as_slice() {
+                    [(op, Some(t))] => (op.to_string(), *t),
+                    [] => bail!("one of --gt/--lt/--ge/--le is required"),
+                    _ => bail!("exactly one of --gt/--lt/--ge/--le, not several"),
+                };
+                let mut label_map = serde_json::Map::new();
+                for l in labels {
+                    let (k, v) = l.split_once('=').context("--label expects key=value")?;
+                    label_map.insert(k.to_string(), Value::String(v.to_string()));
+                }
+                let def = serde_json::json!({
+                    "name": name,
+                    "metric": metric,
+                    "op": op,
+                    "threshold": threshold,
+                    "hold": hold,
+                    "labels": label_map,
+                });
+                client::call(&paths, &Request::ConditionAdd { def })?;
+                println!("condition '{name}' added");
+            }
+            ConditionCmd::Ls { json } => {
+                let response = client::call(&paths, &Request::ConditionLs)?;
+                let conditions = response["conditions"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&conditions)?);
+                } else if conditions.is_empty() {
+                    println!("no conditions");
+                } else {
+                    for c in conditions {
+                        println!(
+                            "{}  {} {} {} for {}  [{}] last={}",
+                            c["name"].as_str().unwrap_or("?"),
+                            c["metric"].as_str().unwrap_or("?"),
+                            c["op"].as_str().unwrap_or("?"),
+                            c["threshold"],
+                            c["hold"].as_str().unwrap_or("?"),
+                            if c["active"].as_bool() == Some(true) {
+                                "ACTIVE"
+                            } else {
+                                "clear"
+                            },
+                            c["lastValue"],
+                        );
+                    }
+                }
+            }
+            ConditionCmd::Rm { name } => {
+                let response = client::call(&paths, &Request::ConditionRm { name: name.clone() })?;
+                if response["removed"].as_bool() == Some(true) {
+                    println!("removed {name}");
+                } else {
+                    bail!("no condition '{name}'");
+                }
+            }
+        },
     }
     Ok(())
 }

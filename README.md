@@ -55,6 +55,16 @@ What works today:
 - **Lifecycle:** `for <ttl>` evaporation, `limit <n>` one/n-shot, `since <lookback>`
   replay, `expect ... within ... else` absence timers with `$origin` join — all working.
   Retention GC (default 7d, `PHER_RETENTION`) from day one.
+- **HTTP ingress** (`PHER_HTTP=127.0.0.1:4870`, or a tailnet address +
+  `PHER_HTTP_TOKEN` — public binds without a token are refused at startup):
+  `POST /webhook/<name>` (generic webhook tap, HMAC-SHA256 verified via
+  `PHER_WEBHOOK_SECRET[_<NAME>]`, events land as `webhook.<name>`),
+  `POST /emit` (remote emit from other nodes), `POST /metric` (datapoint
+  intake), `GET /healthz`.
+- **Metric condition engine** (`pher condition add p95_high --metric
+  p95_latency --gt 800 --for 5m --label env=prod`): conditions evaluate at
+  the tap edge and only transitions become events (`metric.condition.entered`
+  / `.cleared`) — the raw firehose never hits the matcher or the log.
 - **Hive ledger tap** (`pher tap hive`) — the flagship: follows
   `hive events --follow --json` and puts every ledger event on the bus as
   `hive.<type>`, correlation mapped from session/bee fields. The ~160-type
