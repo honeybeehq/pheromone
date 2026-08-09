@@ -1,0 +1,6 @@
+{"subject": "hive.seal", "source": "tap.hive", "correlation": "HE.a3f", "payload": {"status": "blocked", "bee": "CL.6308", "reason": "auth token expired"}}
+{"subject": "hive.seal", "source": "tap.hive", "payload": {"status": "done", "bee": "CL.1111"}}
+{"subject": "ci.github.run.completed", "source": "tap.github", "payload": {"conclusion": "failure", "branch": "main", "run_id": 812}}
+{"subject": "ci.github.run.completed", "source": "tap.github", "payload": {"conclusion": "success", "branch": "main", "run_id": 813}}
+{"subject": "metric.condition.entered", "source": "tap.metrics", "payload": {"name": "p95_latency", "env": "prod", "value_ms": 950}}
+{"subject": "crash.sentry.backend", "source": "tap.sentry", "payload": {"title": "OOM in worker", "level": "fatal"}}
