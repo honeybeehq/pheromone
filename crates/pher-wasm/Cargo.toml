@@ -1,0 +1,15 @@
+[package]
+name = "pher-wasm"
+description = "@pheromone/wasm — tiers 1-2 matcher for edge/browser (filter-at-source)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pher-core = { path = "../pher-core" }
+serde_json.workspace = true
+wasm-bindgen = "0.2"
