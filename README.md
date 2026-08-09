@@ -37,10 +37,20 @@ What works today:
 - **Lifecycle:** `for <ttl>` evaporation, `limit <n>` one/n-shot, `since <lookback>`
   replay, `expect ... within ... else` absence timers with `$origin` join — all working.
   Retention GC (default 7d, `PHER_RETENTION`) from day one.
-- **Benchmarks:** `cargo run --release -p pher-core --example bench` — ~18k events/sec
-  through tiers 1–2 with 10k standing subscriptions in a deliberately harsh workload
-  (~470 trie candidates/event); candidate-set size, not subscription count, is the cost
-  driver. Optimization toward the 50k target continues in slice 1 polish.
+- **Hive ledger tap** (`pher tap hive`) — the flagship: follows
+  `hive events --follow --json` and puts every ledger event on the bus as
+  `hive.<type>`, correlation mapped from session/bee fields. The ~160-type
+  stream with zero programmatic subscribers has its subscriber.
+- **`@pheromone/core` Node addon** (napi-rs, `crates/pher-node`) — the same
+  matcher in-process for TS consumers: `parse`/`fmt`/`canon`/`validate`/
+  `evaluate`/`whyNot` plus a standing `Matcher` class. Build with
+  `npm run build`, smoke-test with `node test.mjs`.
+- **Benchmarks:** `cargo run --release -p pher-core --example bench` — with 10k
+  standing subscriptions, ~49k events/sec through tiers 1–2 in a deliberately
+  pathological workload (33% `ns.**` catch-alls ⇒ ~470 candidates/event) and
+  ~290k events/sec in a realistic one (2% catch-alls). Roadmap target met. Key
+  mechanics: trie candidates skip tier-1 rechecks, parse-time path binding, and
+  a per-event path cache so each distinct `where` path resolves once per event.
 
 Build: `cargo build --release` → `target/release/pher`. Test: `cargo test`.
 

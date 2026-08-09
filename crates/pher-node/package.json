@@ -1,0 +1,12 @@
+{
+  "name": "@pheromone/core",
+  "version": "0.1.0",
+  "description": "In-process Pheromone matcher: parse/validate/format subscriptions, dry-run events, standing Matcher",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "scripts": {
+    "build": "bash ./build.sh",
+    "test": "node test.mjs"
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "pher-node"
+description = "@pheromone/core — in-process Pheromone matcher for Node (napi-rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pher-core = { path = "../pher-core" }
+serde_json.workspace = true
+napi = { version = "2", default-features = false, features = ["napi8", "serde-json"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"
