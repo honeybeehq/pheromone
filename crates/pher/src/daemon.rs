@@ -61,6 +61,23 @@ struct TailClient {
     subject: Option<SubjectPattern>,
 }
 
+/// An open delivery-shaping window for one subscription (`every`/`batch`).
+/// Persisted so kill -9 loses at most the current window's timing, never
+/// its queued events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingWindow {
+    mode: String, // "debounce" | "batch"
+    #[serde(rename = "windowEnd")]
+    window_end: u64,
+    events: Vec<Envelope>,
+    /// Events collapsed (debounce) or dropped over the queue cap (batch).
+    #[serde(default)]
+    collapsed: u64,
+}
+
+/// Evaporation bound for batch queues (principle 6: no unbounded buffers).
+const MAX_BATCH_QUEUE: usize = 1000;
+
 struct State {
     paths: Paths,
     node: String,
@@ -68,6 +85,7 @@ struct State {
     metas: HashMap<String, SubMeta>,
     next_seq: u64,
     timers: Vec<Timer>,
+    pending: HashMap<String, PendingWindow>,
     tails: Vec<TailClient>,
     retention_secs: u64,
 }
@@ -105,6 +123,11 @@ impl State {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
 
+        let pending: HashMap<String, PendingWindow> = std::fs::read_to_string(paths.pending())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+
         let mut state = State {
             paths,
             node,
@@ -112,6 +135,7 @@ impl State {
             metas,
             next_seq,
             timers,
+            pending,
             tails: Vec::new(),
             retention_secs,
         };
@@ -159,16 +183,34 @@ impl State {
             );
         }
         match sub.then.sink {
-            Sink::Cmd | Sink::Emit | Sink::Buz => {}
-            other => {
-                return Err(format!(
-                    "sink '{}' is not implemented yet in the prototype (available: cmd, emit, buz)",
-                    other.name()
-                ))
+            Sink::Buz if sub.then.args.is_empty() => {
+                return Err("'then buz' requires a bee name".to_string());
             }
-        }
-        if sub.then.sink == Sink::Buz && sub.then.args.is_empty() {
-            return Err("'then buz' requires a bee name".to_string());
+            Sink::Http => {
+                let method_ok = sub.then.args.first().is_some_and(|m| {
+                    matches!(
+                        m.to_uppercase().as_str(),
+                        "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+                    )
+                });
+                let url_ok = sub
+                    .then
+                    .args
+                    .get(1)
+                    .is_some_and(|u| u.starts_with("http://") || u.starts_with("https://"));
+                if !method_ok || !url_ok {
+                    return Err(
+                        "'then http' requires a method and url: http POST https://...".to_string(),
+                    );
+                }
+            }
+            Sink::Hermes | Sink::Pol | Sink::Hive if sub.then.args.is_empty() => {
+                return Err(format!(
+                    "'then {}' requires arguments",
+                    sub.then.sink.name()
+                ));
+            }
+            _ => {}
         }
         if sub.then.sink == Sink::Emit {
             match sub.then.args.first() {
@@ -190,12 +232,6 @@ impl State {
             _ => None,
         };
         let mut warnings: Vec<String> = Vec::new();
-        if !matches!(sub.delivery, pher_core::Delivery::Immediate) {
-            warnings.push(
-                "delivery shaping (every/batch) is not enforced yet; delivering immediately"
-                    .to_string(),
-            );
-        }
         if matches!(sub.lifetime, pher_core::Lifetime::Lease { .. }) {
             warnings.push(
                 "lease liveness (while ... alive) is not heartbeat-checked yet; \
@@ -309,8 +345,9 @@ impl State {
         Ok((seq, deliveries))
     }
 
-    /// Deliver `event` to subscription `sub_id` if its cascade matches.
-    /// Returns Some(count) when a delivery happened.
+    /// Run `event` through subscription `sub_id`'s cascade; on match, deliver
+    /// immediately or queue into the subscription's shaping window.
+    /// Returns Some(delivered-count) when the event matched (0 = queued).
     fn try_deliver(&mut self, sub_id: &str, event: &Envelope) -> Option<u64> {
         let sub = self.matcher.get(sub_id)?.clone();
         let eval = evaluate(sub_id, &sub, event, None);
@@ -318,8 +355,117 @@ impl State {
             return None;
         }
         let mut block = eval.match_block?;
-        self.deliver(sub_id, &sub, event, &mut block);
-        Some(1)
+        match &sub.delivery {
+            pher_core::Delivery::Immediate => {
+                self.deliver(sub_id, &sub, event, &mut block, None);
+                Some(1)
+            }
+            pher_core::Delivery::Debounce { window } => {
+                if let Some(p) = self.pending.get_mut(sub_id) {
+                    // Window open: collapse to the latest event, deliver at close.
+                    p.events = vec![event.clone()];
+                    p.collapsed += 1;
+                    let _ = self.persist_pending();
+                    Some(0)
+                } else {
+                    // Leading edge delivers immediately, then the window arms.
+                    self.deliver(sub_id, &sub, event, &mut block, None);
+                    self.pending.insert(
+                        sub_id.to_string(),
+                        PendingWindow {
+                            mode: "debounce".to_string(),
+                            window_end: now_unix() + window.secs(),
+                            events: Vec::new(),
+                            collapsed: 0,
+                        },
+                    );
+                    let _ = self.persist_pending();
+                    Some(1)
+                }
+            }
+            pher_core::Delivery::Batch { window } => {
+                let p = self
+                    .pending
+                    .entry(sub_id.to_string())
+                    .or_insert_with(|| PendingWindow {
+                        mode: "batch".to_string(),
+                        window_end: now_unix() + window.secs(),
+                        events: Vec::new(),
+                        collapsed: 0,
+                    });
+                if p.events.len() >= MAX_BATCH_QUEUE {
+                    p.events.remove(0);
+                    p.collapsed += 1;
+                }
+                p.events.push(event.clone());
+                let _ = self.persist_pending();
+                Some(0)
+            }
+        }
+    }
+
+    fn persist_pending(&self) -> anyhow::Result<()> {
+        write_json_atomic(&self.paths.pending(), &serde_json::to_value(&self.pending)?)
+    }
+
+    /// Close expired shaping windows: debounce delivers the trailing collapsed
+    /// event (and re-arms), batch delivers the accumulated set once.
+    fn fire_shaping_windows(&mut self) {
+        let now = now_unix();
+        let due: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.window_end <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for sub_id in due {
+            let Some(p) = self.pending.remove(&sub_id) else {
+                continue;
+            };
+            let Some(sub) = self.matcher.get(&sub_id).cloned() else {
+                let _ = self.persist_pending();
+                continue; // subscription evaporated while the window was open
+            };
+            if p.events.is_empty() {
+                // Idle debounce window: nothing suppressed, just disarm.
+                let _ = self.persist_pending();
+                continue;
+            }
+            let last = p.events.last().unwrap().clone();
+            let eval = evaluate(&sub_id, &sub, &last, None);
+            let Some(mut block) = eval.match_block else {
+                let _ = self.persist_pending();
+                continue;
+            };
+            let shaping = if p.mode == "batch" {
+                json!({
+                    "mode": "batch",
+                    "count": p.events.len(),
+                    "droppedOverCap": p.collapsed,
+                    "events": p.events,
+                })
+            } else {
+                json!({ "mode": "debounce", "collapsed": p.collapsed })
+            };
+            self.deliver(&sub_id, &sub, &last, &mut block, Some(shaping));
+            if p.mode == "debounce" {
+                // Re-arm so a burst can't exceed one delivery per window.
+                if let pher_core::Delivery::Debounce { window } = &sub.delivery {
+                    if self.metas.contains_key(&sub_id) {
+                        self.pending.insert(
+                            sub_id.clone(),
+                            PendingWindow {
+                                mode: "debounce".to_string(),
+                                window_end: now_unix() + window.secs(),
+                                events: Vec::new(),
+                                collapsed: 0,
+                            },
+                        );
+                    }
+                }
+            }
+            let _ = self.persist_pending();
+        }
     }
 
     fn deliver(
@@ -328,6 +474,7 @@ impl State {
         sub: &Subscription,
         event: &Envelope,
         block: &mut MatchBlock,
+        shaping: Option<Value>,
     ) {
         let n = {
             let meta = match self.metas.get_mut(sub_id) {
@@ -340,14 +487,17 @@ impl State {
         let delivery_id = format!("{sub_id}:{}:{n}", event.id);
         block.delivery_id = Some(delivery_id.clone());
 
-        let sink_result = self.run_sink(sub, event, block, &delivery_id);
-        let record = json!({
+        let sink_result = self.run_sink(sub, event, block, &delivery_id, shaping.as_ref());
+        let mut record = json!({
             "deliveryId": delivery_id,
             "ts": now_ts(),
             "event": event,
             "match": block,
             "sink": sink_result,
         });
+        if let Some(shaping) = &shaping {
+            record["shaping"] = shaping.clone();
+        }
         let _ = self.append_jsonl(&self.paths.deliveries(), &record);
 
         // n-shot subscriptions retire after their last delivery.
@@ -365,8 +515,12 @@ impl State {
         event: &Envelope,
         block: &MatchBlock,
         delivery_id: &str,
+        shaping: Option<&Value>,
     ) -> Value {
-        let delivery_json = json!({ "event": event, "match": block });
+        let mut delivery_json = json!({ "event": event, "match": block });
+        if let Some(shaping) = shaping {
+            delivery_json["shaping"] = shaping.clone();
+        }
         match sub.then.sink {
             Sink::Cmd => {
                 let cmdline = sub.then.args.join(" ");
@@ -431,7 +585,39 @@ impl State {
                     Err(e) => json!({ "sink": "buz", "bee": bee, "error": e.to_string() }),
                 }
             }
-            _ => json!({ "sink": sub.then.sink.name(), "error": "sink not implemented" }),
+            Sink::Http => {
+                // `then http POST <url>` — delivery JSON as the request body,
+                // dispatched off-thread so a slow endpoint never stalls ingest.
+                // Failures come back onto the bus as pher.delivery.failed.
+                let method = sub.then.args[0].to_uppercase();
+                let url = sub.then.args[1].clone();
+                let (method_r, url_r) = (method.clone(), url.clone());
+                let body = delivery_json.to_string();
+                let paths = self.paths.clone();
+                let delivery_id = delivery_id.to_string();
+                std::thread::spawn(move || {
+                    let result = ureq::request(&method, &url)
+                        .timeout(Duration::from_secs(10))
+                        .set("content-type", "application/json")
+                        .send_string(&body);
+                    if let Err(e) = result {
+                        report_delivery_failure(&paths, &delivery_id, "http", &e.to_string());
+                    }
+                });
+                json!({ "sink": "http", "method": method_r, "url": url_r, "dispatched": true })
+            }
+            Sink::Hermes => {
+                // `then hermes <invoke...>` — hand off to the Hermes CLI.
+                spawn_cli_sink("hermes", &sub.then.args, &delivery_json, delivery_id)
+            }
+            Sink::Pol => {
+                // `then pol fire <trigger>` — hand off to the Pollinate CLI.
+                spawn_cli_sink("pol", &sub.then.args, &delivery_json, delivery_id)
+            }
+            Sink::Hive => {
+                // `then hive spawn|send|flow ...` — hand off to the hive CLI.
+                spawn_cli_sink("hive", &sub.then.args, &delivery_json, delivery_id)
+            }
         }
     }
 
@@ -454,8 +640,10 @@ impl State {
         if removed {
             self.metas.remove(id);
             self.timers.retain(|t| t.sub_id != id);
+            self.pending.remove(id);
             let _ = self.persist_subs();
             let _ = self.persist_timers();
+            let _ = self.persist_pending();
             self.emit_bus_event(
                 "pher.subscription.evaporated",
                 json!({ "id": id, "reason": reason }),
@@ -533,7 +721,7 @@ impl State {
             // The delivery payload is the origin event: "this happened and the
             // expected follow-up did not arrive within the window".
             let _ = expect;
-            self.deliver(&timer.sub_id.clone(), &sub, &timer.origin, &mut block);
+            self.deliver(&timer.sub_id.clone(), &sub, &timer.origin, &mut block, None);
         }
     }
 
@@ -583,6 +771,45 @@ impl State {
         })?;
         Ok(())
     }
+}
+
+/// Spawn a CLI sink (`hermes`, `pol`, `hive`) with the delivery in env.
+/// Best-effort: spawn failures are recorded, exit codes are not awaited.
+fn spawn_cli_sink(bin: &str, args: &[String], delivery_json: &Value, delivery_id: &str) -> Value {
+    let spawned = std::process::Command::new(bin)
+        .args(args)
+        .env("PHER_DELIVERY", delivery_json.to_string())
+        .env("PHER_DELIVERY_ID", delivery_id)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(child) => json!({ "sink": bin, "pid": child.id(), "args": args }),
+        Err(e) => json!({ "sink": bin, "error": e.to_string() }),
+    }
+}
+
+/// Report an async sink failure back onto the bus (from a sink thread, via
+/// the daemon's own socket — the bus eats its own dog food).
+fn report_delivery_failure(paths: &Paths, delivery_id: &str, sink: &str, error: &str) {
+    let report = crate::protocol::Request::Emit {
+        event: PartialEvent {
+            subject: "pher.delivery.failed".to_string(),
+            payload: Some(json!({
+                "deliveryId": delivery_id,
+                "sink": sink,
+                "error": error,
+            })),
+            event_type: None,
+            source: Some("pherd".to_string()),
+            correlation: None,
+        },
+    };
+    if let Ok(mut conn) = crate::client::Conn::connect(paths) {
+        let _ = conn.call(&report);
+    }
+    eprintln!("pherd: delivery {delivery_id} via {sink} failed: {error}");
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -696,6 +923,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
                 std::thread::sleep(Duration::from_secs(1));
                 let mut s = state.lock().unwrap();
                 s.fire_expired_timers();
+                s.fire_shaping_windows();
                 s.sweep_expired_subs();
                 if now_unix() - last_gc >= 600 {
                     let _ = s.gc();

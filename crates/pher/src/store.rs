@@ -42,6 +42,10 @@ impl Paths {
     pub fn timers(&self) -> PathBuf {
         self.home.join("timers.json")
     }
+
+    pub fn pending(&self) -> PathBuf {
+        self.home.join("pending.json")
+    }
 }
 
 /// Atomic-ish JSON write: temp file + rename, so kill -9 never leaves a torn file.
