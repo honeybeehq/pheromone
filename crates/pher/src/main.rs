@@ -1,6 +1,7 @@
 mod client;
 mod daemon;
 mod protocol;
+mod semantic;
 mod store;
 mod tap;
 

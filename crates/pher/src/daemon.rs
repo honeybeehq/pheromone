@@ -88,6 +88,7 @@ struct State {
     pending: HashMap<String, PendingWindow>,
     tails: Vec<TailClient>,
     retention_secs: u64,
+    semantic: crate::semantic::Semantic,
 }
 
 impl State {
@@ -128,6 +129,7 @@ impl State {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
 
+        let semantic = crate::semantic::Semantic::new(paths.clone());
         let mut state = State {
             paths,
             node,
@@ -138,7 +140,20 @@ impl State {
             pending,
             tails: Vec::new(),
             retention_secs,
+            semantic,
         };
+        // Re-embed descriptors for meaning subscriptions that survived restart.
+        let meaning_subs: Vec<String> = state.matcher.ids().iter().map(|s| s.to_string()).collect();
+        for id in meaning_subs {
+            let Some(sub) = state.matcher.get(&id) else {
+                continue;
+            };
+            if let Some(meaning) = sub.meaning.clone() {
+                if let Err(e) = state.semantic.on_register(&id, &meaning) {
+                    eprintln!("pherd: warning: meaning subscription {id} cannot score: {e}");
+                }
+            }
+        }
         state.persist_subs()?;
         state.gc()?;
         Ok(state)
@@ -174,13 +189,12 @@ impl State {
                 .map_err(|e| e.to_string())?;
         }
 
-        // Honesty gates: never accept what this build cannot evaluate or execute.
-        if sub.meaning.is_some() || sub.judge.is_some() {
-            return Err(
-                "tiers 3-4 (meaning/judge) are not implemented yet (roadmap slices 4-5); \
+        // Honesty gate: judge (tier 4) is roadmap slice 5 — refuse rather than
+        // silently never fire. `meaning` is live as of slice 4.
+        if sub.judge.is_some() {
+            return Err("tier 4 (judge) is not implemented yet (roadmap slice 5); \
                  this subscription would never fire — refusing to register it silently"
-                    .to_string(),
-            );
+                .to_string());
         }
         match sub.then.sink {
             Sink::Buz if sub.then.args.is_empty() => {
@@ -227,11 +241,23 @@ impl State {
         }
 
         let id = ids::short_id("PH");
+        if let Some(meaning) = &sub.meaning {
+            self.semantic
+                .on_register(&id, meaning)
+                .map_err(|e| format!("cannot enable meaning tier: {e}"))?;
+        }
         let expires_at = match &sub.lifetime {
             pher_core::Lifetime::Ttl { ttl } => Some(now_unix() + ttl.secs()),
             _ => None,
         };
         let mut warnings: Vec<String> = Vec::new();
+        if sub.meaning.is_some() && sub.replay.is_some() {
+            warnings.push(
+                "replay ('since') does not evaluate the meaning tier yet; backlog events \
+                 are matched on tiers 1-2 only when semantic"
+                    .to_string(),
+            );
+        }
         if matches!(sub.lifetime, pher_core::Lifetime::Lease { .. }) {
             warnings.push(
                 "lease liveness (while ... alive) is not heartbeat-checked yet; \
@@ -342,7 +368,74 @@ impl State {
                 deliveries += n;
             }
         }
+
+        // Tier 3: subscriptions whose tiers 1-2 passed but carry a `meaning`
+        // clause. The event is projected + embedded ONCE, shared across all
+        // of them, then recorded into the novelty window.
+        let semantic_ids: Vec<String> = self
+            .matcher
+            .pending_ids(&event)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if !semantic_ids.is_empty() {
+            match self.semantic.embed_event(&event) {
+                Err(e) => {
+                    eprintln!("pherd: semantic tier unavailable for {}: {e}", event.id);
+                }
+                Ok(event_vec) => {
+                    let now = now_unix();
+                    for sub_id in semantic_ids {
+                        let Some(sub) = self.matcher.get(&sub_id).cloned() else {
+                            continue;
+                        };
+                        let Some(meaning) = &sub.meaning else {
+                            continue;
+                        };
+                        if sub.judge.is_some() {
+                            continue; // judge is slice 5; registration blocks these
+                        }
+                        let (passed, record) = self
+                            .semantic
+                            .score(&sub_id, meaning, &event.id, &event_vec, now);
+                        if !passed {
+                            continue;
+                        }
+                        if let Some(expect) = &sub.expect {
+                            self.timers.push(Timer {
+                                sub_id: sub_id.clone(),
+                                origin: event.clone(),
+                                deadline: now_unix() + expect.within.secs(),
+                            });
+                            self.persist_timers().map_err(|e| e.to_string())?;
+                            continue;
+                        }
+                        deliveries += self.deliver_semantic(&sub_id, &sub, &event, record);
+                    }
+                    self.semantic.record_event(now, &event.id, event_vec);
+                }
+            }
+        }
         Ok((seq, deliveries))
+    }
+
+    /// Deliver a tier-3 match: the tiers 1-2 explanation block is extended
+    /// with the meaning record, then shaped/delivered like any other match.
+    fn deliver_semantic(
+        &mut self,
+        sub_id: &str,
+        sub: &Subscription,
+        event: &Envelope,
+        meaning_record: Value,
+    ) -> u64 {
+        let eval = evaluate(sub_id, sub, event, None);
+        let Some(mut block) = eval.match_block else {
+            return 0;
+        };
+        block.meaning = Some(meaning_record);
+        block.pending.clear();
+        block.tiers.push("meaning".to_string());
+        self.shape_or_deliver(sub_id, sub, event, block)
     }
 
     /// Run `event` through subscription `sub_id`'s cascade; on match, deliver
@@ -354,11 +447,23 @@ impl State {
         if !matches!(eval.outcome, Outcome::Matched) {
             return None;
         }
-        let mut block = eval.match_block?;
+        let block = eval.match_block?;
+        Some(self.shape_or_deliver(sub_id, &sub, event, block))
+    }
+
+    /// Deliver immediately or queue into the subscription's shaping window.
+    /// Returns the delivered count (0 = queued for a later window close).
+    fn shape_or_deliver(
+        &mut self,
+        sub_id: &str,
+        sub: &Subscription,
+        event: &Envelope,
+        mut block: MatchBlock,
+    ) -> u64 {
         match &sub.delivery {
             pher_core::Delivery::Immediate => {
-                self.deliver(sub_id, &sub, event, &mut block, None);
-                Some(1)
+                self.deliver(sub_id, sub, event, &mut block, None);
+                1
             }
             pher_core::Delivery::Debounce { window } => {
                 if let Some(p) = self.pending.get_mut(sub_id) {
@@ -366,10 +471,10 @@ impl State {
                     p.events = vec![event.clone()];
                     p.collapsed += 1;
                     let _ = self.persist_pending();
-                    Some(0)
+                    0
                 } else {
                     // Leading edge delivers immediately, then the window arms.
-                    self.deliver(sub_id, &sub, event, &mut block, None);
+                    self.deliver(sub_id, sub, event, &mut block, None);
                     self.pending.insert(
                         sub_id.to_string(),
                         PendingWindow {
@@ -380,7 +485,7 @@ impl State {
                         },
                     );
                     let _ = self.persist_pending();
-                    Some(1)
+                    1
                 }
             }
             pher_core::Delivery::Batch { window } => {
@@ -399,7 +504,7 @@ impl State {
                 }
                 p.events.push(event.clone());
                 let _ = self.persist_pending();
-                Some(0)
+                0
             }
         }
     }
@@ -641,6 +746,7 @@ impl State {
             self.metas.remove(id);
             self.timers.retain(|t| t.sub_id != id);
             self.pending.remove(id);
+            self.semantic.on_remove(id);
             let _ = self.persist_subs();
             let _ = self.persist_timers();
             let _ = self.persist_pending();
@@ -769,6 +875,8 @@ impl State {
                 .and_then(|t| t.as_str())
                 .is_none_or(|ts| ts >= cutoff.as_str())
         })?;
+        self.semantic
+            .gc(now_unix().saturating_sub(self.retention_secs));
         Ok(())
     }
 }
@@ -1008,6 +1116,7 @@ fn handle_request(
                     "armedTimers": s.timers.len(),
                     "tails": s.tails.len(),
                     "retention": format!("{}s", s.retention_secs),
+                    "semantic": s.semantic.status(),
                     "home": s.paths.home.display().to_string(),
                 })),
             )?;
@@ -1041,7 +1150,40 @@ fn handle_request(
             drop(s);
             match found {
                 Some(envelope) => {
-                    let report = why_not(&sub, &subscription, &envelope);
+                    let mut report = why_not(&sub, &subscription, &envelope);
+                    // Tier 3 diagnosis: if tiers 1-2 passed and a meaning
+                    // clause is pending, actually score it and say why.
+                    let pending_semantic = report["matched"] == json!(false)
+                        && report["rejectedAt"] == json!(null)
+                        && subscription.meaning.is_some()
+                        && subscription.judge.is_none();
+                    if pending_semantic {
+                        let meaning = subscription.meaning.clone().unwrap();
+                        let mut s = state.lock().unwrap();
+                        match s.semantic.embed_event(&envelope) {
+                            Ok(vec) => {
+                                let (passed, record) = s.semantic.score(
+                                    &sub,
+                                    &meaning,
+                                    &envelope.id,
+                                    &vec,
+                                    now_unix(),
+                                );
+                                drop(s);
+                                report = json!({
+                                    "subscription": sub,
+                                    "event": envelope.id,
+                                    "matched": passed,
+                                    "rejectedAt": if passed { Value::Null } else { json!("meaning") },
+                                    "meaning": record,
+                                });
+                            }
+                            Err(e) => {
+                                drop(s);
+                                report["reason"] = json!(format!("meaning tier unavailable: {e}"));
+                            }
+                        }
+                    }
                     respond(stream, &ok(json!({ "report": report })))?;
                 }
                 None => respond(stream, &err(format!("no event '{event}' in the log")))?,

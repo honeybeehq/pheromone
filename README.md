@@ -18,9 +18,9 @@ everything else.
 
 ## Status
 
-**Prototype (roadmap slices 1–2, partial 3/5).** The language and the local bus work
-end-to-end; tiers 3–4 (semantic/judge) parse but do not evaluate yet, and the daemon
-refuses to register what it cannot honestly run.
+**Prototype (roadmap slices 1–4 substantially complete).** The language, the local bus,
+all sinks, delivery shaping, and the semantic tier work end-to-end. Tier 4 (`judge`) parses
+but does not evaluate yet — the daemon refuses to register what it cannot honestly run.
 
 What works today:
 
@@ -32,8 +32,17 @@ What works today:
 - **A local bus** (`pher daemon run`) — `emit`, `when`, `ls`, `rm`, `tail` (cursor
   resume), `why <delivery-id>`, `why-not <sub-id> <event-id>`. JSONL event log +
   crash-safe state under `~/.pheromone/`; kill -9 loses nothing.
-- **Sinks:** `cmd`, `emit` (re-emit with hop-capped cycle guard, correlation preserved),
-  `buz` (best-effort `hive buz send`). Others are parsed but rejected at registration.
+- **Sinks — all of them:** `cmd`, `emit` (hop-capped cycle guard, correlation preserved),
+  `buz`, `http` (validated POST/PUT/... off-thread, failures come back as
+  `pher.delivery.failed` bus events), `hermes`, `pol`, `hive` (CLI handoff).
+- **Delivery shaping:** `every` (leading edge + trailing collapsed event per window) and
+  `batch` (one delivery per window, capped queue with drop accounting), persisted so
+  kill -9 keeps queued events.
+- **Tier 3 (`meaning`) is live:** local ONNX embeddings (bge-small, 384-dim, downloaded
+  once to `~/.pheromone/models`, offline after), text projection + secret redaction,
+  descriptor matching, and `novel` anomaly detection over a windowed vector log.
+  Scores/thresholds/model id ride in every match block and `why-not`. Measured quality
+  and threshold guidance: [docs/TIER3_QUALITY.md](docs/TIER3_QUALITY.md).
 - **Lifecycle:** `for <ttl>` evaporation, `limit <n>` one/n-shot, `since <lookback>`
   replay, `expect ... within ... else` absence timers with `$origin` join — all working.
   Retention GC (default 7d, `PHER_RETENTION`) from day one.

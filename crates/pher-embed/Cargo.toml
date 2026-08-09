@@ -1,0 +1,14 @@
+[package]
+name = "pher-embed"
+description = "Pheromone tier 3: local ONNX embeddings (bge-small class), text projection, redaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pher-core = { path = "../pher-core" }
+serde_json.workspace = true
+regex.workspace = true
+anyhow.workspace = true
+fastembed = "5"

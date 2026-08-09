@@ -332,6 +332,18 @@ impl Matcher {
         }
     }
 
+    /// Ids of subscriptions whose tiers 1–2 pass but which carry
+    /// `meaning`/`judge` clauses — the daemon's tier 3/4 work list.
+    pub fn pending_ids(&self, event: &Envelope) -> Vec<&str> {
+        self.candidate_idxs(event)
+            .iter()
+            .filter_map(|&i| {
+                let e = &self.entries[i];
+                (check(&e.sub, event, None) == Check::Pending).then_some(e.id.as_str())
+            })
+            .collect()
+    }
+
     fn candidate_idxs(&self, event: &Envelope) -> Vec<usize> {
         let mut idxs: Vec<usize> = self
             .trie

@@ -18,3 +18,4 @@ anyhow.workspace = true
 clap.workspace = true
 humantime = "2"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+pher-embed = { version = "0.1.0", path = "../pher-embed" }
