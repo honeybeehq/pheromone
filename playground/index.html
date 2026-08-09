@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pher playground — Pheromone subscription language</title>
+<style>
+  :root {
+    --bg: #101418; --panel: #171d24; --border: #2a333d;
+    --text: #d8dee6; --dim: #8a96a3; --accent: #e8a33d;
+    --ok: #5dbb63; --bad: #e06c5f; --pending: #6aa3e0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 2.5rem; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
+  h1 .pher { color: var(--accent); }
+  .sub { color: var(--dim); margin: 0 0 1.5rem; font-size: .85rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  label { display: block; color: var(--dim); font-size: .78rem; margin: 0 0 .35rem;
+          text-transform: uppercase; letter-spacing: .06em; }
+  textarea {
+    width: 100%; background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: .8rem;
+    font: inherit; resize: vertical; outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  #subscription { min-height: 7.5rem; }
+  #event { min-height: 7.5rem; }
+  .out {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: .8rem; margin-top: 1rem; white-space: pre-wrap; word-break: break-word;
+    font-size: .85rem; min-height: 2.2rem;
+  }
+  .badge { display: inline-block; padding: .1rem .55rem; border-radius: 99px;
+           font-size: .75rem; font-weight: 700; margin-right: .5rem; }
+  .b-ok { background: color-mix(in srgb, var(--ok) 22%, transparent); color: var(--ok); }
+  .b-bad { background: color-mix(in srgb, var(--bad) 22%, transparent); color: var(--bad); }
+  .b-pending { background: color-mix(in srgb, var(--pending) 22%, transparent); color: var(--pending); }
+  .presets { margin: .6rem 0 0; display: flex; gap: .5rem; flex-wrap: wrap; }
+  .presets button {
+    background: transparent; color: var(--dim); border: 1px solid var(--border);
+    border-radius: 6px; padding: .25rem .6rem; font: inherit; font-size: .78rem; cursor: pointer;
+  }
+  .presets button:hover { color: var(--text); border-color: var(--accent); }
+  .dim { color: var(--dim); }
+</style>
+</head>
+<body>
+<h1><span class="pher">pher</span> playground</h1>
+<p class="sub">The Pheromone subscription language, in your browser — the same Rust matcher as pherd, compiled to WASM. Tiers 1–2 evaluate here; <code>meaning</code>/<code>judge</code> report as survivors for upstream tiers.</p>
+
+<div class="grid">
+  <div>
+    <label for="subscription">subscription</label>
+    <textarea id="subscription" spellcheck="false">on ci.github.run.completed
+where payload.conclusion == "failure" && payload.branch == "main"
+then hive spawn --flow rerun-and-triage</textarea>
+    <div class="presets" id="presets"></div>
+    <div class="out" id="canon"></div>
+  </div>
+  <div>
+    <label for="event">event</label>
+    <textarea id="event" spellcheck="false">{
+  "subject": "ci.github.run.completed",
+  "payload": {"conclusion": "failure", "branch": "main", "run_id": 812}
+}</textarea>
+    <div class="out" id="verdict"></div>
+  </div>
+</div>
+
+<script type="module">
+import init, { canon, validate, evaluate, whyNot } from "../crates/pher-wasm/pkg/pher_wasm.js";
+
+const $ = (id) => document.getElementById(id);
+const presets = [
+  ["blocked seal", 'on hive.seal where payload.status == "blocked" then buz CL.6308 --tier next-tool',
+   '{"subject": "hive.seal", "payload": {"status": "blocked", "bee": "CL.6308"}}'],
+  ["ci failure", 'on ci.github.run.completed\nwhere payload.conclusion == "failure" && payload.branch == "main"\nthen hive spawn --flow rerun-and-triage',
+   '{"subject": "ci.github.run.completed", "payload": {"conclusion": "failure", "branch": "main"}}'],
+  ["semantic", 'on crash.sentry.* meaning "OOM or memory pressure" > 0.65 then cmd ./triage.sh',
+   '{"subject": "crash.sentry.backend", "payload": {"title": "OOMKilled: worker exceeded 2Gi"}}'],
+  ["absence", 'on hive.bee.spawned\nexpect hive.seal where correlation == $origin.correlation within 2h else\nthen buz operator',
+   '{"subject": "hive.bee.spawned", "correlation": "HE.42", "payload": {"bee": "CL.9999"}}'],
+  ["metric alert", 'on metric.condition.entered where payload.name == "p95_high" then hermes notify-oncall',
+   '{"subject": "metric.condition.entered", "payload": {"name": "p95_high", "value": 950, "threshold": 800}}'],
+];
+
+function refresh() {
+  const sub = $("subscription").value.replace(/\n/g, " ").trim();
+  const canonEl = $("canon");
+  const verdictEl = $("verdict");
+
+  const problem = validate(sub);
+  if (problem) {
+    canonEl.innerHTML = `<span class="badge b-bad">parse error</span>${esc(problem)}`;
+    verdictEl.innerHTML = `<span class="dim">fix the subscription first</span>`;
+    return;
+  }
+  canonEl.innerHTML = `<span class="badge b-ok">valid</span><span class="dim">canonical:</span>\n${esc(canon(sub))}`;
+
+  let eventJson;
+  try {
+    eventJson = JSON.stringify(JSON.parse($("event").value));
+  } catch (e) {
+    verdictEl.innerHTML = `<span class="badge b-bad">event JSON error</span>${esc(String(e.message))}`;
+    return;
+  }
+  try {
+    const evaln = JSON.parse(evaluate(sub, eventJson));
+    if (evaln.outcome === "matched") {
+      verdictEl.innerHTML = `<span class="badge b-ok">MATCH</span>` +
+        `<span class="dim">tiers: ${evaln.match.tiers.join(" → ")}</span>\n` +
+        esc(JSON.stringify(evaln.match, null, 2));
+    } else if (evaln.outcome === "pending_semantic") {
+      verdictEl.innerHTML = `<span class="badge b-pending">SURVIVOR</span>` +
+        `passed tiers 1–2; <b>${evaln.pending.join(" + ")}</b> would run in pherd\n` +
+        esc(JSON.stringify(evaln.match, null, 2));
+    } else {
+      const why = JSON.parse(whyNot(sub, eventJson));
+      verdictEl.innerHTML = `<span class="badge b-bad">no match</span>` +
+        `<span class="dim">rejected at</span> <b>${esc(why.rejectedAt ?? "?")}</b>\n${esc(why.reason ?? "")}`;
+    }
+  } catch (e) {
+    verdictEl.innerHTML = `<span class="badge b-bad">error</span>${esc(String(e))}`;
+  }
+}
+
+const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+await init();
+for (const [name, sub, ev] of presets) {
+  const b = document.createElement("button");
+  b.textContent = name;
+  b.onclick = () => { $("subscription").value = sub; $("event").value = JSON.stringify(JSON.parse(ev), null, 2); refresh(); };
+  $("presets").appendChild(b);
+}
+$("subscription").addEventListener("input", refresh);
+$("event").addEventListener("input", refresh);
+refresh();
+</script>
+</body>
+</html>

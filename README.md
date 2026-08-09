@@ -77,6 +77,11 @@ What works today:
   `parse`/`canon`/`validate`/`evaluate`/`whyNot` plus `survives()` for
   filter-at-source (edge middleware, log shippers, browser playground — only
   survivors cross the wire). Build with `./build.sh`, test with `node test.mjs`.
+- **Browser playground** (`playground/index.html`) — the language in the browser
+  over the WASM matcher: live validate-as-you-type, canonical form, and match/
+  reject/survivor verdicts against an event, with preset examples. Serve the
+  repo root (`python3 -m http.server`) and open `/playground/`; requires the
+  web bundle (`cd crates/pher-wasm && ./build.sh web`).
 - **Benchmarks:** `cargo run --release -p pher-core --example bench` — with 10k
   standing subscriptions, ~49k events/sec through tiers 1–2 in a deliberately
   pathological workload (33% `ns.**` catch-alls ⇒ ~470 candidates/event) and
