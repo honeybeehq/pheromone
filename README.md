@@ -18,9 +18,9 @@ everything else.
 
 ## Status
 
-**Prototype (roadmap slices 1–4 substantially complete).** The language, the local bus,
-all sinks, delivery shaping, and the semantic tier work end-to-end. Tier 4 (`judge`) parses
-but does not evaluate yet — the daemon refuses to register what it cannot honestly run.
+**Prototype (roadmap slices 1–5 substantially complete).** All four tiers of the cost
+cascade are live: `on` → `where` → `meaning` → `judge`, end to end, with the local bus,
+all sinks, delivery shaping, and the hive ledger tap.
 
 What works today:
 
@@ -38,6 +38,15 @@ What works today:
 - **Delivery shaping:** `every` (leading edge + trailing collapsed event per window) and
   `batch` (one delivery per window, capped queue with drop accounting), persisted so
   kill -9 keeps queued events.
+- **Tier 4 (`judge`) is live:** yes/no verdicts from a cheap LLM on tier-3 survivors.
+  Pluggable provider via `PHER_JUDGE_MODEL` — default `claude-haiku-4-5` (Anthropic
+  Messages API with prompt caching on the stable question prefix + structured outputs),
+  or any OpenAI model such as `gpt-5.6-luna` (chat completions). Async worker (verdicts
+  deliver on completion, never blocking ingest), mandatory budgets that fail closed and
+  emit `pher.subscription.budget_exhausted` exactly once per window, content-fingerprint
+  verdict cache (replay and repeats never re-roll; `cached: true` in the match block),
+  `sample` support, and redaction before anything leaves the process. Registration
+  requires a working provider config (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`).
 - **Tier 3 (`meaning`) is live:** local ONNX embeddings (bge-small, 384-dim, downloaded
   once to `~/.pheromone/models`, offline after), text projection + secret redaction,
   descriptor matching, and `novel` anomaly detection over a windowed vector log.

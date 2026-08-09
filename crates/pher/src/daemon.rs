@@ -89,6 +89,31 @@ struct State {
     tails: Vec<TailClient>,
     retention_secs: u64,
     semantic: crate::semantic::Semantic,
+    judge_cfg: Option<crate::judge::JudgeConfig>,
+    judge_tx: Option<mpsc::Sender<JudgeJob>>,
+    judge_budgets: HashMap<String, JudgeBudget>,
+    verdict_cache: HashMap<String, crate::judge::Verdict>,
+}
+
+/// Per-subscription judge budget window. Persisted; fail-closed on exhaustion.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct JudgeBudget {
+    #[serde(rename = "periodStart")]
+    period_start: u64,
+    used: u64,
+    #[serde(default)]
+    notified: bool,
+}
+
+/// A pending tier-4 evaluation, processed off-lock by the judge worker.
+struct JudgeJob {
+    sub_id: String,
+    event: Envelope,
+    summary: String,
+    cache_key: String,
+    question: String,
+    meaning_record: Option<Value>,
+    config: crate::judge::JudgeConfig,
 }
 
 impl State {
@@ -129,6 +154,36 @@ impl State {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
 
+        let judge_budgets: HashMap<String, JudgeBudget> =
+            std::fs::read_to_string(paths.judge_budgets())
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+        let mut verdict_cache: HashMap<String, crate::judge::Verdict> = HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(paths.verdicts()) {
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if let (Some(key), Some(verdict)) = (
+                    v.get("key").and_then(|k| k.as_str()),
+                    v.get("verdict").and_then(|b| b.as_bool()),
+                ) {
+                    verdict_cache.insert(
+                        key.to_string(),
+                        crate::judge::Verdict {
+                            verdict,
+                            rationale: v
+                                .get("rationale")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
         let semantic = crate::semantic::Semantic::new(paths.clone());
         let mut state = State {
             paths,
@@ -141,7 +196,23 @@ impl State {
             tails: Vec::new(),
             retention_secs,
             semantic,
+            judge_cfg: None,
+            judge_tx: None,
+            judge_budgets,
+            verdict_cache,
         };
+        let has_judge_subs = state
+            .matcher
+            .ids()
+            .iter()
+            .any(|id| state.matcher.get(id).is_some_and(|s| s.judge.is_some()));
+        if has_judge_subs {
+            match crate::judge::resolve_config() {
+                Ok(cfg) => state.judge_cfg = Some(cfg),
+                Err(e) => eprintln!("pherd: warning: judge subscriptions cannot fire: {e}"),
+            }
+        }
+
         // Re-embed descriptors for meaning subscriptions that survived restart.
         let meaning_subs: Vec<String> = state.matcher.ids().iter().map(|s| s.to_string()).collect();
         for id in meaning_subs {
@@ -189,12 +260,12 @@ impl State {
                 .map_err(|e| e.to_string())?;
         }
 
-        // Honesty gate: judge (tier 4) is roadmap slice 5 — refuse rather than
-        // silently never fire. `meaning` is live as of slice 4.
+        // Honesty gate: a judge subscription needs a working provider config
+        // NOW, not at first event — refuse registration with the exact fix.
         if sub.judge.is_some() {
-            return Err("tier 4 (judge) is not implemented yet (roadmap slice 5); \
-                 this subscription would never fire — refusing to register it silently"
-                .to_string());
+            let cfg = crate::judge::resolve_config()
+                .map_err(|e| format!("cannot enable judge tier: {e}"))?;
+            self.judge_cfg = Some(cfg);
         }
         match sub.then.sink {
             Sink::Buz if sub.then.args.is_empty() => {
@@ -251,10 +322,10 @@ impl State {
             _ => None,
         };
         let mut warnings: Vec<String> = Vec::new();
-        if sub.meaning.is_some() && sub.replay.is_some() {
+        if (sub.meaning.is_some() || sub.judge.is_some()) && sub.replay.is_some() {
             warnings.push(
-                "replay ('since') does not evaluate the meaning tier yet; backlog events \
-                 are matched on tiers 1-2 only when semantic"
+                "replay ('since') does not evaluate the meaning/judge tiers; backlog \
+                 events are matched on tiers 1-2 only"
                     .to_string(),
             );
         }
@@ -369,54 +440,202 @@ impl State {
             }
         }
 
-        // Tier 3: subscriptions whose tiers 1-2 passed but carry a `meaning`
-        // clause. The event is projected + embedded ONCE, shared across all
-        // of them, then recorded into the novelty window.
-        let semantic_ids: Vec<String> = self
+        // Tiers 3-4: subscriptions whose tiers 1-2 passed but carry `meaning`
+        // and/or `judge` clauses. The event is projected + embedded at most
+        // ONCE, shared across all meaning candidates; judge survivors enqueue
+        // for async verdicts (tier-4 matches deliver on verdict, not ingest).
+        let pending_subs: Vec<String> = self
             .matcher
             .pending_ids(&event)
             .into_iter()
             .map(String::from)
             .collect();
-        if !semantic_ids.is_empty() {
-            match self.semantic.embed_event(&event) {
-                Err(e) => {
-                    eprintln!("pherd: semantic tier unavailable for {}: {e}", event.id);
-                }
-                Ok(event_vec) => {
-                    let now = now_unix();
-                    for sub_id in semantic_ids {
-                        let Some(sub) = self.matcher.get(&sub_id).cloned() else {
-                            continue;
-                        };
-                        let Some(meaning) = &sub.meaning else {
-                            continue;
-                        };
-                        if sub.judge.is_some() {
-                            continue; // judge is slice 5; registration blocks these
-                        }
-                        let (passed, record) = self
-                            .semantic
-                            .score(&sub_id, meaning, &event.id, &event_vec, now);
-                        if !passed {
-                            continue;
-                        }
-                        if let Some(expect) = &sub.expect {
-                            self.timers.push(Timer {
-                                sub_id: sub_id.clone(),
-                                origin: event.clone(),
-                                deadline: now_unix() + expect.within.secs(),
-                            });
-                            self.persist_timers().map_err(|e| e.to_string())?;
-                            continue;
-                        }
-                        deliveries += self.deliver_semantic(&sub_id, &sub, &event, record);
+        if !pending_subs.is_empty() {
+            let needs_embedding = pending_subs
+                .iter()
+                .any(|id| self.matcher.get(id).is_some_and(|s| s.meaning.is_some()));
+            let mut event_vec: Option<Vec<f32>> = None;
+            if needs_embedding {
+                match self.semantic.embed_event(&event) {
+                    Ok(v) => event_vec = Some(v),
+                    Err(e) => {
+                        eprintln!("pherd: semantic tier unavailable for {}: {e}", event.id)
                     }
-                    self.semantic.record_event(now, &event.id, event_vec);
                 }
+            }
+            let now = now_unix();
+            for sub_id in pending_subs {
+                let Some(sub) = self.matcher.get(&sub_id).cloned() else {
+                    continue;
+                };
+                // Tier 3 gates tier 4.
+                let mut meaning_record: Option<Value> = None;
+                if let Some(meaning) = &sub.meaning {
+                    let Some(vec) = &event_vec else { continue }; // embedder down: fail closed
+                    let (passed, record) =
+                        self.semantic.score(&sub_id, meaning, &event.id, vec, now);
+                    if !passed {
+                        continue;
+                    }
+                    meaning_record = Some(record);
+                }
+                if let Some(expect) = &sub.expect {
+                    self.timers.push(Timer {
+                        sub_id: sub_id.clone(),
+                        origin: event.clone(),
+                        deadline: now_unix() + expect.within.secs(),
+                    });
+                    self.persist_timers().map_err(|e| e.to_string())?;
+                    continue;
+                }
+                if sub.judge.is_some() {
+                    deliveries += self.judge_gate(&sub_id, &sub, &event, meaning_record);
+                } else if let Some(record) = meaning_record {
+                    deliveries += self.deliver_semantic(&sub_id, &sub, &event, record);
+                }
+            }
+            if let Some(vec) = event_vec {
+                self.semantic.record_event(now, &event.id, vec);
             }
         }
         Ok((seq, deliveries))
+    }
+
+    /// Tier 4 admission: cached verdicts apply instantly (replay never
+    /// re-rolls); otherwise budget (fail-closed) then sample gate, then the
+    /// job queues for the async judge worker.
+    fn judge_gate(
+        &mut self,
+        sub_id: &str,
+        sub: &Subscription,
+        event: &Envelope,
+        meaning_record: Option<Value>,
+    ) -> u64 {
+        let Some(judge_clause) = sub.judge.clone() else {
+            return 0;
+        };
+        let summary = crate::judge::event_summary(event);
+        let cache_key = format!("{sub_id}:{}", crate::judge::content_fingerprint(event));
+        if let Some(verdict) = self.verdict_cache.get(&cache_key).cloned() {
+            if verdict.verdict {
+                let model = self
+                    .judge_cfg
+                    .as_ref()
+                    .map(|c| c.model.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                return self.deliver_judged(
+                    sub_id,
+                    sub,
+                    event,
+                    meaning_record,
+                    &verdict,
+                    true,
+                    &model,
+                );
+            }
+            return 0;
+        }
+        if !self.reserve_judge_budget(sub_id, &judge_clause) {
+            return 0; // budget exhausted: fail closed
+        }
+        if let Some(sample) = judge_clause.sample {
+            if pseudo_random() > sample {
+                return 0;
+            }
+        }
+        let Some(cfg) = self.judge_cfg.clone() else {
+            eprintln!("pherd: judge subscription {sub_id} has no provider config");
+            return 0;
+        };
+        let Some(tx) = &self.judge_tx else {
+            eprintln!("pherd: judge worker not running");
+            return 0;
+        };
+        let _ = tx.send(JudgeJob {
+            sub_id: sub_id.to_string(),
+            event: event.clone(),
+            summary,
+            cache_key,
+            question: judge_clause.question.clone(),
+            meaning_record,
+            config: cfg,
+        });
+        0 // delivery happens on verdict, asynchronously
+    }
+
+    /// Budget window accounting. Returns whether one judge call may proceed.
+    /// The transition into exhaustion emits pher.subscription.budget_exhausted.
+    fn reserve_judge_budget(&mut self, sub_id: &str, judge: &pher_core::Judge) -> bool {
+        let now = now_unix();
+        let period = crate::judge::period_secs(&judge.budget_period);
+        let (allowed, notify) = {
+            let b = self
+                .judge_budgets
+                .entry(sub_id.to_string())
+                .or_insert(JudgeBudget {
+                    period_start: now,
+                    used: 0,
+                    notified: false,
+                });
+            if now.saturating_sub(b.period_start) >= period {
+                b.period_start = now;
+                b.used = 0;
+                b.notified = false;
+            }
+            if b.used < judge.budget_count {
+                b.used += 1;
+                (true, false)
+            } else {
+                let notify = !b.notified;
+                b.notified = true;
+                (false, notify)
+            }
+        };
+        let _ = write_json_atomic(
+            &self.paths.judge_budgets(),
+            &serde_json::to_value(&self.judge_budgets).unwrap_or_default(),
+        );
+        if notify {
+            self.emit_bus_event(
+                "pher.subscription.budget_exhausted",
+                json!({ "id": sub_id }),
+            );
+        }
+        allowed
+    }
+
+    /// Deliver a tier-4 match: extend the block with meaning + judge records.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_judged(
+        &mut self,
+        sub_id: &str,
+        sub: &Subscription,
+        event: &Envelope,
+        meaning_record: Option<Value>,
+        verdict: &crate::judge::Verdict,
+        cached: bool,
+        model: &str,
+    ) -> u64 {
+        if !verdict.verdict {
+            return 0;
+        }
+        let eval = evaluate(sub_id, sub, event, None);
+        let Some(mut block) = eval.match_block else {
+            return 0;
+        };
+        if let Some(record) = meaning_record {
+            block.meaning = Some(record);
+            block.tiers.push("meaning".to_string());
+        }
+        block.judge = Some(json!({
+            "verdict": verdict.verdict,
+            "rationale": verdict.rationale,
+            "model": model,
+            "cached": cached,
+        }));
+        block.pending.clear();
+        block.tiers.push("judge".to_string());
+        self.shape_or_deliver(sub_id, sub, event, block)
     }
 
     /// Deliver a tier-3 match: the tiers 1-2 explanation block is extended
@@ -747,6 +966,7 @@ impl State {
             self.timers.retain(|t| t.sub_id != id);
             self.pending.remove(id);
             self.semantic.on_remove(id);
+            self.judge_budgets.remove(id);
             let _ = self.persist_subs();
             let _ = self.persist_timers();
             let _ = self.persist_pending();
@@ -877,6 +1097,12 @@ impl State {
         })?;
         self.semantic
             .gc(now_unix().saturating_sub(self.retention_secs));
+        let cutoff_unix = now_unix().saturating_sub(self.retention_secs);
+        gc_jsonl(&self.paths.verdicts(), |v| {
+            v.get("ts")
+                .and_then(|t| t.as_u64())
+                .is_none_or(|ts| ts >= cutoff_unix)
+        })?;
         Ok(())
     }
 }
@@ -918,6 +1144,15 @@ fn report_delivery_failure(paths: &Paths, delivery_id: &str, sink: &str, error: 
         let _ = conn.call(&report);
     }
     eprintln!("pherd: delivery {delivery_id} via {sink} failed: {error}");
+}
+
+/// Cheap uniform-ish [0,1) for `sample` gating; not security-sensitive.
+fn pseudo_random() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    f64::from(nanos % 10_000) / 10_000.0
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1022,6 +1257,56 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         s.emit_bus_event("pher.node.online", json!({ "node": node }));
     }
 
+    // Judge worker: verdicts happen off the state lock; delivery re-acquires.
+    {
+        let (jtx, jrx) = mpsc::channel::<JudgeJob>();
+        state.lock().unwrap().judge_tx = Some(jtx);
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for job in jrx {
+                let result = crate::judge::ask(&job.config, &job.question, &job.summary);
+                let mut s = state.lock().unwrap();
+                match result {
+                    Ok(verdict) => {
+                        s.verdict_cache
+                            .insert(job.cache_key.clone(), verdict.clone());
+                        let record = json!({
+                            "ts": now_unix(),
+                            "key": job.cache_key,
+                            "subscription": job.sub_id,
+                            "event": job.event.id,
+                            "model": job.config.model,
+                            "verdict": verdict.verdict,
+                            "rationale": verdict.rationale,
+                        });
+                        let verdicts_path = s.paths.verdicts();
+                        let _ = s.append_jsonl(&verdicts_path, &record);
+                        if verdict.verdict {
+                            if let Some(sub) = s.matcher.get(&job.sub_id).cloned() {
+                                s.deliver_judged(
+                                    &job.sub_id,
+                                    &sub,
+                                    &job.event,
+                                    job.meaning_record,
+                                    &verdict,
+                                    false,
+                                    &job.config.model,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("pherd: judge call failed for {}: {e}", job.sub_id);
+                        s.emit_bus_event(
+                            "pher.judge.error",
+                            json!({ "subscription": job.sub_id, "event": job.event.id, "error": e }),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     // Housekeeping: expect-timer expiry every second, GC sweep every 10 minutes.
     {
         let state = Arc::clone(&state);
@@ -1117,6 +1402,15 @@ fn handle_request(
                     "tails": s.tails.len(),
                     "retention": format!("{}s", s.retention_secs),
                     "semantic": s.semantic.status(),
+                    "judge": match &s.judge_cfg {
+                        Some(c) => json!({
+                            "configured": true,
+                            "provider": c.provider,
+                            "model": c.model,
+                            "cachedVerdicts": s.verdict_cache.len(),
+                        }),
+                        None => json!({ "configured": false, "cachedVerdicts": s.verdict_cache.len() }),
+                    },
                     "home": s.paths.home.display().to_string(),
                 })),
             )?;
@@ -1151,37 +1445,87 @@ fn handle_request(
             match found {
                 Some(envelope) => {
                     let mut report = why_not(&sub, &subscription, &envelope);
-                    // Tier 3 diagnosis: if tiers 1-2 passed and a meaning
-                    // clause is pending, actually score it and say why.
+                    // Tier 3/4 diagnosis: if tiers 1-2 passed, actually score
+                    // the meaning clause, and report the judge's cached verdict
+                    // (why-not never spends judge budget).
                     let pending_semantic = report["matched"] == json!(false)
                         && report["rejectedAt"] == json!(null)
-                        && subscription.meaning.is_some()
-                        && subscription.judge.is_none();
+                        && (subscription.meaning.is_some() || subscription.judge.is_some());
                     if pending_semantic {
-                        let meaning = subscription.meaning.clone().unwrap();
                         let mut s = state.lock().unwrap();
-                        match s.semantic.embed_event(&envelope) {
-                            Ok(vec) => {
-                                let (passed, record) = s.semantic.score(
-                                    &sub,
-                                    &meaning,
-                                    &envelope.id,
-                                    &vec,
-                                    now_unix(),
-                                );
-                                drop(s);
-                                report = json!({
+                        let mut meaning_result: Option<(bool, Value)> = None;
+                        if let Some(meaning) = subscription.meaning.clone() {
+                            match s.semantic.embed_event(&envelope) {
+                                Ok(vec) => {
+                                    meaning_result = Some(s.semantic.score(
+                                        &sub,
+                                        &meaning,
+                                        &envelope.id,
+                                        &vec,
+                                        now_unix(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    report["reason"] =
+                                        json!(format!("meaning tier unavailable: {e}"));
+                                }
+                            }
+                        }
+                        let meaning_passed = meaning_result.as_ref().map(|(p, _)| *p);
+                        let meaning_record = meaning_result.map(|(_, r)| r);
+                        if meaning_passed == Some(false) {
+                            drop(s);
+                            report = json!({
+                                "subscription": sub,
+                                "event": envelope.id,
+                                "matched": false,
+                                "rejectedAt": "meaning",
+                                "meaning": meaning_record,
+                            });
+                        } else if subscription.judge.is_some() {
+                            let key =
+                                format!("{sub}:{}", crate::judge::content_fingerprint(&envelope));
+                            let cached = s.verdict_cache.get(&key).cloned();
+                            let model = s
+                                .judge_cfg
+                                .as_ref()
+                                .map(|c| c.model.clone())
+                                .unwrap_or_else(|| "unconfigured".to_string());
+                            drop(s);
+                            report = match cached {
+                                Some(v) => json!({
                                     "subscription": sub,
                                     "event": envelope.id,
-                                    "matched": passed,
-                                    "rejectedAt": if passed { Value::Null } else { json!("meaning") },
-                                    "meaning": record,
-                                });
-                            }
-                            Err(e) => {
-                                drop(s);
-                                report["reason"] = json!(format!("meaning tier unavailable: {e}"));
-                            }
+                                    "matched": v.verdict,
+                                    "rejectedAt": if v.verdict { Value::Null } else { json!("judge") },
+                                    "meaning": meaning_record,
+                                    "judge": {
+                                        "verdict": v.verdict,
+                                        "rationale": v.rationale,
+                                        "model": model,
+                                        "cached": true,
+                                    },
+                                }),
+                                None => json!({
+                                    "subscription": sub,
+                                    "event": envelope.id,
+                                    "matched": false,
+                                    "rejectedAt": null,
+                                    "meaning": meaning_record,
+                                    "reason": "no cached judge verdict; why-not never spends budget — emit a matching event to consult the judge",
+                                }),
+                            };
+                        } else if let Some(record) = meaning_record {
+                            drop(s);
+                            report = json!({
+                                "subscription": sub,
+                                "event": envelope.id,
+                                "matched": true,
+                                "rejectedAt": null,
+                                "meaning": record,
+                            });
+                        } else {
+                            drop(s);
                         }
                     }
                     respond(stream, &ok(json!({ "report": report })))?;

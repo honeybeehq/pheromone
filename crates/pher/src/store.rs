@@ -54,6 +54,14 @@ impl Paths {
     pub fn models(&self) -> PathBuf {
         self.home.join("models")
     }
+
+    pub fn verdicts(&self) -> PathBuf {
+        self.home.join("verdicts.jsonl")
+    }
+
+    pub fn judge_budgets(&self) -> PathBuf {
+        self.home.join("judge_budgets.json")
+    }
 }
 
 /// Atomic-ish JSON write: temp file + rename, so kill -9 never leaves a torn file.
