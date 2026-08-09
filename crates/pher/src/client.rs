@@ -16,6 +16,43 @@ pub fn connect(paths: &Paths) -> anyhow::Result<UnixStream> {
     })
 }
 
+/// A persistent daemon connection: many request/response cycles on one
+/// socket. Taps hold one of these for their whole life.
+pub struct Conn {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl Conn {
+    pub fn connect(paths: &Paths) -> anyhow::Result<Conn> {
+        let stream = connect(paths)?;
+        let reader = BufReader::new(stream.try_clone()?);
+        Ok(Conn { stream, reader })
+    }
+
+    pub fn call(&mut self, request: &Request) -> anyhow::Result<Value> {
+        let mut line = serde_json::to_string(request)?;
+        line.push('\n');
+        self.stream.write_all(line.as_bytes())?;
+        self.stream.flush()?;
+        let mut response = String::new();
+        if self.reader.read_line(&mut response)? == 0 {
+            bail!("pherd closed the connection");
+        }
+        let value: Value = serde_json::from_str(response.trim())?;
+        if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            bail!(
+                "{}",
+                value
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown daemon error")
+            );
+        }
+        Ok(value)
+    }
+}
+
 /// Send one request, read one JSON-line response. Errors on `ok: false`.
 pub fn call(paths: &Paths, request: &Request) -> anyhow::Result<Value> {
     let mut stream = connect(paths)?;

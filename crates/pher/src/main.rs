@@ -2,6 +2,7 @@ mod client;
 mod daemon;
 mod protocol;
 mod store;
+mod tap;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
@@ -114,6 +115,21 @@ enum Cmd {
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
+    },
+    /// Run an ecosystem tap (feeds the local bus)
+    Tap {
+        #[command(subcommand)]
+        cmd: TapCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TapCmd {
+    /// Follow the Honeybee ledger and emit `hive.<type>` events
+    Hive {
+        /// Backlog lookback for the first attach (e.g. 15m); default: live only
+        #[arg(long, default_value = "1s")]
+        since: String,
     },
 }
 
@@ -333,6 +349,11 @@ fn run() -> anyhow::Result<()> {
             cmd: DaemonCmd::Run,
         } => {
             daemon::run(paths)?;
+        }
+        Cmd::Tap {
+            cmd: TapCmd::Hive { since },
+        } => {
+            tap::run_hive_tap(&paths, &since)?;
         }
     }
     Ok(())

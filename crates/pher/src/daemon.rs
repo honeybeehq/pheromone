@@ -715,43 +715,64 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Connections are persistent: one JSON-line request per line, one response
+/// line each, until EOF. `tail` switches the connection into streaming mode
+/// and owns it until the client goes away (taps hold an emit connection open
+/// for their whole life).
 fn handle_connection(stream: UnixStream, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Ok(());
-    }
-    let request: Request = match serde_json::from_str(line.trim()) {
-        Ok(r) => r,
-        Err(e) => {
-            respond(&stream, &err(format!("bad request: {e}")))?;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
             return Ok(());
         }
-    };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: Request = match serde_json::from_str(line.trim()) {
+            Ok(r) => r,
+            Err(e) => {
+                respond(&stream, &err(format!("bad request: {e}")))?;
+                continue;
+            }
+        };
+        let streaming = matches!(request, Request::Tail { .. });
+        handle_request(request, &stream, &state)?;
+        if streaming {
+            return Ok(());
+        }
+    }
+}
 
+fn handle_request(
+    request: Request,
+    stream: &UnixStream,
+    state: &Arc<Mutex<State>>,
+) -> anyhow::Result<()> {
     match request {
         Request::Emit { event } => {
             let result = state.lock().unwrap().ingest(event, 0);
-            respond(&stream, &result.unwrap_or_else(err))?;
+            respond(stream, &result.unwrap_or_else(err))?;
         }
         Request::When { string, options } => {
             let result = state.lock().unwrap().register(&string, &options);
-            respond(&stream, &result.unwrap_or_else(err))?;
+            respond(stream, &result.unwrap_or_else(err))?;
         }
         Request::Ls => {
             let s = state.lock().unwrap();
             let mut subs: Vec<&SubMeta> = s.metas.values().collect();
             subs.sort_by(|a, b| a.created.cmp(&b.created));
-            respond(&stream, &ok(json!({ "subs": subs })))?;
+            respond(stream, &ok(json!({ "subs": subs })))?;
         }
         Request::Rm { id } => {
             let removed = state.lock().unwrap().remove_sub(&id, "removed by operator");
-            respond(&stream, &ok(json!({ "removed": removed })))?;
+            respond(stream, &ok(json!({ "removed": removed })))?;
         }
         Request::Status => {
             let s = state.lock().unwrap();
             respond(
-                &stream,
+                stream,
                 &ok(json!({
                     "node": s.node,
                     "subscriptions": s.matcher.len(),
@@ -772,8 +793,8 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<State>>) -> anyhow::Re
                 .filter_map(|l| serde_json::from_str::<Value>(l).ok())
                 .find(|v| v.get("deliveryId").and_then(|d| d.as_str()) == Some(&delivery_id));
             match record {
-                Some(r) => respond(&stream, &ok(json!({ "delivery": r })))?,
-                None => respond(&stream, &err(format!("no delivery '{delivery_id}'")))?,
+                Some(r) => respond(stream, &ok(json!({ "delivery": r })))?,
+                None => respond(stream, &err(format!("no delivery '{delivery_id}'")))?,
             }
         }
         Request::WhyNot { sub, event } => {
@@ -781,7 +802,7 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<State>>) -> anyhow::Re
             let Some(subscription) = s.matcher.get(&sub).cloned() else {
                 let e = err(format!("no subscription '{sub}'"));
                 drop(s);
-                respond(&stream, &e)?;
+                respond(stream, &e)?;
                 return Ok(());
             };
             let found = s
@@ -793,16 +814,16 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<State>>) -> anyhow::Re
             match found {
                 Some(envelope) => {
                     let report = why_not(&sub, &subscription, &envelope);
-                    respond(&stream, &ok(json!({ "report": report })))?;
+                    respond(stream, &ok(json!({ "report": report })))?;
                 }
-                None => respond(&stream, &err(format!("no event '{event}' in the log")))?,
+                None => respond(stream, &err(format!("no event '{event}' in the log")))?,
             }
         }
         Request::Tail { after, subject } => {
             let pattern = match subject.map(|s| SubjectPattern::parse(&s)).transpose() {
                 Ok(p) => p,
                 Err(e) => {
-                    respond(&stream, &err(e))?;
+                    respond(stream, &err(e))?;
                     return Ok(());
                 }
             };
