@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pher playground — Pheromone subscription language</title>
+<link rel="icon" href="../assets/logo/pher-favicon-amber.svg">
 <style>
   :root {
     --bg: #101418; --panel: #171d24; --border: #2a333d;
@@ -15,8 +16,9 @@
     margin: 0; padding: 2rem 2.5rem; background: var(--bg); color: var(--text);
     font: 15px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
-  h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
+  h1 { font-size: 1.15rem; margin: 0 0 .25rem; display: flex; align-items: center; gap: .55rem; }
   h1 .pher { color: var(--accent); }
+  h1 .mark { color: var(--accent); height: 1.15em; width: auto; }
   .sub { color: var(--dim); margin: 0 0 1.5rem; font-size: .85rem; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; align-items: start; }
   @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
@@ -50,7 +52,11 @@
 </style>
 </head>
 <body>
-<h1><span class="pher">pher</span> playground</h1>
+<h1><svg class="mark" viewBox="-202.94 -182.96 261.68 202.19" fill="currentColor"
+  xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><circle cx="-144.89" cy="-38.82" r="40"/><circle
+  cx="-99.75" cy="-112.03" r="28.8"/><circle cx="-46.00" cy="-142.77" r="20.74"/><circle
+  cx="-2.01" cy="-149.99" r="14.93"/><circle cx="29.95" cy="-146.98" r="10.75"/></svg><span><span
+  class="pher">pher</span> playground</span></h1>
 <p class="sub">The Pheromone subscription language, in your browser — the same Rust matcher as pherd, compiled to WASM. Tiers 1–2 evaluate here; <code>meaning</code>/<code>judge</code> report as survivors for upstream tiers.</p>
 
 <div class="grid">

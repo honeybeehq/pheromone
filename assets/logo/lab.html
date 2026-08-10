@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pher logo lab — constructed variants</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Hanken+Grotesk:wght@500;700&family=Space+Grotesk:wght@500;700&family=Jost:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #101418; --panel: #171d24; --border: #2a333d;
+    --text: #d8dee6; --dim: #8a96a3; --accent: #e8a33d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 2.5rem; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
+  h1 .pher { color: var(--accent); }
+  .sub { color: var(--dim); margin: 0 0 1.75rem; font-size: .85rem; }
+  .variant { margin-bottom: 2rem; }
+  .variant h2 { font-size: .85rem; margin: 0 0 .15rem; font-weight: 700; }
+  .variant .note { color: var(--dim); font-size: .78rem; margin: 0 0 .6rem; }
+  .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: stretch; }
+  .chip {
+    border: 1px solid var(--border); border-radius: 10px; padding: .75rem;
+    display: flex; gap: 1.25rem; align-items: center;
+  }
+  .chip.light { background: #ffffff; color: #0a0a0a; }
+  .chip.dark  { background: #101418; color: #e6e6e6; }
+  .chip.amber { background: #101418; color: #e8a33d; }
+  .cell { display: flex; flex-direction: column; align-items: center; gap: .35rem; }
+  .cell .sz { font-size: .65rem; color: var(--dim); }
+  .chip.light .sz { color: #9aa3ad; }
+  .box { display: flex; align-items: center; justify-content: center; }
+  svg { display: block; }
+</style>
+</head>
+<body>
+<h1><span class="pher">pher</span> logo lab</h1>
+<p class="sub">Constructed geometry — dot centers on a true circular arc, radii in a strict
+geometric ratio, gaps proportional to the dots they separate. Judge at 20px before falling
+in love at 140px.</p>
+<div id="variants"></div>
+
+<h1 style="margin-top:2.5rem">wordmark lockups <span style="color:var(--dim);font-weight:400">(mark A + candidate faces)</span></h1>
+<p class="sub">Apiary's convention: shared UI faces (Hanken Grotesk + IBM Plex Mono), plus a
+wordmark-only face (Spectral). Candidates below for Pheromone's wordmark-only face.</p>
+<div id="lockups"></div>
+
+<script>
+function trail({ n = 5, r0 = 40, ratio = 0.72, gap = 0.25, Rc = 150,
+                 startDeg = 195, line = false, lineDeg = 20,
+                 reverse = false, fade = 1 }) {
+  let radii = Array.from({ length: n }, (_, i) => r0 * Math.pow(ratio, i));
+  if (reverse) radii = radii.slice().reverse();
+
+  const pts = [];
+  if (line) {
+    const a = lineDeg * Math.PI / 180;
+    let x = 0, y = 0;
+    pts.push([x, y]);
+    for (let i = 0; i < n - 1; i++) {
+      const d = (radii[i] + radii[i + 1]) * (1 + gap);
+      x += Math.cos(a) * d; y += Math.sin(a) * d;
+      pts.push([x, y]);
+    }
+  } else {
+    let th = startDeg * Math.PI / 180;
+    pts.push([Rc * Math.cos(th), Rc * Math.sin(th)]);
+    for (let i = 0; i < n - 1; i++) {
+      const d = (radii[i] + radii[i + 1]) * (1 + gap);
+      th += 2 * Math.asin(Math.min(0.99, d / (2 * Rc)));
+      pts.push([Rc * Math.cos(th), Rc * Math.sin(th)]);
+    }
+  }
+
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  pts.forEach(([x, y], i) => {
+    x0 = Math.min(x0, x - radii[i]); y0 = Math.min(y0, y - radii[i]);
+    x1 = Math.max(x1, x + radii[i]); y1 = Math.max(y1, y + radii[i]);
+  });
+  const pad = 0.08 * Math.max(x1 - x0, y1 - y0);
+  const vb = [x0 - pad, y0 - pad, (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad]
+    .map(v => v.toFixed(2)).join(" ");
+
+  const circles = pts.map(([x, y], i) => {
+    const op = Math.pow(fade, i);
+    return `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radii[i].toFixed(2)}"` +
+           (op < 1 ? ` opacity="${op.toFixed(2)}"` : "") + `/>`;
+  }).join("");
+  return { vb, circles };
+}
+
+function render(mark, px) {
+  return `<svg viewBox="${mark.vb}" width="${px}" height="${px}"` +
+         ` fill="currentColor" xmlns="http://www.w3.org/2000/svg">${mark.circles}</svg>`;
+}
+
+const VARIANTS = [
+  ["A — recommended: rising arc, 5 dots, solid",
+   "Steep climb flattening at the crest. Evaporation by size only — survives one-color everywhere.",
+   { }],
+  ["B — 4 dots",
+   "One dot per cascade tier (on → where → meaning → judge). Chunkier, best small-size survival.",
+   { n: 4, ratio: 0.66 }],
+  ["C — tighter curl",
+   "Same recipe, more sweep. More dynamic, slightly less calm.",
+   { Rc: 105, startDeg: 205 }],
+  ["D — reversed: arrival",
+   "Events converging into a delivery. The one real alternative concept — but loses the evaporation story.",
+   { reverse: true }],
+  ["E — straight descending diagonal (what most generations did)",
+   "Hazard demo: reads as a declining trend chart next to a dashboard.",
+   { line: true, lineDeg: 20 }],
+  ["F — opacity fade (hazard demo)",
+   "Elegant at 140px, dead in single-color contexts — the tail vanishes at 20px on dark.",
+   { fade: 0.62 }],
+  ["G — favicon collapse: 3 dots",
+   "The 16px form of A. Same recipe, three dots, tighter arc.",
+   { n: 3, ratio: 0.68, Rc: 110, startDeg: 200 }],
+];
+
+const host = document.getElementById("variants");
+for (const [title, note, opts] of VARIANTS) {
+  const mark = trail(opts);
+  const sizes = title.startsWith("G") ? [64, 32, 16] : [140, 48, 20];
+  const section = document.createElement("section");
+  section.className = "variant";
+  section.innerHTML =
+    `<h2>${title}</h2><p class="note">${note}</p><div class="row">` +
+    ["light", "dark", "amber"].map(scheme =>
+      `<div class="chip ${scheme}">` +
+      sizes.map(px =>
+        `<div class="cell"><div class="box">${render(mark, px)}</div>` +
+        `<div class="sz">${px}px</div></div>`).join("") +
+      `</div>`).join("") +
+    `</div>`;
+  host.appendChild(section);
+}
+
+const LOCKUPS = [
+  ["1 — IBM Plex Mono 600 (the terminal voice, single color)",
+   { family: "'IBM Plex Mono', monospace", weight: 600, tracking: "-0.02em" }],
+  ["2 — IBM Plex Mono 500 (lighter, quieter)",
+   { family: "'IBM Plex Mono', monospace", weight: 500, tracking: "-0.02em" }],
+  ["3 — Hanken Grotesk 700 (maximum family unity — same as Apiary UI sans)",
+   { family: "'Hanken Grotesk', sans-serif", weight: 700, tracking: "-0.01em" }],
+  ["4 — Space Grotesk 500 (distinct display face)",
+   { family: "'Space Grotesk', sans-serif", weight: 500, tracking: "0" }],
+  ["5 — Jost 500 (geometric, true-circle o's echo the dots)",
+   { family: "'Jost', sans-serif", weight: 500, tracking: "0.01em" }],
+];
+
+const markA = trail({});
+const lockHost = document.getElementById("lockups");
+for (const [title, f] of LOCKUPS) {
+  const word = (dim) => f.accent
+    ? `<span style="color:var(--accent)">pher</span><span style="font-weight:400;opacity:.8">omone</span>`
+    : `pheromone`;
+  const lockup = (scheme) =>
+    `<div class="chip ${scheme}" style="gap:.9rem; padding: 1rem 1.4rem;">` +
+    `<div class="box">${render(markA, 46)}</div>` +
+    `<div style="font-family:${f.family}; font-weight:${f.weight}; letter-spacing:${f.tracking};` +
+    ` font-size:1.9rem; line-height:1;">${word()}</div></div>`;
+  const section = document.createElement("section");
+  section.className = "variant";
+  section.innerHTML = `<h2>${title}</h2><div class="row">` +
+    lockup("light") + lockup("dark") + `</div>`;
+  lockHost.appendChild(section);
+}
+
+// Color treatments for the mono lockup: color lives in the mark, never the word.
+const T = [
+  ["light", "#0a0a0a", "#0a0a0a", "all black / white"],
+  ["dark",  "#e6e6e6", "#e6e6e6", "all light / dark"],
+  ["dark",  "#e8a33d", "#e6e6e6", "amber mark, neutral word / dark"],
+  ["light", "#e8a33d", "#0a0a0a", "amber mark, black word / light"],
+];
+const tSection = document.createElement("section");
+tSection.className = "variant";
+tSection.innerHTML = `<h2>treatments — IBM Plex Mono 600 lockup</h2>` +
+  `<p class="note">The word stays one color always; amber appears only in the mark.</p>` +
+  `<div class="row">` + T.map(([scheme, markColor, wordColor, label]) =>
+    `<div class="chip ${scheme}" style="gap:.9rem; padding:1rem 1.4rem; flex-direction:column; align-items:flex-start;">` +
+    `<div style="display:flex; gap:.9rem; align-items:center;">` +
+    `<span style="color:${markColor}; display:flex">${render(markA, 46)}</span>` +
+    `<span style="color:${wordColor}; font-family:'IBM Plex Mono',monospace; font-weight:600;` +
+    ` letter-spacing:-0.02em; font-size:1.9rem; line-height:1;">pheromone</span></div>` +
+    `<div class="sz">${label}</div></div>`).join("") +
+  `</div>`;
+lockHost.appendChild(tSection);
+</script>
+</body>
+</html>
