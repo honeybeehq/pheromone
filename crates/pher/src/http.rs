@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 
 use crate::daemon::State;
-use crate::protocol::PartialEvent;
+use crate::protocol::{PartialEvent, Request};
 
 const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
 
@@ -100,6 +100,32 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/healthz") => respond(request, 200, json!({"ok": true})),
+        ("POST", "/rpc") => {
+            // The full (non-streaming) protocol over HTTP — remote CLI.
+            if !authed {
+                return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
+            }
+            let Ok(rpc) = serde_json::from_slice::<Request>(&body) else {
+                return respond(request, 400, json!({"ok": false, "error": "bad request"}));
+            };
+            let response = crate::daemon::handle_rpc(rpc, &state);
+            respond(request, 200, response);
+        }
+        ("POST", "/deliver") => {
+            // Filter-at-source landing zone: a remote node's http sink posts
+            // its delivery JSON here; only matches ever cross the wire.
+            if !authed {
+                return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
+            }
+            let Ok(delivery) = serde_json::from_slice::<Value>(&body) else {
+                return respond(request, 400, json!({"ok": false, "error": "invalid JSON"}));
+            };
+            let result = state.lock().unwrap().ingest_forwarded(delivery);
+            match result {
+                Ok(v) => respond(request, 200, v),
+                Err(e) => respond(request, 400, json!({"ok": false, "error": e})),
+            }
+        }
         ("POST", "/emit") => {
             if !authed {
                 return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));

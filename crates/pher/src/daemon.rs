@@ -94,7 +94,13 @@ pub(crate) struct State {
     judge_budgets: HashMap<String, JudgeBudget>,
     verdict_cache: HashMap<String, crate::judge::Verdict>,
     conditions: crate::conditions::Conditions,
+    /// Admission dedup for cross-node deliveries (Connected-store pattern):
+    /// at-least-once shipping, effectively-once ingestion.
+    forwarded_seen: std::collections::VecDeque<String>,
 }
+
+/// Evaporation bound for the forwarded-delivery dedup window.
+const MAX_FORWARDED_SEEN: usize = 50_000;
 
 /// Per-subscription judge budget window. Persisted; fail-closed on exhaustion.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -213,6 +219,7 @@ impl State {
             judge_budgets,
             verdict_cache,
             conditions,
+            forwarded_seen: std::collections::VecDeque::new(),
         };
         let has_judge_subs = state
             .matcher
@@ -665,6 +672,41 @@ impl State {
         emitted
     }
 
+    /// Ingest a delivery forwarded from another node (filter-at-source:
+    /// the remote ran the cascade; only the match crossed the wire).
+    /// Preserves the origin envelope (id/ts/node/correlation), dedups by
+    /// the remote deliveryId, and honors the hop cycle guard.
+    pub(crate) fn ingest_forwarded(&mut self, delivery: Value) -> Result<Value, String> {
+        let mut event: Envelope = serde_json::from_value(
+            delivery
+                .get("event")
+                .cloned()
+                .ok_or("delivery must carry {event, match}")?,
+        )
+        .map_err(|e| format!("invalid forwarded envelope: {e}"))?;
+        let delivery_id = delivery
+            .pointer("/match/deliveryId")
+            .and_then(|d| d.as_str())
+            .ok_or("delivery must carry match.deliveryId")?
+            .to_string();
+        if self.forwarded_seen.contains(&delivery_id) {
+            return Ok(json!({ "ok": true, "deduped": true }));
+        }
+        self.forwarded_seen.push_back(delivery_id);
+        while self.forwarded_seen.len() > MAX_FORWARDED_SEEN {
+            self.forwarded_seen.pop_front();
+        }
+        let hops = event.hops.unwrap_or(0) + 1;
+        if hops > MAX_EMIT_HOPS {
+            return Err(format!(
+                "hop cap ({MAX_EMIT_HOPS}) reached — forward cycle guard"
+            ));
+        }
+        event.hops = Some(hops);
+        let (seq, deliveries) = self.ingest_envelope(event.clone())?;
+        Ok(json!({ "ok": true, "id": event.id, "seq": seq, "deliveries": deliveries }))
+    }
+
     /// Deliver a tier-4 match: extend the block with meaning + judge records.
     #[allow(clippy::too_many_arguments)]
     fn deliver_judged(
@@ -980,11 +1022,17 @@ impl State {
                 let body = delivery_json.to_string();
                 let paths = self.paths.clone();
                 let delivery_id = delivery_id.to_string();
+                // Cross-node forwarding: authenticate to the remote node's
+                // /deliver with PHER_HTTP_SINK_TOKEN when set.
+                let sink_token = std::env::var("PHER_HTTP_SINK_TOKEN").ok();
                 std::thread::spawn(move || {
-                    let result = ureq::request(&method, &url)
+                    let mut req = ureq::request(&method, &url)
                         .timeout(Duration::from_secs(10))
-                        .set("content-type", "application/json")
-                        .send_string(&body);
+                        .set("content-type", "application/json");
+                    if let Some(token) = &sink_token {
+                        req = req.set("authorization", &format!("Bearer {token}"));
+                    }
+                    let result = req.send_string(&body);
                     if let Err(e) = result {
                         report_delivery_failure(&paths, &delivery_id, "http", &e.to_string());
                     }
@@ -1428,63 +1476,56 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<State>>) -> anyhow::Re
                 continue;
             }
         };
-        let streaming = matches!(request, Request::Tail { .. });
-        handle_request(request, &stream, &state)?;
-        if streaming {
-            return Ok(());
+        if let Request::Tail { after, subject } = request {
+            handle_tail(after, subject, &stream, &state)?;
+            return Ok(()); // tail owns the connection until the client leaves
         }
+        let response = handle_rpc(request, &state);
+        respond(&stream, &response)?;
     }
 }
 
-fn handle_request(
-    request: Request,
-    stream: &UnixStream,
-    state: &Arc<Mutex<State>>,
-) -> anyhow::Result<()> {
+/// Every non-streaming protocol op, shared by the unix socket and HTTP /rpc.
+pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
     match request {
-        Request::Emit { event } => {
-            let result = state.lock().unwrap().ingest(event, 0);
-            respond(stream, &result.unwrap_or_else(err))?;
-        }
-        Request::When { string, options } => {
-            let result = state.lock().unwrap().register(&string, &options);
-            respond(stream, &result.unwrap_or_else(err))?;
-        }
+        Request::Emit { event } => state.lock().unwrap().ingest(event, 0).unwrap_or_else(err),
+        Request::When { string, options } => state
+            .lock()
+            .unwrap()
+            .register(&string, &options)
+            .unwrap_or_else(err),
         Request::Ls => {
             let s = state.lock().unwrap();
             let mut subs: Vec<&SubMeta> = s.metas.values().collect();
             subs.sort_by(|a, b| a.created.cmp(&b.created));
-            respond(stream, &ok(json!({ "subs": subs })))?;
+            ok(json!({ "subs": subs }))
         }
         Request::Rm { id } => {
             let removed = state.lock().unwrap().remove_sub(&id, "removed by operator");
-            respond(stream, &ok(json!({ "removed": removed })))?;
+            ok(json!({ "removed": removed }))
         }
         Request::Status => {
             let s = state.lock().unwrap();
-            respond(
-                stream,
-                &ok(json!({
-                    "node": s.node,
-                    "subscriptions": s.matcher.len(),
-                    "nextSeq": s.next_seq,
-                    "armedTimers": s.timers.len(),
-                    "tails": s.tails.len(),
-                    "retention": format!("{}s", s.retention_secs),
-                    "semantic": s.semantic.status(),
-                    "conditions": s.conditions.defs.len(),
-                    "judge": match &s.judge_cfg {
-                        Some(c) => json!({
-                            "configured": true,
-                            "provider": c.provider,
-                            "model": c.model,
-                            "cachedVerdicts": s.verdict_cache.len(),
-                        }),
-                        None => json!({ "configured": false, "cachedVerdicts": s.verdict_cache.len() }),
-                    },
-                    "home": s.paths.home.display().to_string(),
-                })),
-            )?;
+            ok(json!({
+                "node": s.node,
+                "subscriptions": s.matcher.len(),
+                "nextSeq": s.next_seq,
+                "armedTimers": s.timers.len(),
+                "tails": s.tails.len(),
+                "retention": format!("{}s", s.retention_secs),
+                "semantic": s.semantic.status(),
+                "conditions": s.conditions.defs.len(),
+                "judge": match &s.judge_cfg {
+                    Some(c) => json!({
+                        "configured": true,
+                        "provider": c.provider,
+                        "model": c.model,
+                        "cachedVerdicts": s.verdict_cache.len(),
+                    }),
+                    None => json!({ "configured": false, "cachedVerdicts": s.verdict_cache.len() }),
+                },
+                "home": s.paths.home.display().to_string(),
+            }))
         }
         Request::ConditionAdd { def } => {
             let result = serde_json::from_value::<crate::conditions::ConditionDef>(def)
@@ -1496,19 +1537,19 @@ fn handle_request(
                     Ok(())
                 });
             match result {
-                Ok(()) => respond(stream, &ok(json!({})))?,
-                Err(e) => respond(stream, &err(e))?,
+                Ok(()) => ok(json!({})),
+                Err(e) => err(e),
             }
         }
         Request::ConditionLs => {
             let s = state.lock().unwrap();
-            respond(stream, &ok(json!({ "conditions": s.conditions.status() })))?;
+            ok(json!({ "conditions": s.conditions.status() }))
         }
         Request::ConditionRm { name } => {
             let mut s = state.lock().unwrap();
             let removed = s.conditions.remove(&name);
             let _ = s.persist_conditions();
-            respond(stream, &ok(json!({ "removed": removed })))?;
+            ok(json!({ "removed": removed }))
         }
         Request::Why { delivery_id } => {
             let s = state.lock().unwrap();
@@ -1519,161 +1560,156 @@ fn handle_request(
                 .filter_map(|l| serde_json::from_str::<Value>(l).ok())
                 .find(|v| v.get("deliveryId").and_then(|d| d.as_str()) == Some(&delivery_id));
             match record {
-                Some(r) => respond(stream, &ok(json!({ "delivery": r })))?,
-                None => respond(stream, &err(format!("no delivery '{delivery_id}'")))?,
+                Some(r) => ok(json!({ "delivery": r })),
+                None => err(format!("no delivery '{delivery_id}'")),
             }
         }
-        Request::WhyNot { sub, event } => {
-            let s = state.lock().unwrap();
-            let Some(subscription) = s.matcher.get(&sub).cloned() else {
-                let e = err(format!("no subscription '{sub}'"));
-                drop(s);
-                respond(stream, &e)?;
-                return Ok(());
-            };
-            let found = s
-                .read_events(None)
-                .into_iter()
-                .map(|(_, e)| e)
-                .find(|e| e.id == event);
-            drop(s);
-            match found {
-                Some(envelope) => {
-                    let mut report = why_not(&sub, &subscription, &envelope);
-                    // Tier 3/4 diagnosis: if tiers 1-2 passed, actually score
-                    // the meaning clause, and report the judge's cached verdict
-                    // (why-not never spends judge budget).
-                    let pending_semantic = report["matched"] == json!(false)
-                        && report["rejectedAt"] == json!(null)
-                        && (subscription.meaning.is_some() || subscription.judge.is_some());
-                    if pending_semantic {
-                        let mut s = state.lock().unwrap();
-                        let mut meaning_result: Option<(bool, Value)> = None;
-                        if let Some(meaning) = subscription.meaning.clone() {
-                            match s.semantic.embed_event(&envelope) {
-                                Ok(vec) => {
-                                    meaning_result = Some(s.semantic.score(
-                                        &sub,
-                                        &meaning,
-                                        &envelope.id,
-                                        &vec,
-                                        now_unix(),
-                                    ));
-                                }
-                                Err(e) => {
-                                    report["reason"] =
-                                        json!(format!("meaning tier unavailable: {e}"));
-                                }
-                            }
-                        }
-                        let meaning_passed = meaning_result.as_ref().map(|(p, _)| *p);
-                        let meaning_record = meaning_result.map(|(_, r)| r);
-                        if meaning_passed == Some(false) {
-                            drop(s);
-                            report = json!({
-                                "subscription": sub,
-                                "event": envelope.id,
-                                "matched": false,
-                                "rejectedAt": "meaning",
-                                "meaning": meaning_record,
-                            });
-                        } else if subscription.judge.is_some() {
-                            let key =
-                                format!("{sub}:{}", crate::judge::content_fingerprint(&envelope));
-                            let cached = s.verdict_cache.get(&key).cloned();
-                            let model = s
-                                .judge_cfg
-                                .as_ref()
-                                .map(|c| c.model.clone())
-                                .unwrap_or_else(|| "unconfigured".to_string());
-                            drop(s);
-                            report = match cached {
-                                Some(v) => json!({
-                                    "subscription": sub,
-                                    "event": envelope.id,
-                                    "matched": v.verdict,
-                                    "rejectedAt": if v.verdict { Value::Null } else { json!("judge") },
-                                    "meaning": meaning_record,
-                                    "judge": {
-                                        "verdict": v.verdict,
-                                        "rationale": v.rationale,
-                                        "model": model,
-                                        "cached": true,
-                                    },
-                                }),
-                                None => json!({
-                                    "subscription": sub,
-                                    "event": envelope.id,
-                                    "matched": false,
-                                    "rejectedAt": null,
-                                    "meaning": meaning_record,
-                                    "reason": "no cached judge verdict; why-not never spends budget — emit a matching event to consult the judge",
-                                }),
-                            };
-                        } else if let Some(record) = meaning_record {
-                            drop(s);
-                            report = json!({
-                                "subscription": sub,
-                                "event": envelope.id,
-                                "matched": true,
-                                "rejectedAt": null,
-                                "meaning": record,
-                            });
-                        } else {
-                            drop(s);
-                        }
-                    }
-                    respond(stream, &ok(json!({ "report": report })))?;
+        Request::WhyNot { sub, event } => rpc_why_not(&sub, &event, state),
+        Request::Tail { .. } => err("tail is a streaming op; use the unix socket"),
+    }
+}
+
+fn rpc_why_not(sub: &str, event: &str, state: &Arc<Mutex<State>>) -> Value {
+    let s = state.lock().unwrap();
+    let Some(subscription) = s.matcher.get(sub).cloned() else {
+        return err(format!("no subscription '{sub}'"));
+    };
+    let found = s
+        .read_events(None)
+        .into_iter()
+        .map(|(_, e)| e)
+        .find(|e| e.id == event);
+    drop(s);
+    let Some(envelope) = found else {
+        return err(format!("no event '{event}' in the log"));
+    };
+    let mut report = why_not(sub, &subscription, &envelope);
+    // Tier 3/4 diagnosis: if tiers 1-2 passed, actually score the meaning
+    // clause, and report the judge's cached verdict (why-not never spends
+    // judge budget).
+    let pending_semantic = report["matched"] == json!(false)
+        && report["rejectedAt"] == json!(null)
+        && (subscription.meaning.is_some() || subscription.judge.is_some());
+    if pending_semantic {
+        let mut s = state.lock().unwrap();
+        let mut meaning_result: Option<(bool, Value)> = None;
+        if let Some(meaning) = subscription.meaning.clone() {
+            match s.semantic.embed_event(&envelope) {
+                Ok(vec) => {
+                    meaning_result =
+                        Some(
+                            s.semantic
+                                .score(sub, &meaning, &envelope.id, &vec, now_unix()),
+                        );
                 }
-                None => respond(stream, &err(format!("no event '{event}' in the log")))?,
-            }
-        }
-        Request::Tail { after, subject } => {
-            let pattern = match subject.map(|s| SubjectPattern::parse(&s)).transpose() {
-                Ok(p) => p,
                 Err(e) => {
-                    respond(stream, &err(e))?;
-                    return Ok(());
+                    report["reason"] = json!(format!("meaning tier unavailable: {e}"));
                 }
-            };
-            let (tx, rx) = mpsc::channel::<String>();
-            // Register the live feed first, then send the backlog, then drain
-            // live messages skipping anything already sent (seq dedup).
-            let backlog = {
-                let mut s = state.lock().unwrap();
-                s.tails.push(TailClient {
-                    tx,
-                    subject: pattern.clone(),
-                });
-                s.read_events(after)
-            };
-            let mut writer = stream.try_clone()?;
-            let mut last_sent = after.unwrap_or(0);
-            for (seq, event) in backlog {
-                if let Some(p) = &pattern {
-                    if !p.matches(&event.subject) {
-                        continue;
-                    }
-                }
-                let line = json!({ "seq": seq, "event": event }).to_string();
-                writeln!(writer, "{line}")?;
-                last_sent = seq;
-            }
-            writer.flush()?;
-            for line in rx {
-                let seq = serde_json::from_str::<Value>(&line)
-                    .ok()
-                    .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
-                    .unwrap_or(u64::MAX);
-                if seq <= last_sent {
-                    continue;
-                }
-                if writeln!(writer, "{line}").is_err() || writer.flush().is_err() {
-                    break; // client went away; retain() will drop the sender
-                }
-                last_sent = seq;
             }
         }
+        let meaning_passed = meaning_result.as_ref().map(|(p, _)| *p);
+        let meaning_record = meaning_result.map(|(_, r)| r);
+        if meaning_passed == Some(false) {
+            report = json!({
+                "subscription": sub,
+                "event": envelope.id,
+                "matched": false,
+                "rejectedAt": "meaning",
+                "meaning": meaning_record,
+            });
+        } else if subscription.judge.is_some() {
+            let key = format!("{sub}:{}", crate::judge::content_fingerprint(&envelope));
+            let cached = s.verdict_cache.get(&key).cloned();
+            let model = s
+                .judge_cfg
+                .as_ref()
+                .map(|c| c.model.clone())
+                .unwrap_or_else(|| "unconfigured".to_string());
+            report = match cached {
+                Some(v) => json!({
+                    "subscription": sub,
+                    "event": envelope.id,
+                    "matched": v.verdict,
+                    "rejectedAt": if v.verdict { Value::Null } else { json!("judge") },
+                    "meaning": meaning_record,
+                    "judge": {
+                        "verdict": v.verdict,
+                        "rationale": v.rationale,
+                        "model": model,
+                        "cached": true,
+                    },
+                }),
+                None => json!({
+                    "subscription": sub,
+                    "event": envelope.id,
+                    "matched": false,
+                    "rejectedAt": null,
+                    "meaning": meaning_record,
+                    "reason": "no cached judge verdict; why-not never spends budget — emit a matching event to consult the judge",
+                }),
+            };
+        } else if let Some(record) = meaning_record {
+            report = json!({
+                "subscription": sub,
+                "event": envelope.id,
+                "matched": true,
+                "rejectedAt": null,
+                "meaning": record,
+            });
+        }
+    }
+    ok(json!({ "report": report }))
+}
+
+fn handle_tail(
+    after: Option<u64>,
+    subject: Option<String>,
+    stream: &UnixStream,
+    state: &Arc<Mutex<State>>,
+) -> anyhow::Result<()> {
+    let pattern = match subject.map(|s| SubjectPattern::parse(&s)).transpose() {
+        Ok(p) => p,
+        Err(e) => {
+            respond(stream, &err(e))?;
+            return Ok(());
+        }
+    };
+    let (tx, rx) = mpsc::channel::<String>();
+    // Register the live feed first, then send the backlog, then drain
+    // live messages skipping anything already sent (seq dedup).
+    let backlog = {
+        let mut s = state.lock().unwrap();
+        s.tails.push(TailClient {
+            tx,
+            subject: pattern.clone(),
+        });
+        s.read_events(after)
+    };
+    let mut writer = stream.try_clone()?;
+    let mut last_sent = after.unwrap_or(0);
+    for (seq, event) in backlog {
+        if let Some(p) = &pattern {
+            if !p.matches(&event.subject) {
+                continue;
+            }
+        }
+        let line = json!({ "seq": seq, "event": event }).to_string();
+        writeln!(writer, "{line}")?;
+        last_sent = seq;
+    }
+    writer.flush()?;
+    for line in rx {
+        let seq = serde_json::from_str::<Value>(&line)
+            .ok()
+            .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
+            .unwrap_or(u64::MAX);
+        if seq <= last_sent {
+            continue;
+        }
+        if writeln!(writer, "{line}").is_err() || writer.flush().is_err() {
+            break; // client went away; retain() will drop the sender
+        }
+        last_sent = seq;
     }
     Ok(())
 }

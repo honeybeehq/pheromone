@@ -14,19 +14,35 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
 
-use crate::client::Conn;
+use crate::client::{self, Conn, Target};
 use crate::protocol::{PartialEvent, Request};
 use crate::store::Paths;
+
+/// How the tap reaches its bus: a persistent local socket, or per-event
+/// HTTP to a remote hub (leaf machines need no local daemon at all).
+enum Sender<'a> {
+    Local(Conn),
+    Remote(&'a Target),
+}
+
+impl Sender<'_> {
+    fn emit(&mut self, request: &Request) -> anyhow::Result<serde_json::Value> {
+        match self {
+            Sender::Local(conn) => conn.call(request),
+            Sender::Remote(target) => client::call_target(target, request),
+        }
+    }
+}
 
 /// Ledger fields that identify the acting session/bee, in preference order.
 /// The first one present becomes the envelope correlation, so trails join
 /// spawn → prompt → seal across the whole vocabulary.
 const CORRELATION_FIELDS: &[&str] = &["session", "bee", "name", "flight", "id"];
 
-pub fn run_hive_tap(paths: &Paths, since: &str) -> anyhow::Result<()> {
+pub fn run_hive_tap(target: &Target, paths: &Paths, since: &str) -> anyhow::Result<()> {
     let mut backlog_since = since.to_string();
     loop {
-        match follow_once(paths, &backlog_since) {
+        match follow_once(target, paths, &backlog_since) {
             Ok(()) => unreachable!("follow_once only returns by error"),
             Err(e) => eprintln!("pher tap hive: {e:#}; retrying in 2s"),
         }
@@ -36,8 +52,11 @@ pub fn run_hive_tap(paths: &Paths, since: &str) -> anyhow::Result<()> {
     }
 }
 
-fn follow_once(paths: &Paths, since: &str) -> anyhow::Result<()> {
-    let mut conn = Conn::connect(paths)?;
+fn follow_once(target: &Target, paths: &Paths, since: &str) -> anyhow::Result<()> {
+    let mut conn = match target {
+        Target::Local(_) => Sender::Local(Conn::connect(paths)?),
+        remote => Sender::Remote(remote),
+    };
     let mut child = Command::new("hive")
         .args(["events", "--follow", "--json", "--since", since])
         .stdout(Stdio::piped())
@@ -46,7 +65,7 @@ fn follow_once(paths: &Paths, since: &str) -> anyhow::Result<()> {
         .context("cannot spawn `hive events` (is the hive CLI installed?)")?;
     let stdout = child.stdout.take().expect("stdout piped");
 
-    let announce = conn.call(&Request::Emit {
+    let announce = conn.emit(&Request::Emit {
         event: PartialEvent {
             subject: "pher.tap.up".to_string(),
             payload: Some(json!({ "tap": "hive", "since": since })),
@@ -67,7 +86,7 @@ fn follow_once(paths: &Paths, since: &str) -> anyhow::Result<()> {
         let Some(event) = map_ledger_line(&line) else {
             continue;
         };
-        if let Err(e) = conn.call(&Request::Emit { event }) {
+        if let Err(e) = conn.emit(&Request::Emit { event }) {
             let _ = child.kill();
             return Err(e).context("emit to pherd failed");
         }

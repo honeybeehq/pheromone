@@ -24,6 +24,9 @@ use store::Paths;
     about = "Pheromone — a distributed event bus for agent ecosystems (prototype: tiers 1-2, local bus)"
 )]
 struct Cli {
+    /// Target a remote node: a name from `pher node add`, or a URL
+    #[arg(long, global = true)]
+    node: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -130,6 +133,27 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConditionCmd,
     },
+    /// Manage remote nodes (cross-node targets for --node)
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Register a node, e.g.: pher node add studio --url http://studio:4870 --token s3cret
+    Add {
+        name: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// List registered nodes
+    Ls,
+    /// Remove a node
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -189,6 +213,8 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let paths = Paths::resolve();
+    let target = client::resolve_target(&paths, cli.node.as_deref())?;
+    let remote = !matches!(target, client::Target::Local(_));
     match cli.cmd {
         Cmd::Parse {
             subscription,
@@ -265,8 +291,8 @@ fn run() -> anyhow::Result<()> {
             let payload = payload
                 .map(|p| serde_json::from_str(&p).context("--payload is not valid JSON"))
                 .transpose()?;
-            let response = client::call(
-                &paths,
+            let response = client::call_target(
+                &target,
                 &Request::Emit {
                     event: PartialEvent {
                         subject,
@@ -312,8 +338,8 @@ fn run() -> anyhow::Result<()> {
             if let Some(n) = limit {
                 options.extend(["limit".into(), n.to_string()]);
             }
-            let response = client::call(
-                &paths,
+            let response = client::call_target(
+                &target,
                 &Request::When {
                     string: subscription,
                     options,
@@ -336,7 +362,7 @@ fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Ls { json } => {
-            let response = client::call(&paths, &Request::Ls)?;
+            let response = client::call_target(&target, &Request::Ls)?;
             let subs = response["subs"].as_array().cloned().unwrap_or_default();
             if json {
                 println!("{}", serde_json::to_string_pretty(&subs)?);
@@ -354,7 +380,7 @@ fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Rm { id } => {
-            let response = client::call(&paths, &Request::Rm { id: id.clone() })?;
+            let response = client::call_target(&target, &Request::Rm { id: id.clone() })?;
             if response["removed"].as_bool() == Some(true) {
                 println!("removed {id}");
             } else {
@@ -362,18 +388,21 @@ fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Tail { after, subject } => {
+            if remote {
+                bail!("tail is a streaming op — not supported over --node yet");
+            }
             client::tail(&paths, &Request::Tail { after, subject }, |line| {
                 println!("{line}");
                 Ok(())
             })?;
         }
         Cmd::Why { delivery_id } => {
-            let response = client::call(&paths, &Request::Why { delivery_id })?;
+            let response = client::call_target(&target, &Request::Why { delivery_id })?;
             println!("{}", serde_json::to_string_pretty(&response["delivery"])?);
         }
         Cmd::WhyNot { sub_id, event_id } => {
-            let response = client::call(
-                &paths,
+            let response = client::call_target(
+                &target,
                 &Request::WhyNot {
                     sub: sub_id,
                     event: event_id,
@@ -382,19 +411,59 @@ fn run() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&response["report"])?);
         }
         Cmd::Status => {
-            let response = client::call(&paths, &Request::Status)?;
+            let response = client::call_target(&target, &Request::Status)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Cmd::Daemon {
             cmd: DaemonCmd::Run,
         } => {
+            if remote {
+                bail!("the daemon always runs locally");
+            }
             daemon::run(paths)?;
         }
         Cmd::Tap {
             cmd: TapCmd::Hive { since },
         } => {
-            tap::run_hive_tap(&paths, &since)?;
+            tap::run_hive_tap(&target, &paths, &since)?;
         }
+        Cmd::Node { cmd } => match cmd {
+            NodeCmd::Add { name, url, token } => {
+                let mut nodes = client::load_nodes(&paths);
+                nodes.retain(|n| n.name != name);
+                nodes.push(client::NodeEntry {
+                    name: name.clone(),
+                    url,
+                    token,
+                });
+                client::save_nodes(&paths, &nodes)?;
+                println!("node '{name}' registered");
+            }
+            NodeCmd::Ls => {
+                let nodes = client::load_nodes(&paths);
+                if nodes.is_empty() {
+                    println!("no nodes registered");
+                }
+                for n in nodes {
+                    println!(
+                        "{}  {}  [{}]",
+                        n.name,
+                        n.url,
+                        if n.token.is_some() { "token" } else { "open" }
+                    );
+                }
+            }
+            NodeCmd::Rm { name } => {
+                let mut nodes = client::load_nodes(&paths);
+                let before = nodes.len();
+                nodes.retain(|n| n.name != name);
+                if nodes.len() == before {
+                    bail!("no node '{name}'");
+                }
+                client::save_nodes(&paths, &nodes)?;
+                println!("removed {name}");
+            }
+        },
         Cmd::Condition { cmd } => match cmd {
             ConditionCmd::Add {
                 name,
@@ -426,11 +495,11 @@ fn run() -> anyhow::Result<()> {
                     "hold": hold,
                     "labels": label_map,
                 });
-                client::call(&paths, &Request::ConditionAdd { def })?;
+                client::call_target(&target, &Request::ConditionAdd { def })?;
                 println!("condition '{name}' added");
             }
             ConditionCmd::Ls { json } => {
-                let response = client::call(&paths, &Request::ConditionLs)?;
+                let response = client::call_target(&target, &Request::ConditionLs)?;
                 let conditions = response["conditions"]
                     .as_array()
                     .cloned()
@@ -459,7 +528,8 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             ConditionCmd::Rm { name } => {
-                let response = client::call(&paths, &Request::ConditionRm { name: name.clone() })?;
+                let response =
+                    client::call_target(&target, &Request::ConditionRm { name: name.clone() })?;
                 if response["removed"].as_bool() == Some(true) {
                     println!("removed {name}");
                 } else {

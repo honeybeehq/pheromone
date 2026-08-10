@@ -55,6 +55,15 @@ What works today:
 - **Lifecycle:** `for <ttl>` evaporation, `limit <n>` one/n-shot, `since <lookback>`
   replay, `expect ... within ... else` absence timers with `$origin` join — all working.
   Retention GC (default 7d, `PHER_RETENTION`) from day one.
+- **Cross-node (hub-and-leaf over the tailnet):** `pher node add studio --url
+  http://studio:4870 --token …` registers remote nodes; the global `--node`
+  flag runs any command against them (`pher --node studio when …` — full
+  protocol over `POST /rpc`). Filter-at-source is language composition: register
+  the subscription ON the source node with `then http POST http://hub:4870/deliver`
+  (source daemon authenticates via `PHER_HTTP_SINK_TOKEN`) and only matches
+  cross the wire — origin envelope preserved, hop-capped, admission-deduped by
+  deliveryId (at-least-once shipping, effectively-once ingestion). Leaf machines
+  run taps with no local daemon: `pher --node hub tap hive`.
 - **HTTP ingress** (`PHER_HTTP=127.0.0.1:4870`, or a tailnet address +
   `PHER_HTTP_TOKEN` — public binds without a token are refused at startup):
   `POST /webhook/<name>` (generic webhook tap, HMAC-SHA256 verified via
