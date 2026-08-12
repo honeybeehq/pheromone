@@ -26,6 +26,9 @@
   #statusline b { color: var(--text); font-weight: 600; }
   .grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 1rem; align-items: start; }
   @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  /* Grid/flex children default to min-width:auto — long unbroken payload
+     strings would otherwise stretch columns past the viewport. */
+  .grid > div { min-width: 0; }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
            padding: .8rem; margin-bottom: 1rem; }
   textarea, input[type=text], input[type=password] {
@@ -49,8 +52,10 @@
               white-space: nowrap; overflow: hidden; }
   .feed .ev:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
   .feed .ev .seq { color: var(--dim); flex: 0 0 3.2rem; text-align: right; }
-  .feed .ev .subj { color: var(--accent); flex: 0 0 auto; }
-  .feed .ev .pay { color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
+  .feed .ev .subj { color: var(--accent); flex: 0 1 auto; min-width: 0;
+                    overflow: hidden; text-overflow: ellipsis; }
+  .feed .ev .pay { color: var(--dim); flex: 1 1 0; min-width: 0;
+                   overflow: hidden; text-overflow: ellipsis; }
   .feed .detail { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
                   margin: .2rem 0 .4rem; padding: .5rem; white-space: pre-wrap; word-break: break-word;
                   max-height: 260px; overflow-y: auto; }
@@ -244,7 +249,15 @@ function startFeed() {
 }
 $("feedbtn").onclick = startFeed;
 $("internals").onchange = startFeed;
-$("feedexclude").addEventListener("change", startFeed);
+$("feedexclude").addEventListener("change", () => {
+  localStorage.setItem("pherExclude", $("feedexclude").value);
+  startFeed();
+});
+$("feedfilter").addEventListener("change", () => {
+  localStorage.setItem("pherFilter", $("feedfilter").value);
+});
+$("feedexclude").value = localStorage.getItem("pherExclude") ?? "";
+$("feedfilter").value = localStorage.getItem("pherFilter") ?? "";
 
 // ---- emit ---------------------------------------------------------------
 $("emitbtn").onclick = async () => {
