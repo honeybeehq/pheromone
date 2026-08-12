@@ -52,13 +52,15 @@
   .feed .ev .subj { color: var(--accent); flex: 0 0 auto; }
   .feed .ev .pay { color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
   .feed .detail { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
-                  margin: .2rem 0 .4rem; padding: .5rem; white-space: pre-wrap; word-break: break-word; }
+                  margin: .2rem 0 .4rem; padding: .5rem; white-space: pre-wrap; word-break: break-word;
+                  max-height: 260px; overflow-y: auto; }
   .matches { max-height: 300px; overflow-y: auto; font-size: .78rem; }
   .m { border-left: 3px solid var(--ok); background: var(--bg); border-radius: 4px;
-       padding: .4rem .55rem; margin: .35rem 0; white-space: pre-wrap; word-break: break-word; }
+       padding: .4rem .55rem; margin: .35rem 0; white-space: pre-wrap; word-break: break-word;
+       max-height: 220px; overflow-y: auto; }
   .out { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
          padding: .5rem; margin-top: .5rem; white-space: pre-wrap; word-break: break-word;
-         font-size: .78rem; min-height: 1.4rem; }
+         font-size: .78rem; min-height: 1.4rem; max-height: 320px; overflow-y: auto; }
   .badge { display: inline-block; padding: .05rem .5rem; border-radius: 99px;
            font-size: .72rem; font-weight: 700; margin-right: .4rem; }
   .b-ok { background: color-mix(in srgb, var(--ok) 22%, transparent); color: var(--ok); }
@@ -89,7 +91,8 @@
       <label style="display:flex;align-items:center;gap:.3rem;text-transform:none;letter-spacing:0">
         <input type="checkbox" id="internals" style="width:auto"> bus internals
       </label>
-      <input type="text" id="feedfilter" placeholder="subject filter, e.g. hive.**" style="width:11rem">
+      <input type="text" id="feedfilter" placeholder="subject filter, e.g. hive.**" style="width:10rem">
+      <input type="text" id="feedexclude" placeholder="exclude, e.g. hive.state" style="width:10rem">
       <button id="feedbtn">restart feed</button>
     </h2>
     <div class="feed" id="feed"></div>
@@ -214,6 +217,9 @@ function startFeed() {
     // Lifecycle noise (pher.subscription.* etc.) reads as flakiness; hide
     // it unless asked. The events still exist — this is a view filter.
     if (!$("internals").checked && e.subject.startsWith("pher.")) return;
+    // Client-side excludes for heartbeat floods (comma-separated prefixes).
+    const excludes = $("feedexclude").value.split(",").map((x) => x.trim()).filter(Boolean);
+    if (excludes.some((x) => e.subject.startsWith(x))) return;
     const div = document.createElement("div");
     div.className = "ev";
     div.innerHTML = `<span class="seq">${line.seq}</span><span class="subj">${esc(e.subject)}</span>` +
@@ -238,6 +244,7 @@ function startFeed() {
 }
 $("feedbtn").onclick = startFeed;
 $("internals").onchange = startFeed;
+$("feedexclude").addEventListener("change", startFeed);
 
 // ---- emit ---------------------------------------------------------------
 $("emitbtn").onclick = async () => {
