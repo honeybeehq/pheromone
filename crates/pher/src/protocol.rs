@@ -13,6 +13,10 @@ pub enum Request {
         string: String,
         #[serde(default)]
         options: Vec<String>,
+        /// Stable name for declarative reconciliation (`pher apply`); unique
+        /// among live subscriptions.
+        #[serde(default)]
+        name: Option<String>,
     },
     Ls,
     Rm {

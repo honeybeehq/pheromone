@@ -163,6 +163,51 @@ pub fn call(paths: &Paths, request: &Request) -> anyhow::Result<Value> {
     Ok(value)
 }
 
+/// Stream a remote node's POST /listen (chunked NDJSON): ack line first,
+/// then one line per delivery; blank heartbeat lines are skipped. Returns
+/// when the server ends the stream (subscription removed) or on error.
+pub fn listen_remote(
+    url: &str,
+    token: Option<&str>,
+    body: &Value,
+    mut on_line: impl FnMut(Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut req = ureq::post(&format!("{url}/listen")).set("content-type", "application/json");
+    if let Some(t) = token {
+        req = req.set("authorization", &format!("Bearer {t}"));
+    }
+    let response = req.send_string(&body.to_string()).map_err(|e| match e {
+        ureq::Error::Status(code, resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|x| x.as_str()).map(String::from))
+                .unwrap_or(text);
+            anyhow::anyhow!("remote listen failed ({code}): {msg}")
+        }
+        other => anyhow::anyhow!("remote node unreachable at {url}: {other}"),
+    })?;
+    let reader = BufReader::new(response.into_reader());
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue; // heartbeat
+        }
+        let value: Value = serde_json::from_str(&line)?;
+        if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            bail!(
+                "{}",
+                value
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown remote error")
+            );
+        }
+        on_line(value)?;
+    }
+    Ok(())
+}
+
 /// Open a tail stream; hand each JSON line to `on_line` until EOF/ctrl-c.
 pub fn tail(
     paths: &Paths,

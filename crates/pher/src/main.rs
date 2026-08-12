@@ -1,3 +1,4 @@
+mod apply;
 mod client;
 mod conditions;
 mod daemon;
@@ -89,6 +90,21 @@ enum Cmd {
         /// Max deliveries, then retire
         #[arg(long)]
         limit: Option<u64>,
+        /// Stable name for declarative reconciliation (pher apply)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Apply a declarative config (pheromone.toml): reconcile subscriptions,
+    /// conditions, and nodes against the target daemon
+    Apply {
+        /// Config file (default: ./pheromone.toml, else ~/.pheromone/pheromone.toml)
+        file: Option<String>,
+        /// Remove named subscriptions/conditions on the daemon that are not in the file
+        #[arg(long)]
+        prune: bool,
+        /// Report what would change without changing it
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List registered subscriptions
     Ls {
@@ -334,6 +350,7 @@ fn run() -> anyhow::Result<()> {
             batch,
             since,
             limit,
+            name,
         } => {
             let mut options: Vec<String> = Vec::new();
             if let Some(d) = ttl {
@@ -359,6 +376,7 @@ fn run() -> anyhow::Result<()> {
                 &Request::When {
                     string: subscription,
                     options,
+                    name,
                 },
             )?;
             println!(
@@ -377,6 +395,13 @@ fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Apply {
+            file,
+            prune,
+            dry_run,
+        } => {
+            apply::run(&paths, &target, file.as_deref(), prune, dry_run)?;
+        }
         Cmd::Ls { json } => {
             let response = client::call_target(&target, &Request::Ls)?;
             let subs = response["subs"].as_array().cloned().unwrap_or_default();
@@ -386,8 +411,12 @@ fn run() -> anyhow::Result<()> {
                 println!("no subscriptions");
             } else {
                 for s in subs {
+                    let name = s["name"]
+                        .as_str()
+                        .map(|n| format!(" ({n})"))
+                        .unwrap_or_default();
                     println!(
-                        "{}  [{} deliveries]  {}",
+                        "{}{name}  [{} deliveries]  {}",
                         s["id"].as_str().unwrap_or("?"),
                         s["deliveries"],
                         s["string"].as_str().unwrap_or("?")
@@ -413,9 +442,6 @@ fn run() -> anyhow::Result<()> {
             })?;
         }
         Cmd::Listen { subscription } => {
-            if remote {
-                bail!("listen is a streaming op — not supported over --node yet");
-            }
             // Sugar: a bare `on ... where ...` gets `then stream` appended.
             let text = if Subscription::parse(&subscription).is_ok() {
                 subscription
@@ -423,12 +449,8 @@ fn run() -> anyhow::Result<()> {
                 format!("{subscription} then stream")
             };
             Subscription::parse(&text)?; // surface parse errors before connecting
-            let request = Request::Listen {
-                string: text,
-                options: Vec::new(),
-                client: Some(format!("pher-listen-{}", std::process::id())),
-            };
-            client::tail(&paths, &request, |line| {
+            let client_name = format!("pher-listen-{}@{}", std::process::id(), daemon::hostname());
+            let print = |line: Value| -> anyhow::Result<()> {
                 if let Some(canonical) = line.get("canonical").and_then(|c| c.as_str()) {
                     eprintln!(
                         "listening as {} — {canonical}",
@@ -438,7 +460,21 @@ fn run() -> anyhow::Result<()> {
                     println!("{line}");
                 }
                 Ok(())
-            })?;
+            };
+            match &target {
+                client::Target::Local(_) => {
+                    let request = Request::Listen {
+                        string: text,
+                        options: Vec::new(),
+                        client: Some(client_name),
+                    };
+                    client::tail(&paths, &request, print)?;
+                }
+                client::Target::Remote { url, token } => {
+                    let body = serde_json::json!({ "string": text, "client": client_name });
+                    client::listen_remote(url, token.as_deref(), &body, print)?;
+                }
+            }
         }
         Cmd::Why { delivery_id } => {
             let response = client::call_target(&target, &Request::Why { delivery_id })?;

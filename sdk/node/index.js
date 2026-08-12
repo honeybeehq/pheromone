@@ -122,8 +122,10 @@ export class PherClient {
   }
 
   /** Register a durable subscription (must use a push sink, not stream). */
-  async when(subscription, { options = [] } = {}) {
-    const r = await this._t.call({ op: "when", string: subscription, options });
+  async when(subscription, { options = [], name } = {}) {
+    const req = { op: "when", string: subscription, options };
+    if (name) req.name = name;
+    const r = await this._t.call(req);
     return {
       id: r.id,
       canonical: r.canonical,
@@ -288,11 +290,66 @@ class RemoteTransport {
     return body;
   }
 
-  stream() {
-    throw new Error(
-      "streaming (on/tail) is not supported over HTTP /rpc — connect an SDK " +
-        "client on the node itself, or use a push sink (`when` + then http/buz/...)",
-    );
+  /**
+   * Remote streaming: POST /listen returns chunked NDJSON (ack line, then
+   * deliveries; blank lines are heartbeats). Wrapped to look like a
+   * LineSocket: 'line' / 'closed' / 'error' events and close().
+   */
+  async stream(request) {
+    if (request.op !== "listen") {
+      throw new Error(
+        "only listen streams over HTTP — tail is a local debugging surface",
+      );
+    }
+    const headers = { "content-type": "application/json" };
+    if (this.token) headers.authorization = `Bearer ${this.token}`;
+    const controller = new AbortController();
+    let res;
+    try {
+      res = await fetch(`${this.url}/listen`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      throw new Error(`remote node unreachable at ${this.url}: ${e.message}`);
+    }
+    if (!res.ok && !res.body) {
+      throw new Error(`remote listen failed (HTTP ${res.status})`);
+    }
+
+    const emitter = new EventEmitter();
+    emitter.closed = false;
+    emitter.close = () => {
+      emitter.closed = true;
+      controller.abort();
+    };
+    (async () => {
+      let buf = "";
+      try {
+        for await (const chunk of res.body) {
+          buf += Buffer.from(chunk).toString("utf8");
+          let nl;
+          while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line) continue; // heartbeat
+            try {
+              emitter.emit("line", JSON.parse(line));
+            } catch (e) {
+              emitter.emit("error", new Error(`bad line: ${e.message}`));
+            }
+          }
+        }
+      } catch (e) {
+        if (!emitter.closed) emitter.emit("error", e);
+      } finally {
+        emitter.closed = true;
+        emitter.emit("closed");
+      }
+    })();
+    return emitter;
   }
 
   close() {}

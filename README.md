@@ -81,12 +81,21 @@ What works today:
 - **Code-based subscribers** — `then stream` + the `@pheromone/client` Node SDK
   (`sdk/node`): `pher.on('on ci.* where …', handler)` registers a
   connection-scoped subscription; the daemon evaluates the full cascade and
-  pushes deliveries down the socket. The subscription is removed the moment the
-  listener disconnects — the enforced form of `while <client> alive` (and
+  pushes deliveries down the connection. The subscription is removed the moment
+  the listener disconnects — the enforced form of `while <client> alive` (and
   `pher when '… then stream'` is refused: a stored stream sub with no listener
-  would be a lie). Same surface for humans: `pher listen 'on demo.*'`. The SDK
-  also covers `emit`/`when`/`ls`/`rm`/`why`/`whyNot`/`status`/`tail` locally
-  and against remote nodes via `/rpc` (`PherClient.remote(url, {token})`).
+  would be a lie). Same surface for humans: `pher listen 'on demo.*'`. Works
+  **across the mesh**: `POST /listen` streams chunked NDJSON (heartbeats for
+  bounded disconnect detection), so `pher --node hub listen '…'` and
+  `PherClient.remote(url, {token}).on('…', handler)` subscribe to a remote
+  hub with no local daemon. The SDK also covers
+  `emit`/`when`/`ls`/`rm`/`why`/`whyNot`/`status` locally and via `/rpc`.
+- **Declarative config** — `pheromone.toml` + `pher apply [--prune] [--dry-run]`
+  (see `pheromone.example.toml`): named subscriptions, metric conditions, and
+  the node registry, reconciled idempotently against the local daemon or a
+  remote hub (`pher --node metal1 apply`). Named things are file-owned;
+  ad-hoc `pher when` registrations are never touched. Node tokens via
+  `token-env`, never in the file.
 - **`@pheromone/core` Node addon** (napi-rs, `crates/pher-node`) — the same
   matcher in-process for TS consumers: `parse`/`fmt`/`canon`/`validate`/
   `evaluate`/`whyNot` plus a standing `Matcher` class. Build with

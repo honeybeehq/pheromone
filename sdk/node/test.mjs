@@ -16,8 +16,16 @@ if (!fs.existsSync(bin)) {
   process.exit(1);
 }
 
+const HTTP = "127.0.0.1:14877";
+const TOKEN = "sdk-test-token";
 const daemon = spawn(bin, ["daemon", "run"], {
-  env: { ...process.env, PHEROMONE_HOME: home, PHER_EMBED: "off" },
+  env: {
+    ...process.env,
+    PHEROMONE_HOME: home,
+    PHER_EMBED: "off",
+    PHER_HTTP: HTTP,
+    PHER_HTTP_TOKEN: TOKEN,
+  },
   stdio: ["ignore", "ignore", "inherit"],
 });
 
@@ -104,10 +112,40 @@ try {
   assert.equal(why.match.subscription, listener.id);
   console.log("ok  why()");
 
-  // Remote transport: bad target fails with a useful error, streaming throws.
-  const remote = PherClient.remote("http://127.0.0.1:1", { token: "x" });
-  await assert.rejects(() => remote.status(), /unreachable/);
-  await assert.rejects(() => remote.on("on x", () => {}), /not supported/);
+  // Remote transport over HTTP: verbs via /rpc, streaming via /listen.
+  const hub = PherClient.remote(`http://${HTTP}`, { token: TOKEN });
+  const hubStatus = await hub.status();
+  assert.equal(hubStatus.ok, true);
+  const remoteGot = [];
+  const remoteListener = await hub.on(
+    'on mesh.* where payload.sev == "high"',
+    (d) => remoteGot.push(d),
+  );
+  assert.match(remoteListener.id, /^PH\./);
+  await hub.emit("mesh.alert", { sev: "high" });
+  await hub.emit("mesh.alert", { sev: "low" });
+  await until(() => remoteGot.length >= 1, "remote delivery");
+  await sleep(200);
+  assert.equal(remoteGot.length, 1);
+  assert.equal(remoteGot[0].event.payload.sev, "high");
+  console.log("ok  remote on() over HTTP /listen");
+
+  // Remote hangup: detection is write-bounded (TCP needs a second write
+  // after the peer vanishes to surface the error, or the 15s heartbeat), so
+  // keep emitting while polling.
+  remoteListener.close();
+  await until(async () => {
+    await hub.emit("mesh.alert", { sev: "high" });
+    return !(await hub.ls()).some((s) => s.id === remoteListener.id);
+  }, "remote listener teardown");
+  console.log("ok  remote close() evaporates the subscription");
+
+  // Auth and reachability failures stay useful.
+  const badAuth = PherClient.remote(`http://${HTTP}`, { token: "wrong" });
+  await assert.rejects(() => badAuth.status(), /unauthorized/);
+  const unreachable = PherClient.remote("http://127.0.0.1:1", { token: "x" });
+  await assert.rejects(() => unreachable.status(), /unreachable/);
+  await assert.rejects(() => unreachable.on("on x", () => {}), /unreachable/);
   console.log("ok  remote transport errors");
 
   pher.close();

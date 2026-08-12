@@ -39,16 +39,22 @@ await pher.when("on ci.* where payload.conclusion == \"failure\" then buz operat
 
 ## Remote nodes
 
-Non-streaming verbs work against any node's HTTP `/rpc`:
+The same API works against a remote hub over HTTP — verbs via `/rpc`,
+`on()` via `/listen` (chunked NDJSON with heartbeats). A machine on the mesh
+needs no local daemon to subscribe:
 
 ```js
-const hub = PherClient.remote("http://hub:4870", { token: process.env.PHER_HTTP_TOKEN });
+const hub = PherClient.remote("http://metal1:4870", { token: process.env.PHER_HTTP_TOKEN });
 await hub.emit("deploy.finished", { env: "prod" });
 await hub.when("on deploy.* then buz operator"); // durable, runs on the hub
+const sub = await hub.on("on deploy.* where payload.env == \"prod\"", (d) => {
+  console.log("prod deploy:", d.event.payload);
+});
 ```
 
-Streaming (`on`/`tail`) over HTTP is not supported yet — run the SDK on the
-node itself, or use a push sink pointed at your service.
+Remote disconnect detection is write-bounded: a vanished client is torn down
+on the next delivery or heartbeat (≤ ~30s), not instantly like the local
+socket. `tail` stays local-only (debugging surface).
 
 ## API
 

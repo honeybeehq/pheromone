@@ -67,7 +67,7 @@ export interface TailHandle extends EventEmitter {
 export declare class PherClient {
   /** Connect to the local daemon's unix socket (PHEROMONE_HOME/pherd.sock). */
   static connect(opts?: { home?: string }): Promise<PherClient>;
-  /** Target a remote node's HTTP /rpc. Streaming ops (`on`, `tail`) throw. */
+  /** Target a remote node over HTTP: /rpc for verbs, /listen for `on()`. */
   static remote(url: string, opts?: { token?: string }): PherClient;
 
   emit(
@@ -77,7 +77,10 @@ export declare class PherClient {
   ): Promise<EmitResult>;
 
   /** Register a durable subscription with a push sink (buz/hive/http/cmd/...). */
-  when(subscription: string, opts?: { options?: string[] }): Promise<WhenResult>;
+  when(
+    subscription: string,
+    opts?: { options?: string[]; name?: string },
+  ): Promise<WhenResult>;
 
   /**
    * Register a connection-scoped subscription (`then stream` appended if the

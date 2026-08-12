@@ -37,6 +37,9 @@ fn unix_to_ts(secs: u64) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubMeta {
     pub id: String,
+    /// Stable name for declarative reconciliation (`pher apply`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
     /// Canonical string form.
     pub string: String,
     /// Canonical JSON form (source of truth for reconstruction).
@@ -281,7 +284,12 @@ impl State {
 
     // -- registration ------------------------------------------------------
 
-    fn register(&mut self, string: &str, option_words: &[String]) -> Result<Value, String> {
+    fn register(
+        &mut self,
+        string: &str,
+        option_words: &[String],
+        name: Option<String>,
+    ) -> Result<Value, String> {
         let mut sub = Subscription::parse(string).map_err(|e| e.to_string())?;
         if !option_words.is_empty() {
             pher_core::subscription::apply_option_words(&mut sub, option_words)
@@ -296,7 +304,7 @@ impl State {
                     .to_string(),
             );
         }
-        self.register_parsed(sub)
+        self.register_parsed(sub, name)
     }
 
     /// Registration path for `Listen` connections: the sink must be `stream`,
@@ -324,10 +332,23 @@ impl State {
                 lessee: client.to_string(),
             };
         }
-        self.register_parsed(sub)
+        self.register_parsed(sub, None)
     }
 
-    fn register_parsed(&mut self, sub: Subscription) -> Result<Value, String> {
+    fn register_parsed(
+        &mut self,
+        sub: Subscription,
+        name: Option<String>,
+    ) -> Result<Value, String> {
+        if let Some(n) = &name {
+            if let Some(existing) = self.metas.values().find(|m| m.name.as_deref() == Some(n)) {
+                return Err(format!(
+                    "subscription name '{n}' already in use ({}) — `pher apply` reconciles, \
+                     or rm it first",
+                    existing.id
+                ));
+            }
+        }
         // Honesty gate: a judge subscription needs a working provider config
         // NOW, not at first event — refuse registration with the exact fix.
         if sub.judge.is_some() {
@@ -411,6 +432,7 @@ impl State {
 
         let meta = SubMeta {
             id: id.clone(),
+            name,
             string: sub.canon(),
             json: sub.to_json(),
             created: now_ts(),
@@ -1342,7 +1364,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     std::process::Command::new("hostname")
         .output()
         .ok()
@@ -1564,10 +1586,14 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<State>>) -> anyhow::Re
 pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
     match request {
         Request::Emit { event } => state.lock().unwrap().ingest(event, 0).unwrap_or_else(err),
-        Request::When { string, options } => state
+        Request::When {
+            string,
+            options,
+            name,
+        } => state
             .lock()
             .unwrap()
-            .register(&string, &options)
+            .register(&string, &options, name)
             .unwrap_or_else(err),
         Request::Ls => {
             let s = state.lock().unwrap();
@@ -1791,6 +1817,42 @@ fn handle_tail(
     Ok(())
 }
 
+/// Register a subscription whose sink is a live listener, wherever that
+/// listener is attached (unix socket or HTTP stream). Returns the sub id,
+/// the ack to send first, and the delivery channel. Err carries the protocol
+/// error Value to send back.
+pub(crate) fn attach_listener(
+    state: &Arc<Mutex<State>>,
+    string: &str,
+    options: &[String],
+    client: &str,
+) -> Result<(String, Value, mpsc::Receiver<String>), Value> {
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut s = state.lock().unwrap();
+    match s.register_listener(string, options, client) {
+        Ok(ack) => {
+            let id = ack
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            s.listeners.insert(id.clone(), tx);
+            Ok((id, ack, rx))
+        }
+        Err(e) => Err(err(e)),
+    }
+}
+
+/// Tear a listener's subscription down. Guarded: only the party that still
+/// finds the listener does the removal, so racing detach paths (watchdog,
+/// writer loop, HTTP stream end) can't double-remove.
+pub(crate) fn detach_listener(state: &Arc<Mutex<State>>, sub_id: &str, reason: &str) {
+    let mut s = state.lock().unwrap();
+    if s.listeners.remove(sub_id).is_some() {
+        s.remove_sub(sub_id, reason);
+    }
+}
+
 /// A `Listen` connection: register the subscription with this connection as
 /// its sink, ack with the id, then stream deliveries until the client hangs
 /// up or the subscription is removed. Disconnect tears the subscription down
@@ -1803,35 +1865,16 @@ fn handle_listen(
     state: &Arc<Mutex<State>>,
 ) -> anyhow::Result<()> {
     let client = client.unwrap_or_else(|| "listener".to_string());
-    let (tx, rx) = mpsc::channel::<String>();
-    let (sub_id, ack) = {
-        let mut s = state.lock().unwrap();
-        match s.register_listener(string, options, &client) {
-            Ok(ack) => {
-                let id = ack
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                s.listeners.insert(id.clone(), tx);
-                (id, ack)
-            }
-            Err(e) => {
-                respond(stream, &err(e))?;
-                return Ok(());
-            }
+    let (sub_id, ack, rx) = match attach_listener(state, string, options, &client) {
+        Ok(attached) => attached,
+        Err(e) => {
+            respond(stream, &e)?;
+            return Ok(());
         }
     };
     respond(stream, &ack)?;
 
-    let teardown = |reason: &str| {
-        let mut s = state.lock().unwrap();
-        // Only the party that still finds the listener does the teardown, so
-        // the watchdog and the writer loop can't double-remove.
-        if s.listeners.remove(&sub_id).is_some() {
-            s.remove_sub(&sub_id, reason);
-        }
-    };
+    let teardown = |reason: &str| detach_listener(state, &sub_id, reason);
 
     // EOF watchdog: deliveries may be rare, so a broken pipe alone would
     // detect disconnects too late. A blocked read notices immediately.
@@ -1849,10 +1892,7 @@ fn handle_listen(
                     Ok(_) => {} // the connection is delivery-only; ignore input
                 }
             }
-            let mut s = state.lock().unwrap();
-            if s.listeners.remove(&sub_id).is_some() {
-                s.remove_sub(&sub_id, "listener disconnected");
-            }
+            detach_listener(&state, &sub_id, "listener disconnected");
         });
     }
 

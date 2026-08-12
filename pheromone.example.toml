@@ -1,0 +1,43 @@
+# pheromone.toml — declarative bus config, reconciled with `pher apply`.
+#
+#   pher apply                      # against the local daemon
+#   pher --node hub apply           # against a remote node, over /rpc
+#   pher apply --prune              # the file owns the named namespace
+#   pher apply --dry-run            # show the diff, change nothing
+#
+# Identity is the `name`. Named subscriptions/conditions are managed by this
+# file; ad-hoc unnamed `pher when` registrations are never touched. Typical
+# org layout: check this file into a repo, apply it to the hub from CI or
+# any machine on the tailnet.
+
+# -- what the hub reacts to --------------------------------------------------
+
+[[subscription]]
+name = "ci-failures"
+when = 'on ci.* where payload.conclusion == "failure" && payload.branch == "main" then buz operator'
+
+[[subscription]]
+name = "stuck-agents"
+when = 'on hive.session.* judge "Is this agent stuck in a loop, repeating the same failing action?" budget 200/day then buz operator --tier queue'
+
+[[subscription]]
+name = "latency-page"
+when = 'on metric.condition.entered where payload.name == "p95_high" then hermes notify-oncall'
+
+# -- metric conditions (datapoints in via POST /metric, transitions out) -----
+
+[[condition]]
+name = "p95_high"
+metric = "p95_latency"
+gt = 800
+hold = "5m"
+labels = { env = "prod" }
+
+# -- mesh topology (this machine's node registry) ----------------------------
+# Tokens stay out of the file: token-env names an env var to read at apply
+# time (set it from your secrets manager).
+
+[[node]]
+name = "metal1"
+url = "http://metal1:4870"
+token-env = "PHER_HTTP_TOKEN_METAL1"

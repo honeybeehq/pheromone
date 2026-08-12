@@ -111,6 +111,84 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             let response = crate::daemon::handle_rpc(rpc, &state);
             respond(request, 200, response);
         }
+        ("POST", "/listen") => {
+            // Remote code-based subscribers: register a connection-scoped
+            // `then stream` subscription and stream deliveries as chunked
+            // NDJSON. First line is the ack; blank lines are heartbeats
+            // (bounded disconnect detection). Dropping the response tears the
+            // subscription down — the lease semantics, over the tailnet.
+            if !authed {
+                return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
+            }
+            let Ok(v) = serde_json::from_slice::<Value>(&body) else {
+                return respond(request, 400, json!({"ok": false, "error": "invalid JSON"}));
+            };
+            let Some(string) = v.get("string").and_then(|s| s.as_str()) else {
+                return respond(
+                    request,
+                    400,
+                    json!({"ok": false, "error": "expected {string, options?, client?}"}),
+                );
+            };
+            let options: Vec<String> = v
+                .get("options")
+                .and_then(|o| o.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let client = v
+                .get("client")
+                .and_then(|c| c.as_str())
+                .unwrap_or("http-listener")
+                .to_string();
+            let (sub_id, ack, rx) =
+                match crate::daemon::attach_listener(&state, string, &options, &client) {
+                    Ok(attached) => attached,
+                    Err(e) => return respond(request, 400, e),
+                };
+            // Hand-rolled response: tiny_http's Response path buffers twice
+            // (1KiB BufWriter + the chunked encoder's 8KiB chunk buffer), so
+            // nothing would reach the client until the stream ENDS. Writing
+            // the status line, headers, and chunk frames ourselves — with a
+            // flush per line — is what makes this a live stream.
+            let mut writer = request.into_writer();
+            let reason = (|| -> &'static str {
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\ncache-control: no-store\r\n\r\n";
+                if writer.write_all(head.as_bytes()).is_err() || writer.flush().is_err() {
+                    return "listener disconnected";
+                }
+                if write_chunk(&mut writer, &format!("{ack}\n")).is_err() {
+                    return "listener disconnected";
+                }
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                        Ok(line) => {
+                            if write_chunk(&mut writer, &format!("{line}\n")).is_err() {
+                                return "listener disconnected";
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Heartbeat: detects a vanished client within one
+                            // interval even when no deliveries flow.
+                            if write_chunk(&mut writer, "\n").is_err() {
+                                return "listener disconnected";
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            // Sub removed daemon-side (rm/limit/ttl): end the
+                            // response properly with the terminal chunk.
+                            let _ = writer.write_all(b"0\r\n\r\n");
+                            let _ = writer.flush();
+                            return "stream ended";
+                        }
+                    }
+                }
+            })();
+            crate::daemon::detach_listener(&state, &sub_id, reason);
+        }
         ("POST", "/deliver") => {
             // Filter-at-source landing zone: a remote node's http sink posts
             // its delivery JSON here; only matches ever cross the wire.
@@ -214,6 +292,14 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
         }
         _ => respond(request, 404, json!({"ok": false, "error": "not found"})),
     }
+}
+
+/// One HTTP/1.1 chunk frame: size line, payload, CRLF — flushed immediately.
+fn write_chunk(writer: &mut impl std::io::Write, data: &str) -> std::io::Result<()> {
+    write!(writer, "{:X}\r\n", data.len())?;
+    writer.write_all(data.as_bytes())?;
+    writer.write_all(b"\r\n")?;
+    writer.flush()
 }
 
 fn respond(request: tiny_http::Request, code: u16, body: Value) {
