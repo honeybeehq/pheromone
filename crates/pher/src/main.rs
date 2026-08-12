@@ -2,9 +2,11 @@ mod client;
 mod conditions;
 mod daemon;
 mod http;
+mod init;
 mod judge;
 mod protocol;
 mod semantic;
+mod service;
 mod store;
 mod tap;
 
@@ -124,6 +126,8 @@ enum Cmd {
     },
     /// Daemon status
     Status,
+    /// First-run bootstrap: create the state dir and report environment gaps
+    Init,
     /// Daemon control
     Daemon {
         #[command(subcommand)]
@@ -207,6 +211,12 @@ enum TapCmd {
 enum DaemonCmd {
     /// Run pherd in the foreground
     Run,
+    /// Install pherd as a user service (launchd/systemd): starts now and at login
+    Install,
+    /// Stop and remove the pherd user service
+    Uninstall,
+    /// Show service install state and live daemon status
+    Status,
 }
 
 fn main() {
@@ -448,13 +458,22 @@ fn run() -> anyhow::Result<()> {
             let response = client::call_target(&target, &Request::Status)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
-        Cmd::Daemon {
-            cmd: DaemonCmd::Run,
-        } => {
+        Cmd::Init => {
+            if remote {
+                bail!("init is local-only");
+            }
+            init::run(&paths)?;
+        }
+        Cmd::Daemon { cmd } => {
             if remote {
                 bail!("the daemon always runs locally");
             }
-            daemon::run(paths)?;
+            match cmd {
+                DaemonCmd::Run => daemon::run(paths)?,
+                DaemonCmd::Install => service::install(&paths)?,
+                DaemonCmd::Uninstall => service::uninstall(&paths)?,
+                DaemonCmd::Status => service::status(&paths)?,
+            }
         }
         Cmd::Tap {
             cmd: TapCmd::Hive { since },

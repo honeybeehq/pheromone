@@ -107,14 +107,25 @@ What works today:
   mechanics: trie candidates skip tier-1 rechecks, parse-time path binding, and
   a per-event path cache so each distinct `where` path resolves once per event.
 
-Build: `cargo build --release` → `target/release/pher`. Test: `cargo test`.
+- **Install & run as a service:** release artifacts + a `curl | sh` installer are
+  wired via cargo-dist (`.github/workflows/release.yml`; a tag push publishes
+  once the repo is public). `pher init` bootstraps the state dir and reports
+  environment gaps with the exact fix for each; `pher daemon install` runs pherd
+  under launchd (macOS) / a systemd user unit (Linux) — starts at login,
+  restarts on crash (kill -9 verified), logs to `~/.pheromone/log/pherd.log`,
+  captures `PHEROMONE_HOME` + `PHER_*` env at install time. `pher daemon
+  status` / `uninstall` complete the set.
 
-Quickstart (two shells):
+Build: `cargo build --release` → `target/release/pher`. Test: `cargo test`.
+Release artifacts: `dist build` (cargo-dist).
+
+Quickstart:
 
 ```bash
-pher daemon run                                                    # shell 1
-pher when 'on hive.seal where payload.status == "blocked" then cmd echo stuck'  # shell 2
-pher emit hive.seal --payload '{"status": "blocked"}'
+pher init             # create state dir, see what's missing
+pher daemon install   # supervised daemon (or: pher daemon run, foreground)
+pher listen 'on hive.seal where payload.status == "blocked"'       # shell 1
+pher emit hive.seal --payload '{"status": "blocked"}'              # shell 2
 pher why-not <sub-id> <event-id>   # when something doesn't fire
 ```
 
