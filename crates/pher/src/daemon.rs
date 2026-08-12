@@ -2336,19 +2336,18 @@ fn rpc_why_not(sub: &str, event: &str, state: &Arc<Mutex<State>>) -> Value {
 /// atomically (seq dedup at the handoff makes the seam exact). Shared by the
 /// unix socket and HTTP /tail. `last` truncates the backlog to its tail —
 /// consoles want recent context, not a week of history.
+pub(crate) type TailAttachment = (
+    Vec<(u64, Envelope)>,
+    mpsc::Receiver<String>,
+    Option<SubjectPattern>,
+);
+
 pub(crate) fn attach_tail(
     state: &Arc<Mutex<State>>,
     after: Option<u64>,
     subject: Option<String>,
     last: Option<usize>,
-) -> Result<
-    (
-        Vec<(u64, Envelope)>,
-        mpsc::Receiver<String>,
-        Option<SubjectPattern>,
-    ),
-    Value,
-> {
+) -> Result<TailAttachment, Value> {
     let pattern = match subject.map(|s| SubjectPattern::parse(&s)).transpose() {
         Ok(p) => p,
         Err(e) => return Err(err(e)),
