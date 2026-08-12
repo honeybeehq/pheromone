@@ -39,20 +39,68 @@ impl Sender<'_> {
 /// spawn → prompt → seal across the whole vocabulary.
 const CORRELATION_FIELDS: &[&str] = &["session", "bee", "name", "flight", "id"];
 
+/// Reconnect bookkeeping: where the tap was in the ledger, and what it has
+/// already forwarded. `seen` dedups the resume overlap — re-emitting a
+/// ledger line would mint a fresh envelope id, so without this, retries
+/// would duplicate events on the bus.
+struct TapState {
+    /// Unix secs of the last forwarded ledger event.
+    last_ts: Option<u64>,
+    /// Recent raw ledger lines (the ledger is append-only; identical lines
+    /// mean the same event).
+    seen: std::collections::VecDeque<String>,
+    forwarded: u64,
+}
+
+const TAP_SEEN_WINDOW: usize = 1000;
+
 pub fn run_hive_tap(target: &Target, paths: &Paths, since: &str) -> anyhow::Result<()> {
+    let mut tap = TapState {
+        last_ts: None,
+        seen: std::collections::VecDeque::new(),
+        forwarded: 0,
+    };
     let mut backlog_since = since.to_string();
+    let mut delay = 2u64;
     loop {
-        match follow_once(target, paths, &backlog_since) {
+        let before = tap.forwarded;
+        match follow_once(target, paths, &backlog_since, &mut tap) {
             Ok(()) => unreachable!("follow_once only returns by error"),
-            Err(e) => eprintln!("pher tap hive: {e:#}; retrying in 2s"),
+            Err(e) => eprintln!("pher tap hive: {e:#}; retrying in {delay}s"),
         }
-        // After the first attempt never replay a long backlog again.
-        backlog_since = "1s".to_string();
-        std::thread::sleep(Duration::from_secs(2));
+        // Resume from the last forwarded event (with a 2s overlap the seen-
+        // window dedups), so an outage delays ledger events instead of
+        // dropping them. Cap the re-read at a day.
+        backlog_since = match tap.last_ts {
+            Some(t) => {
+                let gap = (now_unix().saturating_sub(t) + 2).min(86_400);
+                format!("{gap}s")
+            }
+            None => backlog_since, // never connected: keep the requested lookback
+        };
+        std::thread::sleep(Duration::from_secs(delay));
+        // Progress resets the backoff; persistent failure walks it to 30s.
+        delay = if tap.forwarded > before {
+            2
+        } else {
+            (delay * 2).min(30)
+        };
     }
 }
 
-fn follow_once(target: &Target, paths: &Paths, since: &str) -> anyhow::Result<()> {
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn follow_once(
+    target: &Target,
+    paths: &Paths,
+    since: &str,
+    tap: &mut TapState,
+) -> anyhow::Result<()> {
     let mut conn = match target {
         Target::Local(_) => Sender::Local(Conn::connect(paths)?),
         remote => Sender::Remote(remote),
@@ -80,23 +128,43 @@ fn follow_once(target: &Target, paths: &Paths, since: &str) -> anyhow::Result<()
     }
     eprintln!("pher tap hive: following the hive ledger (since {since})");
 
-    let mut count: u64 = 0;
     for line in BufReader::new(stdout).lines() {
         let line = line.context("hive events stream read failed")?;
-        let Some(event) = map_ledger_line(&line) else {
+        let trimmed = line.trim().to_string();
+        let Some(event) = map_ledger_line(&trimmed) else {
             continue;
         };
+        if tap.seen.contains(&trimmed) {
+            continue; // resume overlap: already forwarded before the retry
+        }
         if let Err(e) = conn.emit(&Request::Emit { event }) {
             let _ = child.kill();
             return Err(e).context("emit to pherd failed");
         }
-        count += 1;
-        if count.is_multiple_of(500) {
-            eprintln!("pher tap hive: {count} events forwarded");
+        tap.seen.push_back(trimmed.clone());
+        while tap.seen.len() > TAP_SEEN_WINDOW {
+            tap.seen.pop_front();
+        }
+        if let Some(ts) = ledger_ts(&trimmed) {
+            tap.last_ts = Some(ts);
+        }
+        tap.forwarded += 1;
+        if tap.forwarded.is_multiple_of(500) {
+            eprintln!("pher tap hive: {} events forwarded", tap.forwarded);
         }
     }
     let _ = child.wait();
     bail!("`hive events --follow` exited")
+}
+
+/// Unix secs of a ledger line's `ts` field (RFC3339), if parseable.
+fn ledger_ts(line: &str) -> Option<u64> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    let ts = v.get("ts")?.as_str()?;
+    humantime::parse_rfc3339_weak(ts)
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
 }
 
 /// Map one ledger JSON line to a bus event. Returns None for unparseable

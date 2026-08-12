@@ -127,6 +127,18 @@ enum Cmd {
     Listen {
         /// Subscription text; `then stream` is appended if there is no then-clause
         subscription: String,
+        /// Resume: replay matches from log seq > N, then go live
+        #[arg(long)]
+        after: Option<u64>,
+        /// Named hub-side cursor: resume from its committed position and
+        /// commit each delivery as it is printed
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Inspect or remove named consumer cursors
+    Cursor {
+        #[command(subcommand)]
+        cmd: CursorCmd,
     },
     /// Show the full match record for a delivery
     Why {
@@ -164,6 +176,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NodeCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum CursorCmd {
+    /// List named cursors and the log head
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a cursor
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -441,7 +464,11 @@ fn run() -> anyhow::Result<()> {
                 Ok(())
             })?;
         }
-        Cmd::Listen { subscription } => {
+        Cmd::Listen {
+            subscription,
+            after,
+            cursor,
+        } => {
             // Sugar: a bare `on ... where ...` gets `then stream` appended.
             let text = if Subscription::parse(&subscription).is_ok() {
                 subscription
@@ -450,14 +477,42 @@ fn run() -> anyhow::Result<()> {
             };
             Subscription::parse(&text)?; // surface parse errors before connecting
             let client_name = format!("pher-listen-{}@{}", std::process::id(), daemon::hostname());
-            let print = |line: Value| -> anyhow::Result<()> {
+            // A delivery counts as processed once printed; commit it then.
+            let commit_cursor = cursor.clone();
+            let commit_target = &target;
+            let print = move |line: Value| -> anyhow::Result<()> {
                 if let Some(canonical) = line.get("canonical").and_then(|c| c.as_str()) {
                     eprintln!(
                         "listening as {} — {canonical}",
                         line["id"].as_str().unwrap_or("?")
                     );
+                    if let (Some(from), Some(replayed)) =
+                        (line.get("resumedFrom"), line.get("replayed"))
+                    {
+                        eprintln!("resumed from seq {from}: {replayed} replayed delivery/ies");
+                    }
+                    if let Some(gap) = line.get("gapExpired") {
+                        eprintln!(
+                            "warning: {gap} event(s) in the gap already evaporated (retention)"
+                        );
+                    }
+                    for w in line["warnings"].as_array().into_iter().flatten() {
+                        eprintln!("warning: {}", w.as_str().unwrap_or_default());
+                    }
                 } else {
                     println!("{line}");
+                    if let (Some(name), Some(seq)) = (
+                        commit_cursor.as_deref(),
+                        line.get("seq").and_then(|s| s.as_u64()),
+                    ) {
+                        let _ = client::call_target(
+                            commit_target,
+                            &Request::CursorCommit {
+                                name: name.to_string(),
+                                seq,
+                            },
+                        );
+                    }
                 }
                 Ok(())
             };
@@ -467,15 +522,53 @@ fn run() -> anyhow::Result<()> {
                         string: text,
                         options: Vec::new(),
                         client: Some(client_name),
+                        after,
+                        cursor: cursor.clone(),
                     };
                     client::tail(&paths, &request, print)?;
                 }
                 client::Target::Remote { url, token } => {
-                    let body = serde_json::json!({ "string": text, "client": client_name });
+                    let mut body = serde_json::json!({ "string": text, "client": client_name });
+                    if let Some(a) = after {
+                        body["after"] = serde_json::json!(a);
+                    }
+                    if let Some(c) = &cursor {
+                        body["cursor"] = serde_json::json!(c);
+                    }
                     client::listen_remote(url, token.as_deref(), &body, print)?;
                 }
             }
         }
+        Cmd::Cursor { cmd } => match cmd {
+            CursorCmd::Ls { json } => {
+                let response = client::call_target(&target, &Request::CursorLs)?;
+                let cursors = response["cursors"].as_array().cloned().unwrap_or_default();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                } else if cursors.is_empty() {
+                    println!("no cursors (log head: seq {})", response["head"]);
+                } else {
+                    println!("log head: seq {}", response["head"]);
+                    for c in cursors {
+                        println!(
+                            "{}  seq {}  committed {}",
+                            c["name"].as_str().unwrap_or("?"),
+                            c["seq"],
+                            c["committedAt"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
+            }
+            CursorCmd::Rm { name } => {
+                let response =
+                    client::call_target(&target, &Request::CursorRm { name: name.clone() })?;
+                if response["removed"].as_bool() == Some(true) {
+                    println!("removed {name}");
+                } else {
+                    bail!("no cursor '{name}'");
+                }
+            }
+        },
         Cmd::Why { delivery_id } => {
             let response = client::call_target(&target, &Request::Why { delivery_id })?;
             println!("{}", serde_json::to_string_pretty(&response["delivery"])?);

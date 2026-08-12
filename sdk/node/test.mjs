@@ -140,6 +140,48 @@ try {
   }, "remote listener teardown");
   console.log("ok  remote close() evaporates the subscription");
 
+  // Cursor-based resume: exactly the gap, no duplicates, across a hangup.
+  const got1 = [];
+  const c1 = await pher.on("on cur.*", (d) => got1.push(d), { cursor: "t-cur" });
+  await pher.emit("cur.a", { n: 1 });
+  await until(() => got1.length >= 1, "cursor delivery 1");
+  assert.ok(got1[0].seq > 0, "deliveries carry seq");
+  await sleep(500); // let autoCommit's debounce flush
+  c1.close();
+  await until(
+    async () => !(await pher.ls()).some((s) => s.id === c1.id),
+    "cursor listener teardown",
+  );
+  await pher.emit("cur.b", { n: 2 });
+  await pher.emit("cur.c", { n: 3 });
+  const got2 = [];
+  const c2 = await pher.on("on cur.*", (d) => got2.push(d), { cursor: "t-cur" });
+  assert.ok(c2.ack.resumedFrom >= got1[0].seq, "ack reports resume point");
+  await until(() => got2.length >= 2, "cursor gap replay");
+  await sleep(200);
+  assert.deepEqual(
+    got2.map((d) => d.event.subject),
+    ["cur.b", "cur.c"],
+    "exactly the missed events, in order",
+  );
+  c2.close();
+  const { cursors } = await pher.cursors();
+  assert.ok(cursors.some((c) => c.name === "t-cur"));
+  console.log("ok  cursor resume replays exactly the gap");
+
+  // Reconnect: a server-side hangup (rm) triggers re-attach with backoff.
+  const got3 = [];
+  const r1 = await pher.on("on rec.*", (d) => got3.push(d), { reconnect: true });
+  const firstId = r1.id;
+  const reconnected = new Promise((r) => r1.once("reconnect", r));
+  await pher.rm(firstId);
+  await reconnected;
+  assert.notEqual(r1.id, firstId, "re-attached under a new sub id");
+  await pher.emit("rec.x", { n: 1 });
+  await until(() => got3.length >= 1, "delivery after reconnect");
+  r1.close();
+  console.log("ok  reconnect re-attaches after server-side hangup");
+
   // Auth and reachability failures stay useful.
   const badAuth = PherClient.remote(`http://${HTTP}`, { token: "wrong" });
   await assert.rejects(() => badAuth.status(), /unauthorized/);

@@ -79,18 +79,26 @@ class LineSocket extends EventEmitter {
   }
 }
 
-/** A live `on()` registration. EventEmitter: 'delivery', 'close', 'error'. */
+/**
+ * A live `on()` registration. EventEmitter: 'delivery', 'close', 'error',
+ * 'reconnect'. `lastSeq` tracks the highest log seq seen; `ack` holds the
+ * latest registration ack (resumedFrom, replayed, gapExpired, warnings).
+ */
 export class Listener extends EventEmitter {
-  constructor(sock, id, canonical) {
+  constructor() {
     super();
-    this._sock = sock;
-    this.id = id;
-    this.canonical = canonical;
+    this._sock = null;
+    this.id = null;
+    this.canonical = null;
+    this.ack = null;
+    this.lastSeq = 0;
+    this.closedByUser = false;
   }
 
-  /** Remove the subscription by hanging up. */
+  /** Remove the subscription by hanging up (disables auto-reconnect). */
   close() {
-    this._sock.close();
+    this.closedByUser = true;
+    this._sock?.close();
   }
 }
 
@@ -138,35 +146,139 @@ export class PherClient {
    * Register a connection-scoped subscription and receive deliveries as
    * callbacks. `then stream` is appended if the text has no then-clause.
    * The subscription is removed when the listener (or process) goes away.
+   *
+   * Robust consumption across flaky links:
+   * - `cursor`: named hub-side position; resumes exactly where the last
+   *   run committed, and (with `autoCommit`, default on) commits as
+   *   deliveries are handled.
+   * - `after`: one-shot resume from a log seq you tracked yourself.
+   * - `reconnect`: on connection loss, re-attach with backoff and resume
+   *   from the cursor / last seen seq ('reconnect' event fires).
    */
-  async on(subscription, handler, { client } = {}) {
+  async on(subscription, handler, opts = {}) {
+    const {
+      client,
+      after,
+      cursor,
+      autoCommit = true,
+      reconnect = false,
+    } = opts;
     const text = /\sthen\s/.test(` ${subscription} `)
       ? subscription
       : `${subscription} then stream`;
-    const sock = await this._t.stream({
-      op: "listen",
-      string: text,
-      options: [],
-      client: client ?? `sdk-${process.pid}`,
-    });
-    const ack = await new Promise((resolve, reject) => {
-      sock.once("line", resolve);
-      sock.once("closed", () =>
-        reject(new Error("pherd closed the connection before acking")),
-      );
-      sock.once("error", reject);
-    });
-    if (ack.ok !== true) {
-      sock.close();
-      throw new Error(ack.error ?? "listen failed");
-    }
-    const listener = new Listener(sock, ack.id, ack.canonical);
-    sock.on("line", (delivery) => {
+    const listener = new Listener();
+    if (after) listener.lastSeq = after;
+
+    let commitTimer = null;
+    let maxUncommitted = 0;
+    const commitNow = () => {
+      if (!cursor || !maxUncommitted) return;
+      const seq = maxUncommitted;
+      this._t
+        .call({ op: "cursorCommit", name: cursor, seq })
+        .catch((e) => listener.emit("error", e));
+    };
+    const scheduleCommit = (seq) => {
+      maxUncommitted = Math.max(maxUncommitted, seq);
+      if (commitTimer) return;
+      commitTimer = setTimeout(() => {
+        commitTimer = null;
+        commitNow();
+      }, 300);
+      commitTimer.unref?.();
+    };
+
+    const onDelivery = (delivery) => {
+      if (delivery.seq) {
+        listener.lastSeq = Math.max(listener.lastSeq, delivery.seq);
+        if (cursor && autoCommit) scheduleCommit(delivery.seq);
+      }
       if (handler) handler(delivery);
       listener.emit("delivery", delivery);
-    });
-    sock.on("closed", () => listener.emit("close"));
-    sock.on("error", (e) => listener.emit("error", e));
+    };
+
+    const attach = async (resumeAfter) => {
+      const req = {
+        op: "listen",
+        string: text,
+        options: [],
+        client: client ?? `sdk-${process.pid}`,
+      };
+      // The named cursor is authoritative when present; `after` covers
+      // client-tracked resumes and first attach.
+      if (cursor) req.cursor = cursor;
+      if (!cursor && resumeAfter) req.after = resumeAfter;
+      const sock = await this._t.stream(req);
+
+      // The delivery handler must be wired BEFORE awaiting the ack: with
+      // catch-up replay, deliveries can arrive in the same chunk as the ack
+      // and would otherwise be dropped.
+      let ackResolve, ackReject;
+      const ackPromise = new Promise((res, rej) => {
+        ackResolve = res;
+        ackReject = rej;
+      });
+      let gotAck = false;
+      sock.on("line", (line) => {
+        if (!gotAck) {
+          gotAck = true;
+          ackResolve(line);
+          return;
+        }
+        onDelivery(line);
+      });
+      sock.on("error", (e) => {
+        if (!gotAck) ackReject(e);
+        else listener.emit("error", e);
+      });
+      sock.on("closed", () => {
+        if (!gotAck) {
+          ackReject(new Error("pherd closed the connection before acking"));
+          return;
+        }
+        if (commitTimer) {
+          clearTimeout(commitTimer);
+          commitTimer = null;
+        }
+        commitNow(); // flush the position before deciding what's next
+        if (listener.closedByUser || !reconnect) {
+          listener.emit("close");
+          return;
+        }
+        reattachLoop();
+      });
+
+      const ack = await ackPromise;
+      if (ack.ok !== true) {
+        sock.close();
+        throw new Error(ack.error ?? "listen failed");
+      }
+      listener._sock = sock;
+      listener.id = ack.id;
+      listener.canonical = ack.canonical;
+      listener.ack = ack;
+      return ack;
+    };
+
+    const reattachLoop = async () => {
+      let delay = 1000;
+      for (;;) {
+        await new Promise((r) => setTimeout(r, delay).unref?.());
+        if (listener.closedByUser) {
+          listener.emit("close");
+          return;
+        }
+        try {
+          await attach(listener.lastSeq);
+          listener.emit("reconnect", listener.id);
+          return;
+        } catch {
+          delay = Math.min(delay * 2, 30_000);
+        }
+      }
+    };
+
+    await attach(listener.lastSeq);
     return listener;
   }
 
@@ -189,6 +301,20 @@ export class PherClient {
 
   async ls() {
     return (await this._t.call({ op: "ls" })).subs;
+  }
+
+  /** Named cursors on the target node, plus the log head seq. */
+  async cursors() {
+    const r = await this._t.call({ op: "cursorLs" });
+    return { cursors: r.cursors, head: r.head };
+  }
+
+  async cursorCommit(name, seq) {
+    return (await this._t.call({ op: "cursorCommit", name, seq })).seq;
+  }
+
+  async cursorRm(name) {
+    return (await this._t.call({ op: "cursorRm", name })).removed === true;
   }
 
   async rm(id) {

@@ -144,11 +144,14 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                 .and_then(|c| c.as_str())
                 .unwrap_or("http-listener")
                 .to_string();
-            let (sub_id, ack, rx) =
-                match crate::daemon::attach_listener(&state, string, &options, &client) {
-                    Ok(attached) => attached,
-                    Err(e) => return respond(request, 400, e),
-                };
+            let after = v.get("after").and_then(|a| a.as_u64());
+            let cursor = v.get("cursor").and_then(|c| c.as_str());
+            let (sub_id, ack, rx) = match crate::daemon::attach_listener(
+                &state, string, &options, &client, after, cursor,
+            ) {
+                Ok(attached) => attached,
+                Err(e) => return respond(request, 400, e),
+            };
             // Hand-rolled response: tiny_http's Response path buffers twice
             // (1KiB BufWriter + the chunked encoder's 8KiB chunk buffer), so
             // nothing would reach the client until the stream ENDS. Writing

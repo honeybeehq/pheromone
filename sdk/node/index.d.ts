@@ -14,6 +14,9 @@ export interface Envelope {
 
 export interface Delivery {
   deliveryId: string;
+  /** Log seq of the matched event (cursor bookkeeping); absent on some
+   * timer/shaping deliveries. */
+  seq?: number;
   event: Envelope;
   match: {
     subscription: string;
@@ -49,14 +52,19 @@ export interface SubInfo {
 }
 
 export declare class Listener extends EventEmitter {
-  /** Subscription id (PH.xxxx). */
+  /** Subscription id (PH.xxxx); changes after a reconnect. */
   readonly id: string;
   /** Canonical subscription text as registered. */
   readonly canonical: string;
-  /** Hang up; the daemon removes the subscription. */
+  /** Latest registration ack (resumedFrom, replayed, gapExpired, warnings). */
+  readonly ack: Record<string, unknown>;
+  /** Highest log seq seen (client-side resume bookkeeping). */
+  readonly lastSeq: number;
+  /** Hang up; the daemon removes the subscription (disables reconnect). */
   close(): void;
   on(event: "delivery", cb: (delivery: Delivery) => void): this;
   on(event: "close", cb: () => void): this;
+  on(event: "reconnect", cb: (id: string) => void): this;
   on(event: "error", cb: (err: Error) => void): this;
 }
 
@@ -90,8 +98,25 @@ export declare class PherClient {
   on(
     subscription: string,
     handler?: (delivery: Delivery) => void,
-    opts?: { client?: string },
+    opts?: {
+      client?: string;
+      /** Resume: replay matches from log seq > after, then live. */
+      after?: number;
+      /** Named hub-side cursor: resume from its committed position. */
+      cursor?: string;
+      /** Commit the cursor as deliveries are handled (default true). */
+      autoCommit?: boolean;
+      /** Re-attach with backoff on connection loss (default false). */
+      reconnect?: boolean;
+    },
   ): Promise<Listener>;
+
+  cursors(): Promise<{
+    cursors: Array<{ name: string; seq: number; committedAt: string }>;
+    head: number;
+  }>;
+  cursorCommit(name: string, seq: number): Promise<number>;
+  cursorRm(name: string): Promise<boolean>;
 
   /** Stream raw bus events (debugging surface). */
   tail(

@@ -37,6 +37,23 @@ pub enum Request {
         /// Listener name recorded as the lease lessee (`while <client> alive`).
         #[serde(default)]
         client: Option<String>,
+        /// Resume: replay matches from log events with seq > after, then live.
+        #[serde(default)]
+        after: Option<u64>,
+        /// Named hub-side cursor: resume from its committed seq (see
+        /// CursorCommit); takes effect when `after` is not given.
+        #[serde(default)]
+        cursor: Option<String>,
+    },
+    /// Advance a named cursor to seq (monotonic: max wins). Consumers commit
+    /// after processing, so redelivery-on-crash errs toward at-least-once.
+    CursorCommit {
+        name: String,
+        seq: u64,
+    },
+    CursorLs,
+    CursorRm {
+        name: String,
     },
     Why {
         #[serde(rename = "deliveryId")]

@@ -57,6 +57,18 @@ struct Timer {
     origin: Envelope,
     /// Unix seconds.
     deadline: u64,
+    /// Log seq of the origin event (cursor bookkeeping for the delivery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
+}
+
+/// A named consumer position in this node's log (`listen --cursor <name>`).
+/// Client-committed: the hub never guesses what a consumer has processed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorEntry {
+    pub seq: u64,
+    /// Unix secs of the last commit — evaporation clock.
+    pub ts: u64,
 }
 
 struct TailClient {
@@ -73,6 +85,9 @@ struct PendingWindow {
     #[serde(rename = "windowEnd")]
     window_end: u64,
     events: Vec<Envelope>,
+    /// Log seqs parallel to `events` (cursor bookkeeping at window close).
+    #[serde(default)]
+    seqs: Vec<u64>,
     /// Events collapsed (debounce) or dropped over the queue cap (batch).
     #[serde(default)]
     collapsed: u64,
@@ -94,6 +109,13 @@ pub(crate) struct State {
     /// ends the listener's delivery loop; a vanished listener removes the
     /// subscription — the enforced form of `while <client> alive`.
     listeners: HashMap<String, mpsc::Sender<String>>,
+    /// Named consumer cursors (client-committed positions in this log).
+    cursors: HashMap<String, CursorEntry>,
+    /// Log seq of the event currently being delivered — stamped into
+    /// delivery records and stream lines so consumers can track a cursor.
+    /// Every deliver() path sets it first (ingest, replay, timers, windows,
+    /// async judge verdicts), so it is never stale at delivery time.
+    current_seq: Option<u64>,
     retention_secs: u64,
     semantic: crate::semantic::Semantic,
     judge_cfg: Option<crate::judge::JudgeConfig>,
@@ -102,8 +124,13 @@ pub(crate) struct State {
     verdict_cache: HashMap<String, crate::judge::Verdict>,
     conditions: crate::conditions::Conditions,
     /// Admission dedup for cross-node deliveries (Connected-store pattern):
-    /// at-least-once shipping, effectively-once ingestion.
+    /// at-least-once shipping, effectively-once ingestion. Persisted to
+    /// forwarded_seen.jsonl so restarts don't reopen the window.
     forwarded_seen: std::collections::VecDeque<String>,
+    /// Pending outbound HTTP deliveries (persisted; retried with backoff).
+    outbox: Vec<OutboxEntry>,
+    /// Nudges the outbox worker after an enqueue (fallback: 1s tick).
+    outbox_tx: Option<mpsc::Sender<()>>,
 }
 
 /// Evaporation bound for the forwarded-delivery dedup window.
@@ -119,10 +146,37 @@ struct JudgeBudget {
     notified: bool,
 }
 
+/// A queued outbound HTTP delivery. The http sink never fire-and-forgets:
+/// every send goes through the outbox, which retries with backoff until the
+/// receiver accepts it or the entry outlives retention. Cross-node dedup on
+/// the receiving side makes retries safe (at-least-once shipping,
+/// effectively-once ingestion).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OutboxEntry {
+    #[serde(rename = "deliveryId")]
+    delivery_id: String,
+    method: String,
+    url: String,
+    body: String,
+    #[serde(default)]
+    attempts: u32,
+    /// Unix secs of the next attempt (0 = due immediately).
+    #[serde(rename = "nextTry", default)]
+    next_try: u64,
+    created: u64,
+}
+
+/// Retry backoff: 2s, 4s, 8s, … capped at 15 minutes.
+fn outbox_backoff(attempts: u32) -> u64 {
+    (2u64 << attempts.min(12)).min(900)
+}
+
 /// A pending tier-4 evaluation, processed off-lock by the judge worker.
 struct JudgeJob {
     sub_id: String,
     event: Envelope,
+    /// Log seq of the event (verdict deliveries carry it for cursors).
+    seq: Option<u64>,
     summary: String,
     cache_key: String,
     question: String,
@@ -212,6 +266,32 @@ impl State {
                 .unwrap_or(Value::Null),
         );
 
+        let cursors: HashMap<String, CursorEntry> = std::fs::read_to_string(paths.cursors())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+
+        // Rehydrate the forwarding dedup window (last MAX entries).
+        let mut forwarded_seen = std::collections::VecDeque::new();
+        if let Ok(text) = std::fs::read_to_string(paths.forwarded()) {
+            for line in text.lines() {
+                if let Some(id) = serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
+                {
+                    forwarded_seen.push_back(id);
+                    if forwarded_seen.len() > MAX_FORWARDED_SEEN {
+                        forwarded_seen.pop_front();
+                    }
+                }
+            }
+        }
+
+        let outbox: Vec<OutboxEntry> = std::fs::read_to_string(paths.outbox())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+
         let semantic = crate::semantic::Semantic::new(paths.clone());
         let mut state = State {
             paths,
@@ -223,6 +303,8 @@ impl State {
             pending,
             tails: Vec::new(),
             listeners: HashMap::new(),
+            cursors,
+            current_seq: None,
             retention_secs,
             semantic,
             judge_cfg: None,
@@ -230,7 +312,9 @@ impl State {
             judge_budgets,
             verdict_cache,
             conditions,
-            forwarded_seen: std::collections::VecDeque::new(),
+            forwarded_seen,
+            outbox,
+            outbox_tx: None,
         };
         let has_judge_subs = state
             .matcher
@@ -445,14 +529,19 @@ impl State {
         self.emit_bus_event("pher.subscription.registered", json!({ "id": id }));
 
         // Replay: run the backlog through the matcher first, then live.
+        // Stream sinks replay in attach_listener instead — AFTER the listener
+        // channel is attached, or every replayed delivery would be lost.
         let mut replayed = 0u64;
-        if let Some(replay) = sub.replay.clone() {
-            let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
-            let backlog = self.read_events(None);
-            for (_, event) in backlog {
-                if event.ts >= cutoff {
-                    if let Some(n) = self.try_deliver(&id, &event) {
-                        replayed += n;
+        if sub.then.sink != Sink::Stream {
+            if let Some(replay) = sub.replay.clone() {
+                let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
+                let backlog = self.read_events(None);
+                for (seq, event) in backlog {
+                    if event.ts >= cutoff {
+                        self.current_seq = Some(seq);
+                        if let Some(n) = self.try_deliver(&id, &event) {
+                            replayed += n;
+                        }
                     }
                 }
             }
@@ -501,6 +590,7 @@ impl State {
     fn ingest_envelope(&mut self, event: Envelope) -> Result<(u64, u64), String> {
         let seq = self.next_seq;
         self.next_seq += 1;
+        self.current_seq = Some(seq);
         self.append_jsonl(&self.paths.events(), &json!({ "seq": seq, "event": event }))
             .map_err(|e| e.to_string())?;
         self.notify_tails(seq, &event);
@@ -525,6 +615,7 @@ impl State {
                     sub_id: sub_id.clone(),
                     origin: event.clone(),
                     deadline: now_unix() + expect.within.secs(),
+                    seq: Some(seq),
                 });
                 self.persist_timers().map_err(|e| e.to_string())?;
                 continue;
@@ -578,6 +669,7 @@ impl State {
                         sub_id: sub_id.clone(),
                         origin: event.clone(),
                         deadline: now_unix() + expect.within.secs(),
+                        seq: Some(seq),
                     });
                     self.persist_timers().map_err(|e| e.to_string())?;
                     continue;
@@ -648,6 +740,7 @@ impl State {
         let _ = tx.send(JudgeJob {
             sub_id: sub_id.to_string(),
             event: event.clone(),
+            seq: self.current_seq,
             summary,
             cache_key,
             question: judge_clause.question.clone(),
@@ -766,6 +859,10 @@ impl State {
         if self.forwarded_seen.contains(&delivery_id) {
             return Ok(json!({ "ok": true, "deduped": true }));
         }
+        // Persist before ingest: with at-least-once shipping upstream, a
+        // dedup window that dies with the process would double-fire after a
+        // restart. Append-only; GC compacts to the window size.
+        let _ = self.append_jsonl(&self.paths.forwarded(), &json!({ "id": delivery_id }));
         self.forwarded_seen.push_back(delivery_id);
         while self.forwarded_seen.len() > MAX_FORWARDED_SEEN {
             self.forwarded_seen.pop_front();
@@ -862,9 +959,11 @@ impl State {
                 1
             }
             pher_core::Delivery::Debounce { window } => {
+                let seq = self.current_seq;
                 if let Some(p) = self.pending.get_mut(sub_id) {
                     // Window open: collapse to the latest event, deliver at close.
                     p.events = vec![event.clone()];
+                    p.seqs = seq.into_iter().collect();
                     p.collapsed += 1;
                     let _ = self.persist_pending();
                     0
@@ -877,6 +976,7 @@ impl State {
                             mode: "debounce".to_string(),
                             window_end: now_unix() + window.secs(),
                             events: Vec::new(),
+                            seqs: Vec::new(),
                             collapsed: 0,
                         },
                     );
@@ -885,6 +985,7 @@ impl State {
                 }
             }
             pher_core::Delivery::Batch { window } => {
+                let seq = self.current_seq;
                 let p = self
                     .pending
                     .entry(sub_id.to_string())
@@ -892,13 +993,20 @@ impl State {
                         mode: "batch".to_string(),
                         window_end: now_unix() + window.secs(),
                         events: Vec::new(),
+                        seqs: Vec::new(),
                         collapsed: 0,
                     });
                 if p.events.len() >= MAX_BATCH_QUEUE {
                     p.events.remove(0);
+                    if !p.seqs.is_empty() {
+                        p.seqs.remove(0);
+                    }
                     p.collapsed += 1;
                 }
                 p.events.push(event.clone());
+                if let Some(s) = seq {
+                    p.seqs.push(s);
+                }
                 let _ = self.persist_pending();
                 0
             }
@@ -933,6 +1041,7 @@ impl State {
                 continue;
             }
             let last = p.events.last().unwrap().clone();
+            self.current_seq = p.seqs.last().copied();
             let eval = evaluate(&sub_id, &sub, &last, None);
             let Some(mut block) = eval.match_block else {
                 let _ = self.persist_pending();
@@ -959,6 +1068,7 @@ impl State {
                                 mode: "debounce".to_string(),
                                 window_end: now_unix() + window.secs(),
                                 events: Vec::new(),
+                                seqs: Vec::new(),
                                 collapsed: 0,
                             },
                         );
@@ -992,6 +1102,7 @@ impl State {
         let mut record = json!({
             "deliveryId": delivery_id,
             "ts": now_ts(),
+            "seq": self.current_seq,
             "event": event,
             "match": block,
             "sink": sink_result,
@@ -1019,6 +1130,9 @@ impl State {
         shaping: Option<&Value>,
     ) -> Value {
         let mut delivery_json = json!({ "event": event, "match": block });
+        if let Some(seq) = self.current_seq {
+            delivery_json["seq"] = json!(seq);
+        }
         if let Some(shaping) = shaping {
             delivery_json["shaping"] = shaping.clone();
         }
@@ -1088,30 +1202,26 @@ impl State {
             }
             Sink::Http => {
                 // `then http POST <url>` — delivery JSON as the request body,
-                // dispatched off-thread so a slow endpoint never stalls ingest.
-                // Failures come back onto the bus as pher.delivery.failed.
+                // via the persistent outbox: the worker attempts immediately
+                // and retries with backoff until the receiver accepts or the
+                // entry outlives retention. A dead hub means delayed, not
+                // lost (the receiving side dedups by deliveryId).
                 let method = sub.then.args[0].to_uppercase();
                 let url = sub.then.args[1].clone();
-                let (method_r, url_r) = (method.clone(), url.clone());
-                let body = delivery_json.to_string();
-                let paths = self.paths.clone();
-                let delivery_id = delivery_id.to_string();
-                // Cross-node forwarding: authenticate to the remote node's
-                // /deliver with PHER_HTTP_SINK_TOKEN when set.
-                let sink_token = std::env::var("PHER_HTTP_SINK_TOKEN").ok();
-                std::thread::spawn(move || {
-                    let mut req = ureq::request(&method, &url)
-                        .timeout(Duration::from_secs(10))
-                        .set("content-type", "application/json");
-                    if let Some(token) = &sink_token {
-                        req = req.set("authorization", &format!("Bearer {token}"));
-                    }
-                    let result = req.send_string(&body);
-                    if let Err(e) = result {
-                        report_delivery_failure(&paths, &delivery_id, "http", &e.to_string());
-                    }
+                self.outbox.push(OutboxEntry {
+                    delivery_id: delivery_id.to_string(),
+                    method: method.clone(),
+                    url: url.clone(),
+                    body: delivery_json.to_string(),
+                    attempts: 0,
+                    next_try: 0,
+                    created: now_unix(),
                 });
-                json!({ "sink": "http", "method": method_r, "url": url_r, "dispatched": true })
+                let _ = self.persist_outbox();
+                if let Some(tx) = &self.outbox_tx {
+                    let _ = tx.send(());
+                }
+                json!({ "sink": "http", "method": method, "url": url, "queued": true })
             }
             Sink::Hermes => {
                 // `then hermes <invoke...>` — hand off to the Hermes CLI.
@@ -1228,6 +1338,9 @@ impl State {
             let Some(sub) = self.matcher.get(&timer.sub_id).cloned() else {
                 continue;
             };
+            // Cursor bookkeeping: an absence delivery carries its origin's
+            // seq. Consumers track max(seq), so this never regresses them.
+            self.current_seq = timer.seq;
             let expect = match &sub.expect {
                 Some(e) => e,
                 None => continue,
@@ -1259,6 +1372,29 @@ impl State {
         for id in expired {
             self.remove_sub(&id, "ttl expired");
         }
+    }
+
+    fn persist_outbox(&self) -> anyhow::Result<()> {
+        write_json_atomic(&self.paths.outbox(), &serde_json::to_value(&self.outbox)?)
+    }
+
+    // -- consumer cursors ----------------------------------------------------
+
+    fn persist_cursors(&self) -> anyhow::Result<()> {
+        write_json_atomic(&self.paths.cursors(), &serde_json::to_value(&self.cursors)?)
+    }
+
+    /// Monotonic commit: a cursor never moves backward. Returns the stored seq.
+    fn commit_cursor(&mut self, name: &str, seq: u64) -> u64 {
+        let entry = self
+            .cursors
+            .entry(name.to_string())
+            .or_insert(CursorEntry { seq: 0, ts: 0 });
+        entry.seq = entry.seq.max(seq);
+        entry.ts = now_unix();
+        let stored = entry.seq;
+        let _ = self.persist_cursors();
+        stored
     }
 
     // -- events / tail / introspection -------------------------------------
@@ -1300,6 +1436,22 @@ impl State {
                 .and_then(|t| t.as_u64())
                 .is_none_or(|ts| ts >= cutoff_unix)
         })?;
+        // Cursors evaporate with the events they point into: one not
+        // committed for a full retention window points at nothing.
+        let before = self.cursors.len();
+        self.cursors.retain(|_, e| e.ts >= cutoff_unix);
+        if self.cursors.len() != before {
+            let _ = self.persist_cursors();
+        }
+        // Compact the forwarding dedup log to the in-memory window.
+        if self.forwarded_seen.len() >= MAX_FORWARDED_SEEN {
+            let keep: std::collections::HashSet<&String> = self.forwarded_seen.iter().collect();
+            gc_jsonl(&self.paths.forwarded(), |v| {
+                v.get("id")
+                    .and_then(|i| i.as_str())
+                    .is_none_or(|id| keep.contains(&id.to_string()))
+            })?;
+        }
         Ok(())
     }
 }
@@ -1319,28 +1471,6 @@ fn spawn_cli_sink(bin: &str, args: &[String], delivery_json: &Value, delivery_id
         Ok(child) => json!({ "sink": bin, "pid": child.id(), "args": args }),
         Err(e) => json!({ "sink": bin, "error": e.to_string() }),
     }
-}
-
-/// Report an async sink failure back onto the bus (from a sink thread, via
-/// the daemon's own socket — the bus eats its own dog food).
-fn report_delivery_failure(paths: &Paths, delivery_id: &str, sink: &str, error: &str) {
-    let report = crate::protocol::Request::Emit {
-        event: PartialEvent {
-            subject: "pher.delivery.failed".to_string(),
-            payload: Some(json!({
-                "deliveryId": delivery_id,
-                "sink": sink,
-                "error": error,
-            })),
-            event_type: None,
-            source: Some("pherd".to_string()),
-            correlation: None,
-        },
-    };
-    if let Ok(mut conn) = crate::client::Conn::connect(paths) {
-        let _ = conn.call(&report);
-    }
-    eprintln!("pherd: delivery {delivery_id} via {sink} failed: {error}");
 }
 
 /// Cheap uniform-ish [0,1) for `sample` gating; not security-sensitive.
@@ -1484,6 +1614,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
                         let _ = s.append_jsonl(&verdicts_path, &record);
                         if verdict.verdict {
                             if let Some(sub) = s.matcher.get(&job.sub_id).cloned() {
+                                s.current_seq = job.seq;
                                 s.deliver_judged(
                                     &job.sub_id,
                                     &sub,
@@ -1504,6 +1635,97 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
                         );
                     }
                 }
+            }
+        });
+    }
+
+    // Outbox worker: outbound HTTP deliveries with retry. Attempts happen
+    // off the state lock; a nudge after enqueue keeps the happy path fast,
+    // the 1s tick catches scheduled retries.
+    {
+        let (otx, orx) = mpsc::channel::<()>();
+        state.lock().unwrap().outbox_tx = Some(otx);
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || loop {
+            let _ = orx.recv_timeout(Duration::from_secs(1));
+            let now = now_unix();
+            let due: Vec<OutboxEntry> = {
+                let s = state.lock().unwrap();
+                s.outbox
+                    .iter()
+                    .filter(|e| e.next_try <= now)
+                    .take(32)
+                    .cloned()
+                    .collect()
+            };
+            if due.is_empty() {
+                continue;
+            }
+            let sink_token = std::env::var("PHER_HTTP_SINK_TOKEN").ok();
+            for entry in due {
+                let mut req = ureq::request(&entry.method, &entry.url)
+                    .timeout(Duration::from_secs(10))
+                    .set("content-type", "application/json");
+                if let Some(token) = &sink_token {
+                    req = req.set("authorization", &format!("Bearer {token}"));
+                }
+                let result = req.send_string(&entry.body);
+                let mut s = state.lock().unwrap();
+                let Some(pos) = s
+                    .outbox
+                    .iter()
+                    .position(|e| e.delivery_id == entry.delivery_id && e.url == entry.url)
+                else {
+                    continue; // already resolved elsewhere
+                };
+                match result {
+                    Ok(_) => {
+                        s.outbox.remove(pos);
+                    }
+                    Err(e) => {
+                        let error = truncate(&e.to_string(), 300);
+                        let retention = s.retention_secs;
+                        let expired = now_unix().saturating_sub(entry.created) > retention;
+                        if expired {
+                            // Evaporation bound: give up loudly, once.
+                            s.outbox.remove(pos);
+                            s.emit_bus_event(
+                                "pher.delivery.failed",
+                                json!({
+                                    "deliveryId": entry.delivery_id,
+                                    "sink": "http",
+                                    "url": entry.url,
+                                    "attempts": entry.attempts + 1,
+                                    "error": error,
+                                }),
+                            );
+                        } else {
+                            let e = &mut s.outbox[pos];
+                            e.attempts += 1;
+                            e.next_try = now_unix() + outbox_backoff(e.attempts);
+                            let first_failure = e.attempts == 1;
+                            let attempts = e.attempts;
+                            if first_failure {
+                                // Transition event, not a per-retry firehose.
+                                s.emit_bus_event(
+                                    "pher.delivery.retrying",
+                                    json!({
+                                        "deliveryId": entry.delivery_id,
+                                        "sink": "http",
+                                        "url": entry.url,
+                                        "error": error,
+                                    }),
+                                );
+                            } else if attempts % 10 == 0 {
+                                eprintln!(
+                                    "pherd: outbox {} still failing after {} attempts: {}",
+                                    entry.delivery_id, attempts, error
+                                );
+                            }
+                        }
+                    }
+                }
+                let _ = s.persist_outbox();
             }
         });
     }
@@ -1572,9 +1794,11 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<State>>) -> anyhow::Re
             string,
             options,
             client,
+            after,
+            cursor,
         } = request
         {
-            handle_listen(&string, &options, client, &stream, &state)?;
+            handle_listen(&string, &options, client, after, cursor, &stream, &state)?;
             return Ok(()); // listen owns the connection; disconnect = teardown
         }
         let response = handle_rpc(request, &state);
@@ -1614,6 +1838,8 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
                 "armedTimers": s.timers.len(),
                 "tails": s.tails.len(),
                 "listeners": s.listeners.len(),
+                "cursors": s.cursors.len(),
+                "outbox": s.outbox.len(),
                 "retention": format!("{}s", s.retention_secs),
                 "semantic": s.semantic.status(),
                 "conditions": s.conditions.defs.len(),
@@ -1668,7 +1894,29 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
         }
         Request::WhyNot { sub, event } => rpc_why_not(&sub, &event, state),
         Request::Tail { .. } => err("tail is a streaming op; use the unix socket"),
-        Request::Listen { .. } => err("listen is a streaming op; use the unix socket"),
+        Request::Listen { .. } => {
+            err("listen is a streaming op; use the unix socket or POST /listen")
+        }
+        Request::CursorCommit { name, seq } => {
+            let stored = state.lock().unwrap().commit_cursor(&name, seq);
+            ok(json!({ "name": name, "seq": stored }))
+        }
+        Request::CursorLs => {
+            let s = state.lock().unwrap();
+            let mut cursors: Vec<Value> = s
+                .cursors
+                .iter()
+                .map(|(name, e)| json!({ "name": name, "seq": e.seq, "committedAt": unix_to_ts(e.ts) }))
+                .collect();
+            cursors.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            ok(json!({ "cursors": cursors, "head": s.next_seq.saturating_sub(1) }))
+        }
+        Request::CursorRm { name } => {
+            let mut s = state.lock().unwrap();
+            let removed = s.cursors.remove(&name).is_some();
+            let _ = s.persist_cursors();
+            ok(json!({ "removed": removed }))
+        }
     }
 }
 
@@ -1821,26 +2069,89 @@ fn handle_tail(
 /// listener is attached (unix socket or HTTP stream). Returns the sub id,
 /// the ack to send first, and the delivery channel. Err carries the protocol
 /// error Value to send back.
+///
+/// Resume order of precedence: explicit `after` beats the named cursor's
+/// stored position. Replay runs AFTER the listener channel is attached and
+/// under the same lock as registration, so there is no window where a live
+/// event can slip between backlog and stream: no gap, no duplicate.
 pub(crate) fn attach_listener(
     state: &Arc<Mutex<State>>,
     string: &str,
     options: &[String],
     client: &str,
+    after: Option<u64>,
+    cursor: Option<&str>,
 ) -> Result<(String, Value, mpsc::Receiver<String>), Value> {
     let (tx, rx) = mpsc::channel::<String>();
     let mut s = state.lock().unwrap();
-    match s.register_listener(string, options, client) {
-        Ok(ack) => {
-            let id = ack
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            s.listeners.insert(id.clone(), tx);
-            Ok((id, ack, rx))
+    let stored_cursor = cursor.and_then(|c| s.cursors.get(c)).map(|e| e.seq);
+    let resume_after = after.or(stored_cursor);
+    let mut ack = match s.register_listener(string, options, client) {
+        Ok(ack) => ack,
+        Err(e) => return Err(err(e)),
+    };
+    let id = ack
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    s.listeners.insert(id.clone(), tx);
+
+    // Catch-up replay into the now-attached channel. Cursor resume (exact,
+    // by seq) wins over the subscription's own `since` (fuzzy, by time).
+    let sub = s.matcher.get(&id).cloned();
+    let mut replayed = 0u64;
+    let mut gap_expired = 0u64;
+    if let Some(after) = resume_after {
+        let backlog = s.read_events(Some(after));
+        if let Some((first_seq, _)) = backlog.first() {
+            // Retention already evaporated part of the gap.
+            gap_expired = first_seq.saturating_sub(after + 1);
         }
-        Err(e) => Err(err(e)),
+        for (seq, event) in backlog {
+            s.current_seq = Some(seq);
+            if let Some(n) = s.try_deliver(&id, &event) {
+                replayed += n;
+            }
+        }
+    } else if let Some(replay) = sub.as_ref().and_then(|sub| sub.replay.clone()) {
+        let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
+        let backlog = s.read_events(None);
+        for (seq, event) in backlog {
+            if event.ts >= cutoff {
+                s.current_seq = Some(seq);
+                if let Some(n) = s.try_deliver(&id, &event) {
+                    replayed += n;
+                }
+            }
+        }
     }
+
+    // Ack tells the consumer exactly where it stands: the log head (start a
+    // cursor even with no traffic), what was replayed, and what is gone.
+    ack["seq"] = json!(s.next_seq.saturating_sub(1));
+    ack["replayed"] = json!(replayed);
+    if let Some(after) = resume_after {
+        ack["resumedFrom"] = json!(after);
+    }
+    if gap_expired > 0 {
+        ack["gapExpired"] = json!(gap_expired);
+    }
+    if let Some(name) = cursor {
+        ack["cursor"] = json!(name);
+    }
+    let semantic_sub = sub
+        .as_ref()
+        .is_some_and(|sub| sub.meaning.is_some() || sub.judge.is_some());
+    if semantic_sub && (resume_after.is_some() || replayed > 0) {
+        if let Some(w) = ack.get_mut("warnings").and_then(|w| w.as_array_mut()) {
+            w.push(json!(
+                "catch-up replay evaluates tiers 1-2 only; meaning/judge verdicts \
+                 were not recorded for this subscription while it was away"
+            ));
+        }
+    }
+    Ok((id, ack, rx))
 }
 
 /// Tear a listener's subscription down. Guarded: only the party that still
@@ -1861,17 +2172,20 @@ fn handle_listen(
     string: &str,
     options: &[String],
     client: Option<String>,
+    after: Option<u64>,
+    cursor: Option<String>,
     stream: &UnixStream,
     state: &Arc<Mutex<State>>,
 ) -> anyhow::Result<()> {
     let client = client.unwrap_or_else(|| "listener".to_string());
-    let (sub_id, ack, rx) = match attach_listener(state, string, options, &client) {
-        Ok(attached) => attached,
-        Err(e) => {
-            respond(stream, &e)?;
-            return Ok(());
-        }
-    };
+    let (sub_id, ack, rx) =
+        match attach_listener(state, string, options, &client, after, cursor.as_deref()) {
+            Ok(attached) => attached,
+            Err(e) => {
+                respond(stream, &e)?;
+                return Ok(());
+            }
+        };
     respond(stream, &ack)?;
 
     let teardown = |reason: &str| detach_listener(state, &sub_id, reason);

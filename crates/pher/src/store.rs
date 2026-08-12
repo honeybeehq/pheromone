@@ -70,6 +70,18 @@ impl Paths {
     pub fn condition_state(&self) -> PathBuf {
         self.home.join("condition_state.json")
     }
+
+    pub fn cursors(&self) -> PathBuf {
+        self.home.join("cursors.json")
+    }
+
+    pub fn outbox(&self) -> PathBuf {
+        self.home.join("outbox.json")
+    }
+
+    pub fn forwarded(&self) -> PathBuf {
+        self.home.join("forwarded_seen.jsonl")
+    }
 }
 
 /// Atomic-ish JSON write: temp file + rename, so kill -9 never leaves a torn file.

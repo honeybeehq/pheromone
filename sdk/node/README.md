@@ -56,6 +56,32 @@ Remote disconnect detection is write-bounded: a vanished client is torn down
 on the next delivery or heartbeat (≤ ~30s), not instantly like the local
 socket. `tail` stays local-only (debugging surface).
 
+## Robust consumption (cursors + reconnect)
+
+For consumers that must survive flaky links, sleep, and restarts:
+
+```js
+const sub = await hub.on(
+  'on ci.* where payload.conclusion == "failure"',
+  handleDelivery,
+  { cursor: "ci-watcher", reconnect: true },
+);
+```
+
+- `cursor` names a hub-side position. On attach, the hub replays exactly the
+  deliveries this cursor missed (`sub.ack.resumedFrom` / `.replayed` /
+  `.gapExpired`), then goes live. With `autoCommit` (default), the position
+  advances as your handler processes deliveries — crash and restart, and you
+  get redelivery from the last commit: at-least-once, no gaps, no dupes.
+- `reconnect` re-attaches with backoff on connection loss and resumes from
+  the cursor (or the last seen `seq`); the listener emits `'reconnect'`.
+- Catch-up replay is bounded by the hub's retention (default 7d) and
+  evaluates tiers 1–2 only — the ack carries a warning for meaning/judge
+  subscriptions.
+
+Every delivery carries `seq` (the hub log position) if you'd rather track
+resume state yourself (`on(sub, h, { after: lastSeq })`).
+
 ## API
 
 - `PherClient.connect({home?})` / `PherClient.remote(url, {token?})`

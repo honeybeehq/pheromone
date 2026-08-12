@@ -90,6 +90,21 @@ What works today:
   `PherClient.remote(url, {token}).on('…', handler)` subscribe to a remote
   hub with no local daemon. The SDK also covers
   `emit`/`when`/`ls`/`rm`/`why`/`whyNot`/`status` locally and via `/rpc`.
+- **Mesh robustness** — the two halves of the delivery guarantee:
+  *everything reaches the hub* (the `http` sink runs through a persistent
+  outbox — immediate attempt, then backoff retries up to 15m apart until the
+  receiver accepts or the entry outlives retention; `pher.delivery.retrying`
+  fires once on the transition, `pher.delivery.failed` only on giving up;
+  the cross-node dedup window is persisted, so at-least-once shipping stays
+  effectively-once across daemon restarts) and *everything at the hub reaches
+  each consumer* (every delivery carries the log `seq`; `pher listen --after
+  N` resumes exactly, `--cursor <name>` stores the position hub-side and
+  commits as deliveries are processed — reconnect replays precisely the gap,
+  no dupes, bounded by retention with the expired remainder reported in the
+  ack). `pher cursor ls/rm` inspects positions. The hive tap reconnects with
+  backoff and resumes from its last-forwarded ledger timestamp, deduping the
+  overlap. Verified with an outage drill: hub down → forward queued →
+  hub up → delayed arrival, exactly once, dedup surviving kill -9.
 - **Declarative config** — `pheromone.toml` + `pher apply [--prune] [--dry-run]`
   (see `pheromone.example.toml`): named subscriptions, metric conditions, and
   the node registry, reconciled idempotently against the local daemon or a
