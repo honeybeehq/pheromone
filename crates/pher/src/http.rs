@@ -157,7 +157,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                 last_sent = seq;
             }
             loop {
-                match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                match rx.recv_timeout(std::time::Duration::from_secs(5)) {
                     Ok(line) => {
                         let seq = serde_json::from_str::<Value>(&line)
                             .ok()
@@ -304,7 +304,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                     return "listener disconnected";
                 }
                 loop {
-                    match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
                         Ok(line) => {
                             if write_chunk(&mut writer, &format!("{line}\n")).is_err() {
                                 return "listener disconnected";

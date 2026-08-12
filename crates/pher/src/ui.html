@@ -252,8 +252,20 @@ $("emitbtn").onclick = async () => {
 
 // ---- live tester --------------------------------------------------------
 let testCtrl = null;
-$("tstart").onclick = () => {
-  testCtrl?.abort(); // re-listening replaces the previous test subscription
+let testSubId = null;
+// A fetch abort alone leaves the sub server-side until a write fails
+// (up to two heartbeats). Deliberate stop/replace removes it explicitly,
+// so the only lazily-reaped case is a crashed/closed tab.
+async function dropTestSub() {
+  testCtrl?.abort();
+  if (testSubId) {
+    const id = testSubId;
+    testSubId = null;
+    await rpc({ op: "rm", id }).catch(() => {}); // already gone = fine
+  }
+}
+$("tstart").onclick = async () => {
+  await dropTestSub(); // re-listening replaces the previous test subscription
   $("matches").innerHTML = "";
   $("tstate").innerHTML = `<span class="dim">connecting…</span>`;
   $("tstart").disabled = true;
@@ -261,6 +273,7 @@ $("tstart").onclick = () => {
   if (!/\sthen\s/.test(` ${text} `)) text += " then stream";
   testCtrl = stream("/listen", { string: text, client: "console" }, (line) => {
     if (line.canonical) {
+      testSubId = line.id;
       $("tstate").innerHTML = `<span class="badge b-live">LIVE</span>${esc(line.id)} — ${esc(line.canonical)}`;
       $("tstart").disabled = false;
       $("tstop").disabled = false;
@@ -285,7 +298,12 @@ $("tstart").onclick = () => {
     $("tstop").disabled = true;
   });
 };
-$("tstop").onclick = () => { testCtrl?.abort(); $("tstate").textContent = "stopped — subscription evaporated"; $("tstop").disabled = true; refresh(); };
+$("tstop").onclick = async () => {
+  await dropTestSub();
+  $("tstate").textContent = "stopped — subscription removed";
+  $("tstop").disabled = true;
+  refresh();
+};
 
 // ---- why-not ------------------------------------------------------------
 $("whybtn").onclick = async () => {
