@@ -32,30 +32,16 @@ pub struct Semantic {
 }
 
 impl Semantic {
-    pub fn new(paths: Paths) -> Semantic {
+    /// `window` is the persisted novelty window, loaded by the daemon from
+    /// SQLite (oldest first); persistence of new vectors is the daemon's
+    /// job too — this type only owns the in-memory scan.
+    pub fn new(paths: Paths, preloaded: Vec<(u64, String, Vec<f32>)>) -> Semantic {
         let disabled = std::env::var("PHER_EMBED").is_ok_and(|v| v == "off" || v == "0");
         let mut window = VecDeque::new();
-        if let Ok(text) = std::fs::read_to_string(paths.vectors()) {
-            for line in text.lines() {
-                let Ok(v) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                let (Some(ts), Some(vec)) = (v.get("ts").and_then(|t| t.as_u64()), v.get("vec"))
-                else {
-                    continue;
-                };
-                let Ok(vec) = serde_json::from_value::<Vec<f32>>(vec.clone()) else {
-                    continue;
-                };
-                let id = v
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                window.push_back((ts, id, vec));
-                if window.len() > MAX_WINDOW_VECTORS {
-                    window.pop_front();
-                }
+        for entry in preloaded {
+            window.push_back(entry);
+            if window.len() > MAX_WINDOW_VECTORS {
+                window.pop_front();
             }
         }
         Semantic {
@@ -217,25 +203,17 @@ impl Semantic {
         }
     }
 
-    /// Add an event's vector to the novelty window (memory + disk).
+    /// Add an event's vector to the in-memory novelty window (the daemon
+    /// persists it to SQLite alongside this call).
     pub fn record_event(&mut self, now_unix: u64, event_id: &str, vec: Vec<f32>) {
-        let line =
-            json!({ "ts": now_unix, "id": event_id, "model": pher_embed::MODEL_ID, "vec": vec });
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.paths.vectors())
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "{line}");
-        }
         self.window.push_back((now_unix, event_id.to_string(), vec));
         while self.window.len() > MAX_WINDOW_VECTORS {
             self.window.pop_front();
         }
     }
 
-    /// Evaporate vectors older than the cutoff (memory + disk rewrite).
+    /// Evaporate window vectors older than the cutoff (the vectors table is
+    /// GC'd by Db::gc).
     pub fn gc(&mut self, cutoff_unix: u64) {
         while self
             .window
@@ -243,28 +221,6 @@ impl Semantic {
             .is_some_and(|(ts, _, _)| *ts < cutoff_unix)
         {
             self.window.pop_front();
-        }
-        let Ok(text) = std::fs::read_to_string(self.paths.vectors()) else {
-            return;
-        };
-        let kept: Vec<&str> = text
-            .lines()
-            .filter(|l| {
-                serde_json::from_str::<Value>(l)
-                    .ok()
-                    .and_then(|v| v.get("ts").and_then(|t| t.as_u64()))
-                    .is_some_and(|ts| ts >= cutoff_unix)
-            })
-            .collect();
-        if kept.len() != text.lines().count() {
-            let mut body = kept.join("\n");
-            if !body.is_empty() {
-                body.push('\n');
-            }
-            let tmp = self.paths.vectors().with_extension("tmp");
-            if std::fs::write(&tmp, body).is_ok() {
-                let _ = std::fs::rename(&tmp, self.paths.vectors());
-            }
         }
     }
 

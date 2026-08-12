@@ -3,6 +3,7 @@ mod bridge;
 mod client;
 mod conditions;
 mod daemon;
+mod db;
 mod http;
 mod init;
 mod judge;

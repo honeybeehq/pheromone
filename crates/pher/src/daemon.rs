@@ -98,6 +98,9 @@ const MAX_BATCH_QUEUE: usize = 1000;
 
 pub(crate) struct State {
     paths: Paths,
+    /// SQLite storage for the growing logs (events, deliveries, verdicts,
+    /// vectors, forwarded-dedup). Small operator state stays in JSON files.
+    db: crate::db::Db,
     node: String,
     matcher: Matcher,
     metas: HashMap<String, SubMeta>,
@@ -299,7 +302,8 @@ impl State {
             }
         }
 
-        let next_seq = last_seq(&paths).map(|s| s + 1).unwrap_or(1);
+        let db = crate::db::Db::open(&paths)?;
+        let next_seq = db.max_seq()?.map(|s| s + 1).unwrap_or(1);
 
         let timers: Vec<Timer> = std::fs::read_to_string(paths.timers())
             .ok()
@@ -317,27 +321,22 @@ impl State {
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default();
         let mut verdict_cache: HashMap<String, crate::judge::Verdict> = HashMap::new();
-        if let Ok(text) = std::fs::read_to_string(paths.verdicts()) {
-            for line in text.lines() {
-                let Ok(v) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                if let (Some(key), Some(verdict)) = (
-                    v.get("key").and_then(|k| k.as_str()),
-                    v.get("verdict").and_then(|b| b.as_bool()),
-                ) {
-                    verdict_cache.insert(
-                        key.to_string(),
-                        crate::judge::Verdict {
-                            verdict,
-                            rationale: v
-                                .get("rationale")
-                                .and_then(|r| r.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                        },
-                    );
-                }
+        for v in db.load_verdicts()? {
+            if let (Some(key), Some(verdict)) = (
+                v.get("key").and_then(|k| k.as_str()),
+                v.get("verdict").and_then(|b| b.as_bool()),
+            ) {
+                verdict_cache.insert(
+                    key.to_string(),
+                    crate::judge::Verdict {
+                        verdict,
+                        rationale: v
+                            .get("rationale")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    },
+                );
             }
         }
 
@@ -358,20 +357,8 @@ impl State {
             .unwrap_or_default();
 
         // Rehydrate the forwarding dedup window (last MAX entries).
-        let mut forwarded_seen = std::collections::VecDeque::new();
-        if let Ok(text) = std::fs::read_to_string(paths.forwarded()) {
-            for line in text.lines() {
-                if let Some(id) = serde_json::from_str::<Value>(line)
-                    .ok()
-                    .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
-                {
-                    forwarded_seen.push_back(id);
-                    if forwarded_seen.len() > MAX_FORWARDED_SEEN {
-                        forwarded_seen.pop_front();
-                    }
-                }
-            }
-        }
+        let forwarded_seen: std::collections::VecDeque<String> =
+            db.load_forwarded(MAX_FORWARDED_SEEN)?.into();
 
         let outbox: Vec<OutboxEntry> = std::fs::read_to_string(paths.outbox())
             .ok()
@@ -399,9 +386,10 @@ impl State {
                 .map(|v| v.into_iter().map(|b| (b.name.clone(), b)).collect())
                 .unwrap_or_default();
 
-        let semantic = crate::semantic::Semantic::new(paths.clone());
+        let semantic = crate::semantic::Semantic::new(paths.clone(), db.load_vectors(20_000)?);
         let mut state = State {
             paths,
+            db,
             node,
             matcher,
             metas,
@@ -462,18 +450,6 @@ impl State {
 
     fn persist_timers(&self) -> anyhow::Result<()> {
         write_json_atomic(&self.paths.timers(), &serde_json::to_value(&self.timers)?)
-    }
-
-    fn append_jsonl(&self, path: &std::path::Path, value: &Value) -> anyhow::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let mut line = serde_json::to_string(value)?;
-        line.push('\n');
-        f.write_all(line.as_bytes())?;
-        f.flush()?;
-        Ok(())
     }
 
     // -- registration ------------------------------------------------------
@@ -645,13 +621,10 @@ impl State {
         if sub.then.sink != Sink::Stream {
             if let Some(replay) = sub.replay.clone() {
                 let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
-                let backlog = self.read_events(None);
-                for (seq, event) in backlog {
-                    if event.ts >= cutoff {
-                        self.current_seq = Some(seq);
-                        if let Some(n) = self.try_deliver(&id, &event) {
-                            replayed += n;
-                        }
+                for (seq, event) in self.read_events_since_ts(&cutoff) {
+                    self.current_seq = Some(seq);
+                    if let Some(n) = self.try_deliver(&id, &event) {
+                        replayed += n;
                     }
                 }
             }
@@ -701,7 +674,8 @@ impl State {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.current_seq = Some(seq);
-        self.append_jsonl(&self.paths.events(), &json!({ "seq": seq, "event": event }))
+        self.db
+            .append_event(seq, &event)
             .map_err(|e| e.to_string())?;
         self.notify_tails(seq, &event);
 
@@ -791,6 +765,7 @@ impl State {
                 }
             }
             if let Some(vec) = event_vec {
+                let _ = self.db.append_vector(now, &event.id, &vec);
                 self.semantic.record_event(now, &event.id, vec);
             }
         }
@@ -976,7 +951,7 @@ impl State {
         if self.forwarded_seen.contains(&event.id) {
             return Ok(json!({ "ok": true, "deduped": true }));
         }
-        let _ = self.append_jsonl(&self.paths.forwarded(), &json!({ "id": event.id }));
+        let _ = self.db.forwarded_insert(&event.id);
         self.forwarded_seen.push_back(event.id.clone());
         while self.forwarded_seen.len() > MAX_FORWARDED_SEEN {
             self.forwarded_seen.pop_front();
@@ -1300,7 +1275,9 @@ impl State {
         if let Some(shaping) = &shaping {
             record["shaping"] = shaping.clone();
         }
-        let _ = self.append_jsonl(&self.paths.deliveries(), &record);
+        let _ = self
+            .db
+            .append_delivery(&delivery_id, record["ts"].as_str().unwrap_or(""), &record);
 
         // n-shot subscriptions retire after their last delivery.
         let retire = sub.limit.is_some_and(|limit| n >= limit);
@@ -1600,7 +1577,11 @@ impl State {
     // -- events / tail / introspection -------------------------------------
 
     fn read_events(&self, after: Option<u64>) -> Vec<(u64, Envelope)> {
-        read_events_file(&self.paths, after)
+        self.db.events_after(after, None).unwrap_or_default()
+    }
+
+    fn read_events_since_ts(&self, ts: &str) -> Vec<(u64, Envelope)> {
+        self.db.events_since_ts(ts).unwrap_or_default()
     }
 
     fn notify_tails(&mut self, seq: u64, event: &Envelope) {
@@ -1617,40 +1598,15 @@ impl State {
 
     fn gc(&mut self) -> anyhow::Result<()> {
         let cutoff = unix_to_ts(now_unix().saturating_sub(self.retention_secs));
-        gc_jsonl(&self.paths.events(), |v| {
-            v.get("event")
-                .and_then(|e| e.get("ts"))
-                .and_then(|t| t.as_str())
-                .is_none_or(|ts| ts >= cutoff.as_str())
-        })?;
-        gc_jsonl(&self.paths.deliveries(), |v| {
-            v.get("ts")
-                .and_then(|t| t.as_str())
-                .is_none_or(|ts| ts >= cutoff.as_str())
-        })?;
-        self.semantic
-            .gc(now_unix().saturating_sub(self.retention_secs));
         let cutoff_unix = now_unix().saturating_sub(self.retention_secs);
-        gc_jsonl(&self.paths.verdicts(), |v| {
-            v.get("ts")
-                .and_then(|t| t.as_u64())
-                .is_none_or(|ts| ts >= cutoff_unix)
-        })?;
+        self.db.gc(&cutoff, cutoff_unix, MAX_FORWARDED_SEEN)?;
+        self.semantic.gc(cutoff_unix);
         // Cursors evaporate with the events they point into: one not
         // committed for a full retention window points at nothing.
         let before = self.cursors.len();
         self.cursors.retain(|_, e| e.ts >= cutoff_unix);
         if self.cursors.len() != before {
             let _ = self.persist_cursors();
-        }
-        // Compact the forwarding dedup log to the in-memory window.
-        if self.forwarded_seen.len() >= MAX_FORWARDED_SEEN {
-            let keep: std::collections::HashSet<&String> = self.forwarded_seen.iter().collect();
-            gc_jsonl(&self.paths.forwarded(), |v| {
-                v.get("id")
-                    .and_then(|i| i.as_str())
-                    .is_none_or(|id| keep.contains(&id.to_string()))
-            })?;
         }
         Ok(())
     }
@@ -1702,56 +1658,6 @@ pub(crate) fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown-node".to_string())
-}
-
-fn last_seq(paths: &Paths) -> Option<u64> {
-    let text = std::fs::read_to_string(paths.events()).ok()?;
-    text.lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<Value>(l).ok())
-        .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
-}
-
-fn read_events_file(paths: &Paths, after: Option<u64>) -> Vec<(u64, Envelope)> {
-    let Ok(text) = std::fs::read_to_string(paths.events()) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| {
-            let seq = v.get("seq")?.as_u64()?;
-            if after.is_some_and(|a| seq <= a) {
-                return None;
-            }
-            let event: Envelope = serde_json::from_value(v.get("event")?.clone()).ok()?;
-            Some((seq, event))
-        })
-        .collect()
-}
-
-/// Rewrite a JSONL file keeping only lines that pass `keep`. Evaporation.
-fn gc_jsonl(path: &std::path::Path, keep: impl Fn(&Value) -> bool) -> anyhow::Result<()> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Ok(());
-    };
-    let kept: Vec<&str> = text
-        .lines()
-        .filter(|l| {
-            serde_json::from_str::<Value>(l)
-                .map(|v| keep(&v))
-                .unwrap_or(false)
-        })
-        .collect();
-    if kept.len() != text.lines().count() {
-        let tmp = path.with_extension("tmp");
-        let mut body = kept.join("\n");
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, path)?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1810,8 +1716,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
                             "verdict": verdict.verdict,
                             "rationale": verdict.rationale,
                         });
-                        let verdicts_path = s.paths.verdicts();
-                        let _ = s.append_jsonl(&verdicts_path, &record);
+                        let _ = s.db.append_verdict(&job.cache_key, now_unix(), &record);
                         if verdict.verdict {
                             if let Some(sub) = s.matcher.get(&job.sub_id).cloned() {
                                 s.current_seq = job.seq;
@@ -2125,13 +2030,13 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
             ok(json!({ "removed": removed }))
         }
         Request::Why { delivery_id } => {
-            let s = state.lock().unwrap();
-            let text = std::fs::read_to_string(s.paths.deliveries()).unwrap_or_default();
-            drop(s);
-            let record = text
-                .lines()
-                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                .find(|v| v.get("deliveryId").and_then(|d| d.as_str()) == Some(&delivery_id));
+            let record = state
+                .lock()
+                .unwrap()
+                .db
+                .delivery_by_id(&delivery_id)
+                .ok()
+                .flatten();
             match record {
                 Some(r) => ok(json!({ "delivery": r })),
                 None => err(format!("no delivery '{delivery_id}'")),
@@ -2273,11 +2178,7 @@ fn rpc_why_not(sub: &str, event: &str, state: &Arc<Mutex<State>>) -> Value {
     let Some(subscription) = s.matcher.get(sub).cloned() else {
         return err(format!("no subscription '{sub}'"));
     };
-    let found = s
-        .read_events(None)
-        .into_iter()
-        .map(|(_, e)| e)
-        .find(|e| e.id == event);
+    let found = s.db.event_by_id(event).ok().flatten();
     drop(s);
     let Some(envelope) = found else {
         return err(format!("no event '{event}' in the log"));
@@ -2386,7 +2287,14 @@ pub(crate) fn attach_tail(
         tx,
         subject: pattern.clone(),
     });
-    let mut backlog = s.read_events(after);
+    // With a subject pattern the SQL limit can't apply (matching happens
+    // here), so over-fetch a bounded window and trim after filtering.
+    let fetch = match (&pattern, last) {
+        (None, n) => n,
+        (Some(_), Some(n)) => Some((n * 20).clamp(1000, 20_000)),
+        (Some(_), None) => None,
+    };
+    let mut backlog = s.db.events_after(after, fetch).unwrap_or_default();
     if let Some(p) = &pattern {
         backlog.retain(|(_, e)| p.matches(&e.subject));
     }
@@ -2488,13 +2396,10 @@ pub(crate) fn attach_listener(
         }
     } else if let Some(replay) = sub.as_ref().and_then(|sub| sub.replay.clone()) {
         let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
-        let backlog = s.read_events(None);
-        for (seq, event) in backlog {
-            if event.ts >= cutoff {
-                s.current_seq = Some(seq);
-                if let Some(n) = s.try_deliver(&id, &event) {
-                    replayed += n;
-                }
+        for (seq, event) in s.read_events_since_ts(&cutoff) {
+            s.current_seq = Some(seq);
+            if let Some(n) = s.try_deliver(&id, &event) {
+                replayed += n;
             }
         }
     }
