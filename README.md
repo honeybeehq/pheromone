@@ -105,6 +105,22 @@ What works today:
   backoff and resumes from its last-forwarded ledger timestamp, deduping the
   overlap. Verified with an outage drill: hub down → forward queued →
   hub up → delayed arrival, exactly once, dedup surviving kill -9.
+- **Composable buses (bridges + grants).** A bus is just a pherd; meshes are
+  built from two primitives, both speaking the subscription language.
+  *Bridges* pull: `[[bridge]] from/sub` (or `pher bridge add`) holds a durable
+  filtered listen against an upstream bus and re-ingests deliveries locally —
+  envelope identity preserved (same event id, hops incremented), admission
+  deduped by event id, position cursor-resumed across outages, worker
+  supervised by the daemon with backoff. Derived buses are just buses whose
+  inputs are bridges. *Grants* bound tokens: `[[grant]] allow/emit` gives a
+  named bearer token a consume filter and a publish filter — enforcement IS
+  the matcher (tiers 1–2 only; deterministic authorization), applied at the
+  listen stream and at emit admission. Grant tokens can emit (filtered),
+  listen (filtered), and commit cursors; operating the bus requires the admin
+  token. `pher grant ls` shows token fingerprints, never tokens.
+  `GET /.well-known/pheromone` makes a bus discoverable. Honesty note:
+  grants are boundary enforcement, not cryptography — delivered events
+  belong to their recipient.
 - **Declarative config** — `pheromone.toml` + `pher apply [--prune] [--dry-run]`
   (see `pheromone.example.toml`): named subscriptions, metric conditions, and
   the node registry, reconciled idempotently against the local daemon or a

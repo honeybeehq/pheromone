@@ -91,23 +91,66 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             .map(|h| h.value.as_str().to_string())
     };
 
-    let authed = match &token {
-        None => true,
-        Some(t) => header("authorization")
-            .map(|v| v == format!("Bearer {t}"))
-            .unwrap_or(false),
+    // Three auth tiers: the admin token operates the bus; a grant token
+    // speaks and listens through its filters; anonymous gets health checks.
+    // A tokenless (loopback-only) bind trusts everyone as admin.
+    let bearer = header("authorization").and_then(|v| v.strip_prefix("Bearer ").map(String::from));
+    let principal = match (&token, &bearer) {
+        (None, _) => Principal::Admin,
+        (Some(t), Some(b)) if b == t => Principal::Admin,
+        (Some(_), Some(b)) => match state.lock().unwrap().grant_for_token(b) {
+            Some(name) => Principal::Grant(name),
+            None => Principal::Anon,
+        },
+        (Some(_), None) => Principal::Anon,
     };
+    let authed = matches!(principal, Principal::Admin);
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/healthz") => respond(request, 200, json!({"ok": true})),
+        ("GET", "/.well-known/pheromone") => {
+            // Bus discovery: enough to point a bridge or SDK at, no secrets.
+            respond(
+                request,
+                200,
+                json!({
+                    "pheromone": true,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "auth": if token.is_some() { "bearer" } else { "none" },
+                    "surfaces": ["/rpc", "/listen", "/deliver", "/emit", "/metric", "/webhook/<name>"],
+                }),
+            )
+        }
         ("POST", "/rpc") => {
             // The full (non-streaming) protocol over HTTP — remote CLI.
-            if !authed {
-                return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
-            }
             let Ok(rpc) = serde_json::from_slice::<Request>(&body) else {
                 return respond(request, 400, json!({"ok": false, "error": "bad request"}));
             };
+            match &principal {
+                Principal::Admin => {}
+                Principal::Grant(name) => {
+                    // Grants speak (filtered emit) and track their position;
+                    // operating the bus needs the admin token.
+                    match &rpc {
+                        Request::Emit { event } => {
+                            if let Err(e) = state.lock().unwrap().check_grant_emit(name, event) {
+                                return respond(request, 403, json!({"ok": false, "error": e}));
+                            }
+                        }
+                        Request::CursorCommit { .. } | Request::CursorLs => {}
+                        _ => {
+                            return respond(
+                                request,
+                                403,
+                                json!({"ok": false, "error": "this op requires the admin token"}),
+                            );
+                        }
+                    }
+                }
+                Principal::Anon => {
+                    return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
+                }
+            }
             let response = crate::daemon::handle_rpc(rpc, &state);
             respond(request, 200, response);
         }
@@ -117,9 +160,27 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             // NDJSON. First line is the ack; blank lines are heartbeats
             // (bounded disconnect detection). Dropping the response tears the
             // subscription down — the lease semantics, over the tailnet.
-            if !authed {
-                return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
-            }
+            // Grant tokens listen through their allow filter (intersection).
+            let filter = match &principal {
+                Principal::Admin => None,
+                Principal::Grant(name) => {
+                    let s = state.lock().unwrap();
+                    match s.grants.get(name).and_then(|g| g.allow_sub.clone()) {
+                        Some(f) => Some(f),
+                        None => {
+                            drop(s);
+                            return respond(
+                                request,
+                                403,
+                                json!({"ok": false, "error": format!("grant '{name}' has no allow filter")}),
+                            );
+                        }
+                    }
+                }
+                Principal::Anon => {
+                    return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
+                }
+            };
             let Ok(v) = serde_json::from_slice::<Value>(&body) else {
                 return respond(request, 400, json!({"ok": false, "error": "invalid JSON"}));
             };
@@ -147,7 +208,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             let after = v.get("after").and_then(|a| a.as_u64());
             let cursor = v.get("cursor").and_then(|c| c.as_str());
             let (sub_id, ack, rx) = match crate::daemon::attach_listener(
-                &state, string, &options, &client, after, cursor,
+                &state, string, &options, &client, after, cursor, filter,
             ) {
                 Ok(attached) => attached,
                 Err(e) => return respond(request, 400, e),
@@ -208,9 +269,6 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             }
         }
         ("POST", "/emit") => {
-            if !authed {
-                return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
-            }
             let Ok(event) = serde_json::from_slice::<PartialEvent>(&body) else {
                 return respond(
                     request,
@@ -218,6 +276,17 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                     json!({"ok": false, "error": "body must be a partial event with at least {subject}"}),
                 );
             };
+            match &principal {
+                Principal::Admin => {}
+                Principal::Grant(name) => {
+                    if let Err(e) = state.lock().unwrap().check_grant_emit(name, &event) {
+                        return respond(request, 403, json!({"ok": false, "error": e}));
+                    }
+                }
+                Principal::Anon => {
+                    return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
+                }
+            }
             let result = state.lock().unwrap().ingest(event, 0);
             match result {
                 Ok(v) => respond(request, 200, v),
@@ -295,6 +364,16 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
         }
         _ => respond(request, 404, json!({"ok": false, "error": "not found"})),
     }
+}
+
+enum Principal {
+    /// The bus operator (PHER_HTTP_TOKEN, or any caller on a tokenless
+    /// loopback bind).
+    Admin,
+    /// A named grant: emit through its emit filter, listen through its
+    /// allow filter, commit cursors. Nothing else.
+    Grant(String),
+    Anon,
 }
 
 /// One HTTP/1.1 chunk frame: size line, payload, CRLF — flushed immediately.

@@ -43,6 +43,45 @@ pub struct Config {
     pub conditions: Vec<CondEntry>,
     #[serde(default, rename = "node")]
     pub nodes: Vec<NodeCfg>,
+    #[serde(default, rename = "bridge")]
+    pub bridges: Vec<BridgeEntry>,
+    #[serde(default, rename = "grant")]
+    pub grants: Vec<GrantEntry>,
+}
+
+/// Pull composition: a durable filtered listen against an upstream bus,
+/// re-ingested locally. `from` names a [[node]].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEntry {
+    pub name: String,
+    pub from: String,
+    pub sub: String,
+    /// Upstream cursor name; default bridge:<name>@<target node>.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// A named bearer token bounded by subscription-language filters.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantEntry {
+    pub name: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default, rename = "token-env")]
+    pub token_env: Option<String>,
+    /// What the token may consume, e.g. 'on team.** where payload.vis != "private"'
+    #[serde(default)]
+    pub allow: Option<String>,
+    /// What the token may publish, e.g. 'on team.anna.**'
+    #[serde(default)]
+    pub emit: Option<String>,
+}
+
+fn fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(token.as_bytes()))[..12].to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,8 +229,8 @@ pub fn run(
     };
 
     // -- nodes: local registry (this machine's view of the mesh) ------------
+    let mut nodes = client::load_nodes(paths);
     if !config.nodes.is_empty() {
-        let mut nodes = client::load_nodes(paths);
         let mut changed = false;
         for n in &config.nodes {
             let token = match (&n.token, &n.token_env) {
@@ -353,6 +392,135 @@ pub fn run(
         }
     }
 
+    // -- bridges: reconcile by name -------------------------------------------
+    if !config.bridges.is_empty() || prune {
+        let bls = client::call_target(target, &Request::BridgeLs)?;
+        let existing_bridges: HashMap<String, Value> = bls["bridges"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|b| Some((b.get("name")?.as_str()?.to_string(), b)))
+            .collect();
+        for entry in &config.bridges {
+            let node = nodes
+                .iter()
+                .find(|n| n.name == entry.from)
+                .with_context(|| {
+                    format!(
+                        "bridge '{}': unknown node '{}' — declare it in [[node]]",
+                        entry.name, entry.from
+                    )
+                })?;
+            let cursor = entry.cursor.clone().unwrap_or_default();
+            let same = existing_bridges.get(&entry.name).is_some_and(|b| {
+                b["url"].as_str() == Some(node.url.as_str())
+                    && b["sub"].as_str() == Some(entry.sub.as_str())
+                    && (cursor.is_empty() || b["cursor"].as_str() == Some(cursor.as_str()))
+                    && b["authed"].as_bool() == Some(node.token.is_some())
+            });
+            if same {
+                println!("  bridge {}: unchanged", entry.name);
+                continue;
+            }
+            let existed = existing_bridges.contains_key(&entry.name);
+            act(format!(
+                "bridge {}: {} ← {}",
+                entry.name,
+                if existed { "updated" } else { "created" },
+                node.url
+            ));
+            if !dry_run {
+                client::call_target(
+                    target,
+                    &Request::BridgeAdd {
+                        def: json!({
+                            "name": entry.name,
+                            "url": node.url,
+                            "token": node.token,
+                            "sub": entry.sub,
+                            "cursor": cursor,
+                        }),
+                    },
+                )?;
+            }
+        }
+        if prune {
+            let desired: std::collections::HashSet<&str> =
+                config.bridges.iter().map(|b| b.name.as_str()).collect();
+            for name in existing_bridges.keys() {
+                if !desired.contains(name.as_str()) {
+                    act(format!("bridge {name}: pruned"));
+                    if !dry_run {
+                        client::call_target(target, &Request::BridgeRm { name: name.clone() })?;
+                    }
+                }
+            }
+        }
+    }
+
+    // -- grants: reconcile by name --------------------------------------------
+    if !config.grants.is_empty() || prune {
+        let gls = client::call_target(target, &Request::GrantLs)?;
+        let existing_grants: HashMap<String, Value> = gls["grants"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|g| Some((g.get("name")?.as_str()?.to_string(), g)))
+            .collect();
+        for entry in &config.grants {
+            let token = match (&entry.token, &entry.token_env) {
+                (Some(t), _) => t.clone(),
+                (None, Some(var)) => std::env::var(var)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .with_context(|| format!("grant '{}': token-env {var} is unset", entry.name))?,
+                (None, None) => bail!("grant '{}': token or token-env required", entry.name),
+            };
+            let same = existing_grants.get(&entry.name).is_some_and(|g| {
+                g["tokenFingerprint"].as_str() == Some(fingerprint(&token).as_str())
+                    && g["allow"].as_str() == entry.allow.as_deref()
+                    && g["emit"].as_str() == entry.emit.as_deref()
+            });
+            if same {
+                println!("  grant {}: unchanged", entry.name);
+                continue;
+            }
+            let existed = existing_grants.contains_key(&entry.name);
+            act(format!(
+                "grant {}: {}",
+                entry.name,
+                if existed { "updated" } else { "created" }
+            ));
+            if !dry_run {
+                client::call_target(
+                    target,
+                    &Request::GrantSet {
+                        def: json!({
+                            "name": entry.name,
+                            "token": token,
+                            "allow": entry.allow,
+                            "emit": entry.emit,
+                        }),
+                    },
+                )?;
+            }
+        }
+        if prune {
+            let desired: std::collections::HashSet<&str> =
+                config.grants.iter().map(|g| g.name.as_str()).collect();
+            for name in existing_grants.keys() {
+                if !desired.contains(name.as_str()) {
+                    act(format!("grant {name}: pruned"));
+                    if !dry_run {
+                        client::call_target(target, &Request::GrantRm { name: name.clone() })?;
+                    }
+                }
+            }
+        }
+    }
+
     if dry_run {
         println!("dry run: nothing changed");
     }
@@ -406,6 +574,30 @@ mod tests {
             cfg.nodes[0].token_env.as_deref(),
             Some("PHER_HTTP_TOKEN_METAL1")
         );
+    }
+
+    #[test]
+    fn parses_bridges_and_grants() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[bridge]]
+            name = "company-ci"
+            from = "company"
+            sub = "on ci.**"
+
+            [[grant]]
+            name = "team"
+            token-env = "PHER_TOKEN_TEAM"
+            allow = 'on ci.**, deploy.*'
+            emit = 'on team.oslo.**'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.bridges[0].from, "company");
+        assert_eq!(cfg.bridges[0].cursor, None);
+        assert_eq!(cfg.grants[0].allow.as_deref(), Some("on ci.**, deploy.*"));
+        // Unknown fields are config typos, not silent no-ops.
+        assert!(toml::from_str::<Config>("[[grant]]\nname='x'\nalow='on a'").is_err());
     }
 
     #[test]

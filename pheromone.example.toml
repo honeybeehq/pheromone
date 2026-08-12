@@ -41,3 +41,25 @@ labels = { env = "prod" }
 name = "metal1"
 url = "http://metal1:4870"
 token-env = "PHER_HTTP_TOKEN_METAL1"
+
+# -- bridges: pull composition between buses ----------------------------------
+# A bridge is a durable filtered listen against an upstream bus, re-ingested
+# locally: same event ids, hops incremented, deduped, cursor-resumed across
+# outages. The upstream evaluates the subscription (its tiers, its budgets).
+
+[[bridge]]
+name = "company-ci"
+from = "metal1"                       # a [[node]] name (its token is used)
+sub = 'on ci.**, deploy.* where payload.visibility != "private"'
+
+# -- grants: authorization in the subscription language -----------------------
+# A grant is a named bearer token bounded by two filters: `allow` is what it
+# may consume (listen), `emit` is what it may publish. Tiers 1-2 only —
+# authorization never consults an embedding or an LLM. Everything else
+# (when/ls/rm/apply/...) requires the admin token.
+
+[[grant]]
+name = "teammate-anna"
+token-env = "PHER_TOKEN_ANNA"
+allow = 'on team.**, ci.**'
+emit = 'on team.anna.**'

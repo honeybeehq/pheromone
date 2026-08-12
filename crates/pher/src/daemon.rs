@@ -108,9 +108,15 @@ pub(crate) struct State {
     /// Live `then stream` listeners by subscription id. Dropping the sender
     /// ends the listener's delivery loop; a vanished listener removes the
     /// subscription — the enforced form of `while <client> alive`.
-    listeners: HashMap<String, mpsc::Sender<String>>,
+    listeners: HashMap<String, ListenerHandle>,
     /// Named consumer cursors (client-committed positions in this log).
     cursors: HashMap<String, CursorEntry>,
+    /// Named token grants (authorization = the subscription language).
+    pub(crate) grants: HashMap<String, GrantRuntime>,
+    /// Bridge definitions (pull composition from upstream buses).
+    bridges: HashMap<String, crate::bridge::BridgeDef>,
+    /// Cancel flags for running bridge workers.
+    bridge_cancels: HashMap<String, Arc<std::sync::atomic::AtomicBool>>,
     /// Log seq of the event currently being delivered — stamped into
     /// delivery records and stream lines so consumers can track a cursor.
     /// Every deliver() path sets it first (ingest, replay, timers, windows,
@@ -169,6 +175,86 @@ struct OutboxEntry {
 /// Retry backoff: 2s, 4s, 8s, … capped at 15 minutes.
 fn outbox_backoff(attempts: u32) -> u64 {
     (2u64 << attempts.min(12)).min(900)
+}
+
+/// A named bearer token whose surface is a pair of subscription-language
+/// filters: `allow` bounds what it may consume, `emit` what it may publish.
+/// Authorization IS the matcher — no second policy language.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct GrantDef {
+    pub name: String,
+    pub token: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub allow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub emit: Option<String>,
+}
+
+pub(crate) struct GrantRuntime {
+    pub def: GrantDef,
+    pub allow_sub: Option<Subscription>,
+    pub emit_sub: Option<Subscription>,
+}
+
+impl GrantDef {
+    pub fn compile(self) -> Result<GrantRuntime, String> {
+        let allow_sub = self.allow.as_deref().map(parse_filter).transpose()?;
+        let emit_sub = self.emit.as_deref().map(parse_filter).transpose()?;
+        if allow_sub.is_none() && emit_sub.is_none() {
+            return Err(format!(
+                "grant '{}' needs at least one of allow/emit",
+                self.name
+            ));
+        }
+        Ok(GrantRuntime {
+            def: self,
+            allow_sub,
+            emit_sub,
+        })
+    }
+
+    /// First 12 hex chars of sha256(token): diffable identity that never
+    /// exposes the token (`pher grant ls`, `pher apply`).
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(self.token.as_bytes()))[..12].to_string()
+    }
+}
+
+/// `on <subjects> [from <node>] [where <expr>]` — a deterministic filter in
+/// the subscription language. Tiers 1-2 only: authorization never consults
+/// an embedding or an LLM.
+pub(crate) fn parse_filter(text: &str) -> Result<Subscription, String> {
+    let sub = Subscription::parse(&format!("{text} then stream")).map_err(|e| {
+        format!("filter '{text}': {e} (filters are 'on <subjects> [where <expr>]', no then-clause)")
+    })?;
+    if sub.meaning.is_some() || sub.judge.is_some() || sub.expect.is_some() {
+        return Err(format!(
+            "filter '{text}': grant filters are deterministic — tiers 1-2 only"
+        ));
+    }
+    // The action clause swallows rest-of-line, so an embedded `then …` in the
+    // filter text would otherwise parse "successfully" as sink arguments.
+    if sub.then.sink != Sink::Stream || !sub.then.args.is_empty() {
+        return Err(format!(
+            "filter '{text}': filters take no then-clause — they bound, they don't act"
+        ));
+    }
+    Ok(sub)
+}
+
+pub(crate) fn filter_matches(filter: &Subscription, event: &Envelope) -> bool {
+    matches!(
+        evaluate("GRANT", filter, event, None).outcome,
+        Outcome::Matched
+    )
+}
+
+/// A live stream listener: its delivery channel, plus the grant filter it
+/// is bounded by (None = local/admin, unfiltered).
+pub(crate) struct ListenerHandle {
+    tx: mpsc::Sender<String>,
+    filter: Option<Subscription>,
 }
 
 /// A pending tier-4 evaluation, processed off-lock by the judge worker.
@@ -292,6 +378,27 @@ impl State {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
 
+        let mut grants: HashMap<String, GrantRuntime> = HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(paths.grants()) {
+            let defs: Vec<GrantDef> = serde_json::from_str(&text).context("grants.json corrupt")?;
+            for def in defs {
+                let name = def.name.clone();
+                match def.compile() {
+                    Ok(g) => {
+                        grants.insert(name, g);
+                    }
+                    Err(e) => eprintln!("pherd: warning: grant '{name}' disabled: {e}"),
+                }
+            }
+        }
+
+        let bridges: HashMap<String, crate::bridge::BridgeDef> =
+            std::fs::read_to_string(paths.bridges())
+                .ok()
+                .and_then(|t| serde_json::from_str::<Vec<crate::bridge::BridgeDef>>(&t).ok())
+                .map(|v| v.into_iter().map(|b| (b.name.clone(), b)).collect())
+                .unwrap_or_default();
+
         let semantic = crate::semantic::Semantic::new(paths.clone());
         let mut state = State {
             paths,
@@ -304,6 +411,9 @@ impl State {
             tails: Vec::new(),
             listeners: HashMap::new(),
             cursors,
+            grants,
+            bridges,
+            bridge_cancels: HashMap::new(),
             current_seq: None,
             retention_secs,
             semantic,
@@ -844,26 +954,30 @@ impl State {
     /// Preserves the origin envelope (id/ts/node/correlation), dedups by
     /// the remote deliveryId, and honors the hop cycle guard.
     pub(crate) fn ingest_forwarded(&mut self, delivery: Value) -> Result<Value, String> {
-        let mut event: Envelope = serde_json::from_value(
+        let event: Envelope = serde_json::from_value(
             delivery
                 .get("event")
                 .cloned()
-                .ok_or("delivery must carry {event, match}")?,
+                .ok_or("delivery must carry {event, ...}")?,
         )
         .map_err(|e| format!("invalid forwarded envelope: {e}"))?;
-        let delivery_id = delivery
-            .pointer("/match/deliveryId")
-            .and_then(|d| d.as_str())
-            .ok_or("delivery must carry match.deliveryId")?
-            .to_string();
-        if self.forwarded_seen.contains(&delivery_id) {
+        self.admit_remote(event)
+    }
+
+    /// Admit an event that originated on another bus (push via /deliver, or
+    /// pull via a bridge). Dedup is by EVENT id — the envelope's identity is
+    /// preserved across any topology, so the same event arriving via two
+    /// routes (or retried at-least-once) ingests exactly once. Persisted
+    /// before ingest so restarts don't reopen the window.
+    pub(crate) fn admit_remote(&mut self, mut event: Envelope) -> Result<Value, String> {
+        if event.id.is_empty() {
+            return Err("remote event has no id".to_string());
+        }
+        if self.forwarded_seen.contains(&event.id) {
             return Ok(json!({ "ok": true, "deduped": true }));
         }
-        // Persist before ingest: with at-least-once shipping upstream, a
-        // dedup window that dies with the process would double-fire after a
-        // restart. Append-only; GC compacts to the window size.
-        let _ = self.append_jsonl(&self.paths.forwarded(), &json!({ "id": delivery_id }));
-        self.forwarded_seen.push_back(delivery_id);
+        let _ = self.append_jsonl(&self.paths.forwarded(), &json!({ "id": event.id }));
+        self.forwarded_seen.push_back(event.id.clone());
         while self.forwarded_seen.len() > MAX_FORWARDED_SEEN {
             self.forwarded_seen.pop_front();
         }
@@ -876,6 +990,82 @@ impl State {
         event.hops = Some(hops);
         let (seq, deliveries) = self.ingest_envelope(event.clone())?;
         Ok(json!({ "ok": true, "id": event.id, "seq": seq, "deliveries": deliveries }))
+    }
+
+    fn persist_grants(&self) -> anyhow::Result<()> {
+        let defs: Vec<&GrantDef> = self.grants.values().map(|g| &g.def).collect();
+        write_json_atomic(&self.paths.grants(), &serde_json::to_value(defs)?)?;
+        // Tokens live in this file: owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                self.paths.grants(),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        Ok(())
+    }
+
+    fn persist_bridges(&self) -> anyhow::Result<()> {
+        let defs: Vec<&crate::bridge::BridgeDef> = self.bridges.values().collect();
+        write_json_atomic(&self.paths.bridges(), &serde_json::to_value(defs)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                self.paths.bridges(),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        Ok(())
+    }
+
+    /// Resolve a bearer token to a grant name (http auth).
+    pub(crate) fn grant_for_token(&self, token: &str) -> Option<String> {
+        self.grants
+            .values()
+            .find(|g| g.def.token == token)
+            .map(|g| g.def.name.clone())
+    }
+
+    /// May this grant emit this event? Checked against the `emit` filter
+    /// with a probe envelope (grants should reference subject/payload).
+    pub(crate) fn check_grant_emit(&self, grant: &str, event: &PartialEvent) -> Result<(), String> {
+        let g = self
+            .grants
+            .get(grant)
+            .ok_or_else(|| format!("unknown grant '{grant}'"))?;
+        let Some(filter) = &g.emit_sub else {
+            return Err(format!("grant '{grant}' has no emit filter"));
+        };
+        let probe = Envelope {
+            id: String::new(),
+            ts: String::new(),
+            node: self.node.clone(),
+            source: event
+                .source
+                .clone()
+                .unwrap_or_else(|| format!("grant:{grant}")),
+            event_type: event
+                .event_type
+                .clone()
+                .unwrap_or_else(|| event.subject.clone()),
+            subject: event.subject.clone(),
+            correlation: event.correlation.clone(),
+            payload: event.payload.clone().unwrap_or(Value::Null),
+            ttl_class: None,
+            hops: None,
+        };
+        if filter_matches(filter, &probe) {
+            Ok(())
+        } else {
+            Err(format!(
+                "grant '{grant}' may not emit '{}' (emit filter: {})",
+                event.subject,
+                g.def.emit.as_deref().unwrap_or("")
+            ))
+        }
     }
 
     /// Deliver a tier-4 match: extend the block with meaning + judge records.
@@ -1240,7 +1430,17 @@ impl State {
                 // subscription. No listener means the sub is mid-teardown.
                 delivery_json["deliveryId"] = json!(delivery_id);
                 match self.listeners.get(&block.subscription) {
-                    Some(tx) if tx.send(delivery_json.to_string()).is_ok() => {
+                    // Grant enforcement: the delivery must also match the
+                    // listener's allow filter — intersection, not trust.
+                    Some(handle)
+                        if handle
+                            .filter
+                            .as_ref()
+                            .is_some_and(|f| !filter_matches(f, event)) =>
+                    {
+                        json!({ "sink": "stream", "filtered": "grant allow" })
+                    }
+                    Some(handle) if handle.tx.send(delivery_json.to_string()).is_ok() => {
                         json!({ "sink": "stream", "delivered": true })
                     }
                     _ => json!({ "sink": "stream", "error": "listener gone" }),
@@ -1730,6 +1930,21 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         });
     }
 
+    // Bridge workers for persisted bridges.
+    {
+        let defs: Vec<crate::bridge::BridgeDef> =
+            state.lock().unwrap().bridges.values().cloned().collect();
+        for def in defs {
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            state
+                .lock()
+                .unwrap()
+                .bridge_cancels
+                .insert(def.name.clone(), Arc::clone(&cancel));
+            crate::bridge::spawn(Arc::clone(&state), def, cancel);
+        }
+    }
+
     // HTTP ingress (webhooks, remote emit, metric intake) if configured.
     if let Some(http_cfg) = http_cfg {
         crate::http::start(Arc::clone(&state), http_cfg)?;
@@ -1840,6 +2055,8 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
                 "listeners": s.listeners.len(),
                 "cursors": s.cursors.len(),
                 "outbox": s.outbox.len(),
+                "bridges": s.bridges.len(),
+                "grants": s.grants.len(),
                 "retention": format!("{}s", s.retention_secs),
                 "semantic": s.semantic.status(),
                 "conditions": s.conditions.defs.len(),
@@ -1915,6 +2132,109 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
             let mut s = state.lock().unwrap();
             let removed = s.cursors.remove(&name).is_some();
             let _ = s.persist_cursors();
+            ok(json!({ "removed": removed }))
+        }
+        Request::BridgeAdd { def } => {
+            let mut def: crate::bridge::BridgeDef = match serde_json::from_value(def) {
+                Ok(d) => d,
+                Err(e) => return err(format!("invalid bridge: {e}")),
+            };
+            if let Err(e) = Subscription::parse(&def.sub_text()) {
+                return err(format!("bridge '{}': bad sub: {e}", def.name));
+            }
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let mut s = state.lock().unwrap();
+                if def.cursor.is_empty() {
+                    // Scoped to this consuming bus, so two team members
+                    // bridging the same upstream never share a position.
+                    def.cursor = format!("bridge:{}@{}", def.name, s.node);
+                }
+                // Re-add = replace: the old worker winds down on its next
+                // heartbeat/line; its upstream sub evaporates on disconnect.
+                if let Some(old) = s.bridge_cancels.remove(&def.name) {
+                    old.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                s.bridges.insert(def.name.clone(), def.clone());
+                if let Err(e) = s.persist_bridges() {
+                    return err(format!("cannot persist bridge: {e}"));
+                }
+                s.bridge_cancels
+                    .insert(def.name.clone(), Arc::clone(&cancel));
+            }
+            crate::bridge::spawn(Arc::clone(state), def.clone(), cancel);
+            ok(json!({ "name": def.name, "cursor": def.cursor }))
+        }
+        Request::BridgeLs => {
+            let s = state.lock().unwrap();
+            let mut bridges: Vec<Value> = s
+                .bridges
+                .values()
+                .map(|b| {
+                    json!({
+                        "name": b.name,
+                        "url": b.url,
+                        "sub": b.sub,
+                        "cursor": b.cursor,
+                        "authed": b.token.is_some(),
+                    })
+                })
+                .collect();
+            bridges.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            ok(json!({ "bridges": bridges }))
+        }
+        Request::BridgeRm { name } => {
+            let mut s = state.lock().unwrap();
+            if let Some(cancel) = s.bridge_cancels.remove(&name) {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let removed = s.bridges.remove(&name).is_some();
+            let _ = s.persist_bridges();
+            ok(json!({ "removed": removed }))
+        }
+        Request::GrantSet { def } => {
+            let def: GrantDef = match serde_json::from_value(def) {
+                Ok(d) => d,
+                Err(e) => return err(format!("invalid grant: {e}")),
+            };
+            if def.token.len() < 16 {
+                return err("grant tokens must be at least 16 characters");
+            }
+            let name = def.name.clone();
+            let fingerprint = def.fingerprint();
+            match def.compile() {
+                Ok(runtime) => {
+                    let mut s = state.lock().unwrap();
+                    s.grants.insert(name.clone(), runtime);
+                    if let Err(e) = s.persist_grants() {
+                        return err(format!("cannot persist grant: {e}"));
+                    }
+                    ok(json!({ "name": name, "tokenFingerprint": fingerprint }))
+                }
+                Err(e) => err(e),
+            }
+        }
+        Request::GrantLs => {
+            let s = state.lock().unwrap();
+            let mut grants: Vec<Value> = s
+                .grants
+                .values()
+                .map(|g| {
+                    json!({
+                        "name": g.def.name,
+                        "allow": g.def.allow,
+                        "emit": g.def.emit,
+                        "tokenFingerprint": g.def.fingerprint(),
+                    })
+                })
+                .collect();
+            grants.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            ok(json!({ "grants": grants }))
+        }
+        Request::GrantRm { name } => {
+            let mut s = state.lock().unwrap();
+            let removed = s.grants.remove(&name).is_some();
+            let _ = s.persist_grants();
             ok(json!({ "removed": removed }))
         }
     }
@@ -2081,6 +2401,7 @@ pub(crate) fn attach_listener(
     client: &str,
     after: Option<u64>,
     cursor: Option<&str>,
+    filter: Option<Subscription>,
 ) -> Result<(String, Value, mpsc::Receiver<String>), Value> {
     let (tx, rx) = mpsc::channel::<String>();
     let mut s = state.lock().unwrap();
@@ -2095,7 +2416,8 @@ pub(crate) fn attach_listener(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    s.listeners.insert(id.clone(), tx);
+    s.listeners
+        .insert(id.clone(), ListenerHandle { tx, filter });
 
     // Catch-up replay into the now-attached channel. Cursor resume (exact,
     // by seq) wins over the subscription's own `since` (fuzzy, by time).
@@ -2178,14 +2500,22 @@ fn handle_listen(
     state: &Arc<Mutex<State>>,
 ) -> anyhow::Result<()> {
     let client = client.unwrap_or_else(|| "listener".to_string());
-    let (sub_id, ack, rx) =
-        match attach_listener(state, string, options, &client, after, cursor.as_deref()) {
-            Ok(attached) => attached,
-            Err(e) => {
-                respond(stream, &e)?;
-                return Ok(());
-            }
-        };
+    // Unix socket = local operator = unfiltered.
+    let (sub_id, ack, rx) = match attach_listener(
+        state,
+        string,
+        options,
+        &client,
+        after,
+        cursor.as_deref(),
+        None,
+    ) {
+        Ok(attached) => attached,
+        Err(e) => {
+            respond(stream, &e)?;
+            return Ok(());
+        }
+    };
     respond(stream, &ack)?;
 
     let teardown = |reason: &str| detach_listener(state, &sub_id, reason);
@@ -2231,4 +2561,74 @@ fn respond(mut stream: &UnixStream, value: &Value) -> anyhow::Result<()> {
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+
+    fn ev(subject: &str, payload: Value) -> Envelope {
+        Envelope {
+            id: "E.1".into(),
+            ts: "2026-08-12T00:00:00Z".into(),
+            node: "n".into(),
+            source: "s".into(),
+            event_type: subject.into(),
+            subject: subject.into(),
+            correlation: None,
+            payload,
+            ttl_class: None,
+            hops: None,
+        }
+    }
+
+    #[test]
+    fn grant_filters_are_deterministic_tiers_only() {
+        assert!(parse_filter("on ci.**, deploy.*").is_ok());
+        assert!(parse_filter(r#"on a.* where payload.env == "prod""#).is_ok());
+        // Probabilistic tiers and actions have no place in authorization.
+        assert!(parse_filter(r#"on a.* meaning "x""#).is_err());
+        assert!(parse_filter("on a.* then cmd echo hi").is_err());
+        assert!(parse_filter(r#"on a.* judge "q" budget 1/day"#).is_err());
+    }
+
+    #[test]
+    fn grant_filters_match_like_the_matcher() {
+        let f = parse_filter(r#"on ci.**, deploy.* where payload.env == "prod""#).unwrap();
+        assert!(filter_matches(
+            &f,
+            &ev("deploy.done", json!({"env": "prod"}))
+        ));
+        assert!(filter_matches(
+            &f,
+            &ev("ci.run.completed", json!({"env": "prod"}))
+        ));
+        assert!(!filter_matches(
+            &f,
+            &ev("deploy.done", json!({"env": "dev"}))
+        ));
+        assert!(!filter_matches(
+            &f,
+            &ev("hr.salary", json!({"env": "prod"}))
+        ));
+    }
+
+    #[test]
+    fn grants_need_a_surface_and_real_tokens() {
+        let def = GrantDef {
+            name: "x".into(),
+            token: "0123456789abcdef".into(),
+            allow: None,
+            emit: None,
+        };
+        assert!(def.compile().is_err());
+        let def = GrantDef {
+            name: "x".into(),
+            token: "0123456789abcdef".into(),
+            allow: Some("on a.*".into()),
+            emit: None,
+        };
+        assert_eq!(def.fingerprint().len(), 12);
+        assert!(def.compile().is_ok());
+    }
 }

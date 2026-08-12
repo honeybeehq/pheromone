@@ -1,4 +1,5 @@
 mod apply;
+mod bridge;
 mod client;
 mod conditions;
 mod daemon;
@@ -140,6 +141,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CursorCmd,
     },
+    /// Manage bridges (pull filtered streams from upstream buses)
+    Bridge {
+        #[command(subcommand)]
+        cmd: BridgeCmd,
+    },
+    /// Inspect or remove token grants (set them via pher apply)
+    Grant {
+        #[command(subcommand)]
+        cmd: GrantCmd,
+    },
     /// Show the full match record for a delivery
     Why {
         #[arg(name = "delivery-id")]
@@ -176,6 +187,41 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NodeCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum BridgeCmd {
+    /// Add/replace a bridge, e.g.: pher bridge add company-ci --from company --sub 'on ci.**'
+    Add {
+        name: String,
+        /// Upstream: a node name from `pher node add`, or a URL
+        #[arg(long)]
+        from: String,
+        /// Subscription text ('then stream' implied)
+        #[arg(long)]
+        sub: String,
+        /// Upstream bearer token (defaults to the node's registered token)
+        #[arg(long)]
+        token: Option<String>,
+        /// Upstream cursor name (default: bridge:<name>@<node>)
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// List bridges
+    Ls,
+    /// Remove a bridge
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum GrantCmd {
+    /// List grants (tokens shown as fingerprints only)
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a grant
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -539,6 +585,99 @@ fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Bridge { cmd } => match cmd {
+            BridgeCmd::Add {
+                name,
+                from,
+                sub,
+                token,
+                cursor,
+            } => {
+                // Resolve the upstream from the node registry, or take a URL.
+                let (url, node_token) =
+                    if from.starts_with("http://") || from.starts_with("https://") {
+                        (from.trim_end_matches('/').to_string(), None)
+                    } else {
+                        let nodes = client::load_nodes(&paths);
+                        let node = nodes
+                            .iter()
+                            .find(|n| n.name == from)
+                            .with_context(|| format!("unknown node '{from}' — pher node add"))?;
+                        (node.url.clone(), node.token.clone())
+                    };
+                let response = client::call_target(
+                    &target,
+                    &Request::BridgeAdd {
+                        def: serde_json::json!({
+                            "name": name,
+                            "url": url,
+                            "token": token.or(node_token),
+                            "sub": sub,
+                            "cursor": cursor.unwrap_or_default(),
+                        }),
+                    },
+                )?;
+                println!(
+                    "bridge {name} → pulling from {url} (cursor {})",
+                    response["cursor"].as_str().unwrap_or("?")
+                );
+            }
+            BridgeCmd::Ls => {
+                let response = client::call_target(&target, &Request::BridgeLs)?;
+                let bridges = response["bridges"].as_array().cloned().unwrap_or_default();
+                if bridges.is_empty() {
+                    println!("no bridges");
+                }
+                for b in bridges {
+                    println!(
+                        "{}  ← {}  '{}'  cursor={}",
+                        b["name"].as_str().unwrap_or("?"),
+                        b["url"].as_str().unwrap_or("?"),
+                        b["sub"].as_str().unwrap_or("?"),
+                        b["cursor"].as_str().unwrap_or("?"),
+                    );
+                }
+            }
+            BridgeCmd::Rm { name } => {
+                let response =
+                    client::call_target(&target, &Request::BridgeRm { name: name.clone() })?;
+                if response["removed"].as_bool() == Some(true) {
+                    println!("removed {name} (winds down within ~15s)");
+                } else {
+                    bail!("no bridge '{name}'");
+                }
+            }
+        },
+        Cmd::Grant { cmd } => match cmd {
+            GrantCmd::Ls { json } => {
+                let response = client::call_target(&target, &Request::GrantLs)?;
+                let grants = response["grants"].as_array().cloned().unwrap_or_default();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&grants)?);
+                } else if grants.is_empty() {
+                    println!("no grants");
+                } else {
+                    for g in grants {
+                        println!(
+                            "{}  [{}]  allow: {}  emit: {}",
+                            g["name"].as_str().unwrap_or("?"),
+                            g["tokenFingerprint"].as_str().unwrap_or("?"),
+                            g["allow"].as_str().unwrap_or("-"),
+                            g["emit"].as_str().unwrap_or("-"),
+                        );
+                    }
+                }
+            }
+            GrantCmd::Rm { name } => {
+                let response =
+                    client::call_target(&target, &Request::GrantRm { name: name.clone() })?;
+                if response["removed"].as_bool() == Some(true) {
+                    println!("removed {name}");
+                } else {
+                    bail!("no grant '{name}'");
+                }
+            }
+        },
         Cmd::Cursor { cmd } => match cmd {
             CursorCmd::Ls { json } => {
                 let response = client::call_target(&target, &Request::CursorLs)?;

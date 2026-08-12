@@ -55,6 +55,26 @@ pub enum Request {
     CursorRm {
         name: String,
     },
+    /// Upsert a bridge: a durable pull from an upstream bus — its /listen
+    /// filtered by `sub`, re-ingested locally with envelope identity
+    /// preserved. `url`/`token` are resolved from the node registry by the
+    /// caller (`pher apply` / `pher bridge add`).
+    BridgeAdd {
+        def: Value,
+    },
+    BridgeLs,
+    BridgeRm {
+        name: String,
+    },
+    /// Upsert a grant: a named bearer token whose read/write surface is a
+    /// pair of subscription-language filters (tiers 1-2 only).
+    GrantSet {
+        def: Value,
+    },
+    GrantLs,
+    GrantRm {
+        name: String,
+    },
     Why {
         #[serde(rename = "deliveryId")]
         delivery_id: String,

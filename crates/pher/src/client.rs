@@ -72,9 +72,21 @@ pub fn call_target(target: &Target, request: &Request) -> anyhow::Result<Value> 
             if let Some(t) = token {
                 req = req.set("authorization", &format!("Bearer {t}"));
             }
-            let response = req
-                .send_string(&serde_json::to_string(request)?)
-                .map_err(|e| anyhow::anyhow!("remote node unreachable at {url}: {e}"))?;
+            let response =
+                req.send_string(&serde_json::to_string(request)?)
+                    .map_err(|e| match e {
+                        ureq::Error::Status(code, resp) => {
+                            let text = resp.into_string().unwrap_or_default();
+                            let msg = serde_json::from_str::<Value>(&text)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("error").and_then(|x| x.as_str()).map(String::from)
+                                })
+                                .unwrap_or(text);
+                            anyhow::anyhow!("remote node refused ({code}): {msg}")
+                        }
+                        other => anyhow::anyhow!("remote node unreachable at {url}: {other}"),
+                    })?;
             let text = response.into_string()?;
             let value: Value = serde_json::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("remote response not JSON: {e}"))?;

@@ -82,6 +82,14 @@ impl Paths {
     pub fn forwarded(&self) -> PathBuf {
         self.home.join("forwarded_seen.jsonl")
     }
+
+    pub fn bridges(&self) -> PathBuf {
+        self.home.join("bridges.json")
+    }
+
+    pub fn grants(&self) -> PathBuf {
+        self.home.join("grants.json")
+    }
 }
 
 /// Atomic-ish JSON write: temp file + rename, so kill -9 never leaves a torn file.
