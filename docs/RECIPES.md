@@ -41,8 +41,8 @@ Every delivery also has a receipt: `pher why <deliveryId>`.
 Requires the embedding model (~30MB, downloads once; unset `PHER_EMBED=off`).
 
 ```bash
-pher listen 'on crash.** meaning "OOM or memory pressure" > 0.65'
-pher emit crash.sentry.backend --payload '{"title": "OOMKilled: worker exceeded 2Gi RSS"}'   # matches (~0.68)
+pher listen 'on crash.** meaning "OOM or memory pressure" > 0.55'
+pher emit crash.sentry.backend --payload '{"title": "OOMKilled: worker exceeded 2Gi RSS"}'   # matches (~0.62)
 pher emit crash.sentry.backend --payload '{"title": "TypeError: undefined is not a function"}' # rejected
 ```
 

@@ -86,6 +86,9 @@
 <div>
   <div class="panel">
     <h2>live events <span class="spacer"></span>
+      <label style="display:flex;align-items:center;gap:.3rem;text-transform:none;letter-spacing:0">
+        <input type="checkbox" id="internals" style="width:auto"> bus internals
+      </label>
       <input type="text" id="feedfilter" placeholder="subject filter, e.g. hive.**" style="width:11rem">
       <button id="feedbtn">restart feed</button>
     </h2>
@@ -186,7 +189,10 @@ async function refresh() {
       `node <b>${esc(s.node)}</b> · <b>${s.subscriptions}</b> subs · ` +
       `<b>${s.listeners}</b> listeners · <b>${s.outbox}</b> outbox · ` +
       `<b>${s.bridges}</b> bridges · <b>${s.grants}</b> grants · ` +
-      `meaning ${s.semantic?.enabled ? "on" : "off"} · judge ${s.judge?.configured ? esc(s.judge.model) : "off"}`;
+      `meaning ${s.semantic?.enabled ? "on" : "off"} · judge ${s.judge?.configured ? esc(s.judge.model) : "off"}` +
+      (s.build === "debug"
+        ? ` · <span style="color:var(--bad)">debug build — embeddings are ~20x slower; use cargo build --release</span>`
+        : "");
     loadSubs();
   } catch (e) {
     $("statusline").innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>` +
@@ -205,6 +211,9 @@ function startFeed() {
   feedCtrl = stream("/tail", body, (line) => {
     if (!line.event) return;
     const e = line.event;
+    // Lifecycle noise (pher.subscription.* etc.) reads as flakiness; hide
+    // it unless asked. The events still exist — this is a view filter.
+    if (!$("internals").checked && e.subject.startsWith("pher.")) return;
     const div = document.createElement("div");
     div.className = "ev";
     div.innerHTML = `<span class="seq">${line.seq}</span><span class="subj">${esc(e.subject)}</span>` +
@@ -228,6 +237,7 @@ function startFeed() {
   });
 }
 $("feedbtn").onclick = startFeed;
+$("internals").onchange = startFeed;
 
 // ---- emit ---------------------------------------------------------------
 $("emitbtn").onclick = async () => {
@@ -243,13 +253,16 @@ $("emitbtn").onclick = async () => {
 // ---- live tester --------------------------------------------------------
 let testCtrl = null;
 $("tstart").onclick = () => {
-  testCtrl?.abort();
+  testCtrl?.abort(); // re-listening replaces the previous test subscription
   $("matches").innerHTML = "";
+  $("tstate").innerHTML = `<span class="dim">connecting…</span>`;
+  $("tstart").disabled = true;
   let text = $("tsub").value.replace(/\n/g, " ").trim();
   if (!/\sthen\s/.test(` ${text} `)) text += " then stream";
   testCtrl = stream("/listen", { string: text, client: "console" }, (line) => {
     if (line.canonical) {
       $("tstate").innerHTML = `<span class="badge b-live">LIVE</span>${esc(line.id)} — ${esc(line.canonical)}`;
+      $("tstart").disabled = false;
       $("tstop").disabled = false;
       refresh();
       return;
@@ -268,6 +281,7 @@ $("tstart").onclick = () => {
     $("tstate").innerHTML = err
       ? `<span class="badge b-bad">error</span>${esc(err.message)}`
       : `<span class="dim">stream ended (sub removed)</span>`;
+    $("tstart").disabled = false;
     $("tstop").disabled = true;
   });
 };
@@ -301,7 +315,7 @@ const recipes = [
   ["where clause", "on demo.* where payload.n > 1", "demo.hello", '{"n": 5}'],
   ["ci failure", 'on ci.* where payload.conclusion == "failure" && payload.branch == "main"',
     "ci.github.run.completed", '{"conclusion": "failure", "branch": "main", "run": 812}'],
-  ["meaning: OOM", 'on crash.* meaning "OOM or memory pressure" > 0.65',
+  ["meaning: OOM", 'on crash.** meaning "OOM or memory pressure" > 0.55',
     "crash.sentry.backend", '{"title": "OOMKilled: worker exceeded 2Gi RSS"}'],
   ["meaning: novel", "on app.log.error meaning novel > 0.4 over 1h",
     "app.log.error", '{"msg": "disk quota exceeded on /var/lib/pg"}'],

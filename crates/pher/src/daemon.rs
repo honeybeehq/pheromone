@@ -1930,6 +1930,33 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         });
     }
 
+    // Prewarm the meaning tier OFF the state lock: on a cold home the model
+    // download + ONNX load takes seconds — paid here in the background, not
+    // at the first meaning registration with the whole daemon frozen.
+    {
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let (enabled, paths) = {
+                let mut s = state.lock().unwrap();
+                s.semantic.set_warming(true);
+                (s.semantic.enabled(), s.paths.clone())
+            };
+            if !enabled {
+                return;
+            }
+            let result = crate::semantic::Semantic::build_embedder(&paths);
+            let mut s = state.lock().unwrap();
+            s.semantic.set_warming(false);
+            match result {
+                Ok(embedder) => {
+                    s.semantic.install(embedder);
+                    eprintln!("pherd: meaning tier warm");
+                }
+                Err(e) => eprintln!("pherd: warning: meaning tier unavailable: {e}"),
+            }
+        });
+    }
+
     // Bridge workers for persisted bridges.
     {
         let defs: Vec<crate::bridge::BridgeDef> =
@@ -2048,6 +2075,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
             let s = state.lock().unwrap();
             ok(json!({
                 "node": s.node,
+                "build": if cfg!(debug_assertions) { "debug" } else { "release" },
                 "subscriptions": s.matcher.len(),
                 "nextSeq": s.next_seq,
                 "armedTimers": s.timers.len(),

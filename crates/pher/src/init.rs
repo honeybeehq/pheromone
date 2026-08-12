@@ -30,6 +30,10 @@ pub fn run(paths: &Paths) -> anyhow::Result<()> {
     std::fs::create_dir_all(paths.home.join("log"))?;
     println!("pheromone home: {}\n", paths.home.display());
 
+    if cfg!(debug_assertions) {
+        gap("this is a DEBUG build — embeddings run ~20x slower; build with --release");
+    }
+
     // Daemon + service.
     let daemon_up = match crate::client::call(paths, &Request::Status) {
         Ok(s) => {

@@ -21,6 +21,8 @@ const MAX_WINDOW_VECTORS: usize = 20_000;
 pub struct Semantic {
     paths: Paths,
     disabled: bool,
+    /// The startup prewarm is mid-download; registrations wait it out.
+    warming: bool,
     embedder: Option<Arc<pher_embed::Embedder>>,
     /// Descriptor embeddings per subscription id.
     desc_vecs: HashMap<String, Vec<Vec<f32>>>,
@@ -59,6 +61,7 @@ impl Semantic {
         Semantic {
             paths,
             disabled,
+            warming: false,
             embedder: None,
             desc_vecs: HashMap::new(),
             window,
@@ -72,11 +75,44 @@ impl Semantic {
         if let Some(e) = &self.embedder {
             return Ok(Arc::clone(e));
         }
+        if self.warming {
+            // Racing the prewarm's model download would trip fastembed's
+            // file lock and surface as gibberish; say what's happening.
+            return Err(
+                "meaning tier is warming up (model downloading) — retry in a few seconds"
+                    .to_string(),
+            );
+        }
         let embedder =
             pher_embed::Embedder::new(self.paths.models()).map_err(|e| format!("{e:#}"))?;
         let arc = Arc::new(embedder);
         self.embedder = Some(Arc::clone(&arc));
         Ok(arc)
+    }
+
+    pub fn set_warming(&mut self, warming: bool) {
+        self.warming = warming;
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.disabled
+    }
+
+    /// Build an embedder with NO daemon lock held — model download and ONNX
+    /// load can take many seconds on a cold home, and doing that lazily
+    /// inside the state lock froze the entire daemon at first `meaning`
+    /// registration. The startup prewarm calls this from its own thread.
+    pub fn build_embedder(paths: &Paths) -> Result<Arc<pher_embed::Embedder>, String> {
+        pher_embed::Embedder::new(paths.models())
+            .map(Arc::new)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    /// Install a prewarmed embedder (no-op if disabled or already warm).
+    pub fn install(&mut self, embedder: Arc<pher_embed::Embedder>) {
+        if !self.disabled && self.embedder.is_none() {
+            self.embedder = Some(embedder);
+        }
     }
 
     /// Embed a meaning subscription's descriptors at registration time.
