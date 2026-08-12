@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pher console</title>
+<style>
+  :root {
+    --bg: #101418; --panel: #171d24; --border: #2a333d;
+    --text: #d8dee6; --dim: #8a96a3; --accent: #e8a33d;
+    --ok: #5dbb63; --bad: #e06c5f; --pending: #6aa3e0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.2rem 1.5rem; background: var(--bg); color: var(--text);
+    font: 13px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 1rem; margin: 0; display: flex; align-items: center; gap: .5rem; }
+  h1 .pher { color: var(--accent); }
+  h2 { font-size: .72rem; color: var(--dim); text-transform: uppercase; letter-spacing: .07em;
+       margin: 0 0 .5rem; display: flex; align-items: center; gap: .5rem; }
+  h2 .spacer { flex: 1; }
+  .top { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  .top .spacer { flex: 1; }
+  #statusline { color: var(--dim); font-size: .78rem; }
+  #statusline b { color: var(--text); font-weight: 600; }
+  .grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 1rem; align-items: start; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+           padding: .8rem; margin-bottom: 1rem; }
+  textarea, input[type=text], input[type=password] {
+    width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: .45rem .55rem; font: inherit; outline: none;
+  }
+  textarea:focus, input:focus { border-color: var(--accent); }
+  textarea { resize: vertical; }
+  button {
+    background: transparent; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: .3rem .7rem; font: inherit; font-size: .8rem; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { border-color: var(--accent); color: var(--accent); }
+  button.danger:hover { border-color: var(--bad); color: var(--bad); }
+  .row { display: flex; gap: .5rem; margin: .4rem 0; align-items: center; }
+  .row > * { flex: 1; }
+  .row > button, .row > .fixed { flex: 0 0 auto; }
+  .feed { max-height: 420px; overflow-y: auto; font-size: .78rem; }
+  .feed .ev { padding: .18rem .3rem; border-radius: 4px; cursor: pointer; display: flex; gap: .6rem;
+              white-space: nowrap; overflow: hidden; }
+  .feed .ev:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .feed .ev .seq { color: var(--dim); flex: 0 0 3.2rem; text-align: right; }
+  .feed .ev .subj { color: var(--accent); flex: 0 0 auto; }
+  .feed .ev .pay { color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
+  .feed .detail { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+                  margin: .2rem 0 .4rem; padding: .5rem; white-space: pre-wrap; word-break: break-word; }
+  .matches { max-height: 300px; overflow-y: auto; font-size: .78rem; }
+  .m { border-left: 3px solid var(--ok); background: var(--bg); border-radius: 4px;
+       padding: .4rem .55rem; margin: .35rem 0; white-space: pre-wrap; word-break: break-word; }
+  .out { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+         padding: .5rem; margin-top: .5rem; white-space: pre-wrap; word-break: break-word;
+         font-size: .78rem; min-height: 1.4rem; }
+  .badge { display: inline-block; padding: .05rem .5rem; border-radius: 99px;
+           font-size: .72rem; font-weight: 700; margin-right: .4rem; }
+  .b-ok { background: color-mix(in srgb, var(--ok) 22%, transparent); color: var(--ok); }
+  .b-bad { background: color-mix(in srgb, var(--bad) 22%, transparent); color: var(--bad); }
+  .b-live { background: color-mix(in srgb, var(--pending) 22%, transparent); color: var(--pending); }
+  .presets { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .5rem; }
+  .presets button { font-size: .74rem; color: var(--dim); padding: .2rem .55rem; }
+  .presets button:hover { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+  td { padding: .25rem .35rem; border-top: 1px solid var(--border); vertical-align: top; }
+  td.id { color: var(--accent); white-space: nowrap; }
+  .dim { color: var(--dim); }
+  .hint { color: var(--dim); font-size: .74rem; margin-top: .35rem; }
+</style>
+</head>
+<body>
+<div class="top">
+  <h1><span class="pher">pher</span> console</h1>
+  <span id="statusline">connecting…</span>
+  <span class="spacer"></span>
+  <input type="password" id="token" placeholder="admin token (blank on loopback)" style="width:16rem">
+</div>
+
+<div class="grid">
+<div>
+  <div class="panel">
+    <h2>live events <span class="spacer"></span>
+      <input type="text" id="feedfilter" placeholder="subject filter, e.g. hive.**" style="width:11rem">
+      <button id="feedbtn">restart feed</button>
+    </h2>
+    <div class="feed" id="feed"></div>
+  </div>
+
+  <div class="panel">
+    <h2>emit</h2>
+    <div class="row">
+      <input type="text" id="esubject" placeholder="subject, e.g. demo.hello">
+      <button class="primary fixed" id="emitbtn">emit</button>
+    </div>
+    <textarea id="epayload" rows="3" spellcheck="false">{"n": 1}</textarea>
+    <div class="out" id="emitout"><span class="dim">nothing emitted yet</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>subscriptions <span class="spacer"></span><button id="subsbtn">refresh</button></h2>
+    <table id="subs"></table>
+  </div>
+</div>
+
+<div>
+  <div class="panel">
+    <h2>test a subscription — live, full cascade</h2>
+    <div class="presets" id="presets"></div>
+    <textarea id="tsub" rows="3" spellcheck="false">on demo.* where payload.n > 1</textarea>
+    <div class="row">
+      <span class="hint" id="tstate">not listening</span>
+      <button class="primary fixed" id="tstart">listen</button>
+      <button class="fixed" id="tstop" disabled>stop</button>
+    </div>
+    <div class="matches" id="matches"></div>
+    <div class="hint">Registers a real connection-scoped subscription: meaning scores
+      and judge verdicts run for real (and spend real budget). It evaporates when
+      you press stop or close the tab.</div>
+  </div>
+
+  <div class="panel">
+    <h2>why-not — replay one event through one subscription</h2>
+    <div class="row">
+      <input type="text" id="wsub" placeholder="sub id (PH.…)">
+      <input type="text" id="wevent" placeholder="event id (PH.…) — click a feed row">
+      <button class="fixed" id="whybtn">explain</button>
+    </div>
+    <div class="out" id="whyout"><span class="dim">pick a subscription and an event</span></div>
+  </div>
+</div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const token = $("token");
+token.value = localStorage.getItem("pherToken") ?? "";
+token.addEventListener("change", () => { localStorage.setItem("pherToken", token.value); refresh(); startFeed(); });
+
+function headers() {
+  const h = { "content-type": "application/json" };
+  if (token.value) h.authorization = `Bearer ${token.value}`;
+  return h;
+}
+async function rpc(body) {
+  const r = await fetch("/rpc", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+  const v = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
+  if (v.ok !== true) throw new Error(v.error ?? `HTTP ${r.status}`);
+  return v;
+}
+// Stream chunked NDJSON; returns an aborter. Blank lines are heartbeats.
+function stream(path, body, onLine, onEnd) {
+  const ctrl = new AbortController();
+  (async () => {
+    try {
+      const r = await fetch(path, { method: "POST", headers: headers(),
+        body: JSON.stringify(body), signal: ctrl.signal });
+      if (!r.ok && !r.body) throw new Error(`HTTP ${r.status}`);
+      let buf = "";
+      for await (const chunk of r.body) {
+        buf += new TextDecoder().decode(chunk);
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (line) onLine(JSON.parse(line));
+        }
+      }
+      onEnd?.();
+    } catch (e) { if (!ctrl.signal.aborted) onEnd?.(e); }
+  })();
+  return ctrl;
+}
+
+// ---- status -----------------------------------------------------------
+async function refresh() {
+  try {
+    const s = await rpc({ op: "status" });
+    $("statusline").innerHTML =
+      `node <b>${esc(s.node)}</b> · <b>${s.subscriptions}</b> subs · ` +
+      `<b>${s.listeners}</b> listeners · <b>${s.outbox}</b> outbox · ` +
+      `<b>${s.bridges}</b> bridges · <b>${s.grants}</b> grants · ` +
+      `meaning ${s.semantic?.enabled ? "on" : "off"} · judge ${s.judge?.configured ? esc(s.judge.model) : "off"}`;
+    loadSubs();
+  } catch (e) {
+    $("statusline").innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>` +
+      (token.value ? "" : " — set the admin token ↗");
+  }
+}
+
+// ---- feed ---------------------------------------------------------------
+let feedCtrl = null;
+function startFeed() {
+  feedCtrl?.abort();
+  $("feed").innerHTML = "";
+  const body = { last: 40 };
+  const f = $("feedfilter").value.trim();
+  if (f) body.subject = f;
+  feedCtrl = stream("/tail", body, (line) => {
+    if (!line.event) return;
+    const e = line.event;
+    const div = document.createElement("div");
+    div.className = "ev";
+    div.innerHTML = `<span class="seq">${line.seq}</span><span class="subj">${esc(e.subject)}</span>` +
+      `<span class="pay">${esc(JSON.stringify(e.payload))}</span>`;
+    div.onclick = () => {
+      $("wevent").value = e.id;
+      const open = div.nextElementSibling?.classList.contains("detail");
+      document.querySelectorAll(".feed .detail").forEach((d) => d.remove());
+      if (!open) {
+        const det = document.createElement("div");
+        det.className = "detail";
+        det.textContent = JSON.stringify(line, null, 2);
+        div.after(det);
+      }
+    };
+    const feed = $("feed");
+    feed.prepend(div);
+    while (feed.children.length > 200) feed.lastChild.remove();
+  }, (err) => {
+    if (err) $("feed").innerHTML = `<div class="dim">feed error: ${esc(err.message)} — check token</div>` + $("feed").innerHTML;
+  });
+}
+$("feedbtn").onclick = startFeed;
+
+// ---- emit ---------------------------------------------------------------
+$("emitbtn").onclick = async () => {
+  try {
+    const payload = $("epayload").value.trim() ? JSON.parse($("epayload").value) : null;
+    const v = await rpc({ op: "emit", event: { subject: $("esubject").value.trim(), payload } });
+    $("emitout").innerHTML = `<span class="badge b-ok">emitted</span>${esc(v.id)} seq ${v.seq}, ` +
+      `${v.deliveries} immediate delivery/ies`;
+    refresh();
+  } catch (e) { $("emitout").innerHTML = `<span class="badge b-bad">error</span>${esc(e.message)}`; }
+};
+
+// ---- live tester --------------------------------------------------------
+let testCtrl = null;
+$("tstart").onclick = () => {
+  testCtrl?.abort();
+  $("matches").innerHTML = "";
+  let text = $("tsub").value.replace(/\n/g, " ").trim();
+  if (!/\sthen\s/.test(` ${text} `)) text += " then stream";
+  testCtrl = stream("/listen", { string: text, client: "console" }, (line) => {
+    if (line.canonical) {
+      $("tstate").innerHTML = `<span class="badge b-live">LIVE</span>${esc(line.id)} — ${esc(line.canonical)}`;
+      $("tstop").disabled = false;
+      refresh();
+      return;
+    }
+    const m = document.createElement("div");
+    m.className = "m";
+    const tiers = line.match?.tiers?.join(" → ") ?? "?";
+    let extra = "";
+    if (line.match?.meaning) extra += `\nmeaning: ${JSON.stringify(line.match.meaning)}`;
+    if (line.match?.judge) extra += `\njudge: ${JSON.stringify(line.match.judge)}`;
+    m.innerHTML = `<span class="badge b-ok">MATCH</span><b>${esc(line.event.subject)}</b> ` +
+      `<span class="dim">[${esc(tiers)}] seq ${line.seq ?? "-"}</span>` +
+      `\n${esc(JSON.stringify(line.event.payload))}${esc(extra)}`;
+    $("matches").prepend(m);
+  }, (err) => {
+    $("tstate").innerHTML = err
+      ? `<span class="badge b-bad">error</span>${esc(err.message)}`
+      : `<span class="dim">stream ended (sub removed)</span>`;
+    $("tstop").disabled = true;
+  });
+};
+$("tstop").onclick = () => { testCtrl?.abort(); $("tstate").textContent = "stopped — subscription evaporated"; $("tstop").disabled = true; refresh(); };
+
+// ---- why-not ------------------------------------------------------------
+$("whybtn").onclick = async () => {
+  try {
+    const v = await rpc({ op: "whyNot", sub: $("wsub").value.trim(), event: $("wevent").value.trim() });
+    $("whyout").textContent = JSON.stringify(v.report, null, 2);
+  } catch (e) { $("whyout").innerHTML = `<span class="badge b-bad">error</span>${esc(e.message)}`; }
+};
+
+// ---- subs ---------------------------------------------------------------
+async function loadSubs() {
+  try {
+    const v = await rpc({ op: "ls" });
+    const rows = (v.subs ?? []).map((s) =>
+      `<tr><td class="id" onclick="document.getElementById('wsub').value='${esc(s.id)}'" style="cursor:pointer">${esc(s.id)}</td>` +
+      `<td>${esc(s.string)}${s.name ? ` <span class="dim">(${esc(s.name)})</span>` : ""}` +
+      `<div class="dim">${s.deliveries} deliveries</div></td>` +
+      `<td><button class="danger" onclick="rmSub('${esc(s.id)}')">rm</button></td></tr>`);
+    $("subs").innerHTML = rows.join("") || `<tr><td class="dim">no subscriptions</td></tr>`;
+  } catch { /* status line already shows the auth problem */ }
+}
+window.rmSub = async (id) => { try { await rpc({ op: "rm", id }); refresh(); } catch (e) { alert(e.message); } };
+$("subsbtn").onclick = loadSubs;
+
+// ---- recipes ------------------------------------------------------------
+const recipes = [
+  ["where clause", "on demo.* where payload.n > 1", "demo.hello", '{"n": 5}'],
+  ["ci failure", 'on ci.* where payload.conclusion == "failure" && payload.branch == "main"',
+    "ci.github.run.completed", '{"conclusion": "failure", "branch": "main", "run": 812}'],
+  ["meaning: OOM", 'on crash.* meaning "OOM or memory pressure" > 0.65',
+    "crash.sentry.backend", '{"title": "OOMKilled: worker exceeded 2Gi RSS"}'],
+  ["meaning: novel", "on app.log.error meaning novel > 0.4 over 1h",
+    "app.log.error", '{"msg": "disk quota exceeded on /var/lib/pg"}'],
+  ["judge: stuck?", 'on agent.step judge "Is this agent stuck repeating the same failing action?" budget 20/day',
+    "agent.step", '{"history": ["npm test -> FAIL", "npm test -> FAIL", "npm test -> FAIL", "npm test -> FAIL"]}'],
+  ["shaping: debounce", "on noisy.* every 30s", "noisy.tick", '{"n": 1}'],
+];
+for (const [name, sub, subject, payload] of recipes) {
+  const b = document.createElement("button");
+  b.textContent = name;
+  b.title = `sub: ${sub}\nemit: ${subject} ${payload}`;
+  b.onclick = () => {
+    $("tsub").value = sub;
+    $("esubject").value = subject;
+    $("epayload").value = payload;
+  };
+  $("presets").appendChild(b);
+}
+
+$("esubject").value = "demo.hello";
+refresh();
+startFeed();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

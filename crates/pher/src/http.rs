@@ -108,6 +108,82 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/healthz") => respond(request, 200, json!({"ok": true})),
+        ("GET", "/") | ("GET", "/ui") => {
+            // The live console: a single self-contained page served by the
+            // daemon itself. Anyone who can reach the port can load the HTML;
+            // every API call it makes is auth-checked as usual.
+            let response = tiny_http::Response::from_string(UI_HTML)
+                .with_status_code(200)
+                .with_header(
+                    tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .expect("static header"),
+                );
+            let _ = request.respond(response);
+        }
+        ("POST", "/tail") => {
+            // Raw event feed for consoles/debugging: backlog then live, as
+            // chunked NDJSON. Unlike /listen this registers no subscription
+            // and records no deliveries. Admin-only (it is the firehose).
+            if !authed {
+                return respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
+            }
+            let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+            let after = v.get("after").and_then(|a| a.as_u64());
+            let subject = v.get("subject").and_then(|s| s.as_str()).map(String::from);
+            let last = v.get("last").and_then(|l| l.as_u64()).map(|l| l as usize);
+            let (backlog, rx, _) =
+                match crate::daemon::attach_tail(&state, after, subject, last.or(Some(100))) {
+                    Ok(t) => t,
+                    Err(e) => return respond(request, 400, e),
+                };
+            let mut writer = request.into_writer();
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\ncache-control: no-store\r\n\r\n";
+            if writer.write_all(head.as_bytes()).is_err() || writer.flush().is_err() {
+                return;
+            }
+            let mut last_sent = after.unwrap_or(0);
+            for (seq, event) in backlog {
+                if write_chunk(
+                    &mut writer,
+                    &format!("{}\n", json!({"seq": seq, "event": event})),
+                )
+                .is_err()
+                {
+                    return;
+                }
+                last_sent = seq;
+            }
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                    Ok(line) => {
+                        let seq = serde_json::from_str::<Value>(&line)
+                            .ok()
+                            .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
+                            .unwrap_or(u64::MAX);
+                        if seq <= last_sent {
+                            continue; // already sent in the backlog
+                        }
+                        if write_chunk(&mut writer, &format!("{line}\n")).is_err() {
+                            return; // client gone; tails retain() drops us
+                        }
+                        last_sent = seq;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if write_chunk(&mut writer, "\n").is_err() {
+                            return;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = writer.write_all(b"0\r\n\r\n");
+                        let _ = writer.flush();
+                        return;
+                    }
+                }
+            }
+        }
         ("GET", "/.well-known/pheromone") => {
             // Bus discovery: enough to point a bridge or SDK at, no secrets.
             respond(
@@ -365,6 +441,9 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
         _ => respond(request, 404, json!({"ok": false, "error": "not found"})),
     }
 }
+
+/// The live console, embedded so the daemon is self-contained.
+const UI_HTML: &str = include_str!("ui.html");
 
 enum Principal {
     /// The bus operator (PHER_HTTP_TOKEN, or any caller on a tokenless

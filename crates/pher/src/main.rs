@@ -165,6 +165,8 @@ enum Cmd {
     },
     /// Daemon status
     Status,
+    /// Open the live console (served by the daemon's HTTP ingress)
+    Ui,
     /// First-run bootstrap: create the state dir and report environment gaps
     Init,
     /// Daemon control
@@ -725,6 +727,37 @@ fn run() -> anyhow::Result<()> {
         Cmd::Status => {
             let response = client::call_target(&target, &Request::Status)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        Cmd::Ui => {
+            let url = match &target {
+                client::Target::Remote { url, .. } => format!("{url}/ui"),
+                client::Target::Local(_) => match std::env::var("PHER_HTTP") {
+                    Ok(addr) if !addr.is_empty() => format!("http://{addr}/ui"),
+                    _ => {
+                        // No ingress configured: check whether one is running
+                        // anyway (daemon env differs from shell env).
+                        let probe = "http://127.0.0.1:4870";
+                        if ureq::get(&format!("{probe}/healthz"))
+                            .timeout(std::time::Duration::from_millis(500))
+                            .call()
+                            .is_ok()
+                        {
+                            format!("{probe}/ui")
+                        } else {
+                            bail!(
+                                "no HTTP ingress detected — run the daemon with PHER_HTTP set:\n  \
+                                 PHER_HTTP=127.0.0.1:4870 pher daemon run\n\
+                                 (or reinstall the service: PHER_HTTP=127.0.0.1:4870 pher daemon install)"
+                            );
+                        }
+                    }
+                },
+            };
+            println!("console: {url}");
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+            #[cfg(target_os = "linux")]
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
         }
         Cmd::Init => {
             if remote {

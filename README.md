@@ -156,18 +156,29 @@ What works today:
   captures `PHEROMONE_HOME` + `PHER_*` env at install time. `pher daemon
   status` / `uninstall` complete the set.
 
+- **The live console** (`pher ui`) — served by the daemon itself at
+  `http://<PHER_HTTP>/ui`, zero build step: live event feed (via the new
+  `POST /tail` NDJSON endpoint — the raw firehose, admin-only, records no
+  deliveries), an emit form, a live subscription tester that registers a
+  real connection-scoped sub (full cascade: meaning scores and judge
+  verdicts run for real), why-not explanations, subscription management,
+  and recipe presets per tier. Works against remote hubs too (token field).
+
 Build: `cargo build --release` → `target/release/pher`. Test: `cargo test`.
 Release artifacts: `dist build` (cargo-dist).
 
 Quickstart:
 
 ```bash
-pher init             # create state dir, see what's missing
-pher daemon install   # supervised daemon (or: pher daemon run, foreground)
+pher init                                    # create state dir, see what's missing
+PHER_HTTP=127.0.0.1:4870 pher daemon install # supervised daemon (or: pher daemon run)
+pher ui                                      # live console in the browser
 pher listen 'on hive.seal where payload.status == "blocked"'       # shell 1
 pher emit hive.seal --payload '{"status": "blocked"}'              # shell 2
 pher why-not <sub-id> <event-id>   # when something doesn't fire
 ```
+
+Copy-paste scenarios for every tier: [docs/RECIPES.md](docs/RECIPES.md).
 
 The design corpus lives in `docs/`:
 

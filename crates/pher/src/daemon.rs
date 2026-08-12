@@ -2332,38 +2332,61 @@ fn rpc_why_not(sub: &str, event: &str, state: &Arc<Mutex<State>>) -> Value {
     ok(json!({ "report": report }))
 }
 
+/// Attach a raw-event tail: register the live feed and snapshot the backlog
+/// atomically (seq dedup at the handoff makes the seam exact). Shared by the
+/// unix socket and HTTP /tail. `last` truncates the backlog to its tail —
+/// consoles want recent context, not a week of history.
+pub(crate) fn attach_tail(
+    state: &Arc<Mutex<State>>,
+    after: Option<u64>,
+    subject: Option<String>,
+    last: Option<usize>,
+) -> Result<
+    (
+        Vec<(u64, Envelope)>,
+        mpsc::Receiver<String>,
+        Option<SubjectPattern>,
+    ),
+    Value,
+> {
+    let pattern = match subject.map(|s| SubjectPattern::parse(&s)).transpose() {
+        Ok(p) => p,
+        Err(e) => return Err(err(e)),
+    };
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut s = state.lock().unwrap();
+    s.tails.push(TailClient {
+        tx,
+        subject: pattern.clone(),
+    });
+    let mut backlog = s.read_events(after);
+    if let Some(p) = &pattern {
+        backlog.retain(|(_, e)| p.matches(&e.subject));
+    }
+    if let Some(n) = last {
+        if backlog.len() > n {
+            backlog.drain(..backlog.len() - n);
+        }
+    }
+    Ok((backlog, rx, pattern))
+}
+
 fn handle_tail(
     after: Option<u64>,
     subject: Option<String>,
     stream: &UnixStream,
     state: &Arc<Mutex<State>>,
 ) -> anyhow::Result<()> {
-    let pattern = match subject.map(|s| SubjectPattern::parse(&s)).transpose() {
-        Ok(p) => p,
+    let (backlog, rx, _pattern) = match attach_tail(state, after, subject, None) {
+        Ok(t) => t,
         Err(e) => {
-            respond(stream, &err(e))?;
+            respond(stream, &e)?;
             return Ok(());
         }
-    };
-    let (tx, rx) = mpsc::channel::<String>();
-    // Register the live feed first, then send the backlog, then drain
-    // live messages skipping anything already sent (seq dedup).
-    let backlog = {
-        let mut s = state.lock().unwrap();
-        s.tails.push(TailClient {
-            tx,
-            subject: pattern.clone(),
-        });
-        s.read_events(after)
     };
     let mut writer = stream.try_clone()?;
     let mut last_sent = after.unwrap_or(0);
     for (seq, event) in backlog {
-        if let Some(p) = &pattern {
-            if !p.matches(&event.subject) {
-                continue;
-            }
-        }
         let line = json!({ "seq": seq, "event": event }).to_string();
         writeln!(writer, "{line}")?;
         last_sent = seq;
