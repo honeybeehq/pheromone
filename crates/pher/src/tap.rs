@@ -54,17 +54,28 @@ struct TapState {
 
 const TAP_SEEN_WINDOW: usize = 1000;
 
-pub fn run_hive_tap(target: &Target, paths: &Paths, since: &str) -> anyhow::Result<()> {
+pub fn run_hive_tap(
+    target: &Target,
+    paths: &Paths,
+    since: &str,
+    excludes: &[String],
+) -> anyhow::Result<()> {
     let mut tap = TapState {
         last_ts: None,
         seen: std::collections::VecDeque::new(),
         forwarded: 0,
     };
+    if !excludes.is_empty() {
+        eprintln!(
+            "pher tap hive: dropping ledger types: {}",
+            excludes.join(", ")
+        );
+    }
     let mut backlog_since = since.to_string();
     let mut delay = 2u64;
     loop {
         let before = tap.forwarded;
-        match follow_once(target, paths, &backlog_since, &mut tap) {
+        match follow_once(target, paths, &backlog_since, excludes, &mut tap) {
             Ok(()) => unreachable!("follow_once only returns by error"),
             Err(e) => eprintln!("pher tap hive: {e:#}; retrying in {delay}s"),
         }
@@ -99,6 +110,7 @@ fn follow_once(
     target: &Target,
     paths: &Paths,
     since: &str,
+    excludes: &[String],
     tap: &mut TapState,
 ) -> anyhow::Result<()> {
     let mut conn = match target {
@@ -134,6 +146,18 @@ fn follow_once(
         let Some(event) = map_ledger_line(&trimmed) else {
             continue;
         };
+        // Edge filtering: heartbeat-grade ledger types (e.g. state.verified
+        // liveness probes at hundreds/min) never reach the bus or its log.
+        let typ = event
+            .subject
+            .strip_prefix("hive.")
+            .unwrap_or(&event.subject);
+        if excludes.iter().any(|x| typ.starts_with(x.as_str())) {
+            if let Some(ts) = ledger_ts(&trimmed) {
+                tap.last_ts = Some(ts); // resume position still advances
+            }
+            continue;
+        }
         if tap.seen.contains(&trimmed) {
             continue; // resume overlap: already forwarded before the retry
         }

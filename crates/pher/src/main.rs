@@ -291,6 +291,10 @@ enum TapCmd {
         /// Backlog lookback for the first attach (e.g. 15m); default: live only
         #[arg(long, default_value = "1s")]
         since: String,
+        /// Ledger type prefixes to drop at the tap edge (repeatable),
+        /// e.g. --exclude state.verified for liveness-probe heartbeats
+        #[arg(long = "exclude")]
+        excludes: Vec<String>,
     },
 }
 
@@ -777,9 +781,9 @@ fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Tap {
-            cmd: TapCmd::Hive { since },
+            cmd: TapCmd::Hive { since, excludes },
         } => {
-            tap::run_hive_tap(&target, &paths, &since)?;
+            tap::run_hive_tap(&target, &paths, &since, &excludes)?;
         }
         Cmd::Node { cmd } => match cmd {
             NodeCmd::Add { name, url, token } => {
