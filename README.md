@@ -78,6 +78,15 @@ What works today:
   `hive events --follow --json` and puts every ledger event on the bus as
   `hive.<type>`, correlation mapped from session/bee fields. The ~160-type
   stream with zero programmatic subscribers has its subscriber.
+- **Code-based subscribers** — `then stream` + the `@pheromone/client` Node SDK
+  (`sdk/node`): `pher.on('on ci.* where …', handler)` registers a
+  connection-scoped subscription; the daemon evaluates the full cascade and
+  pushes deliveries down the socket. The subscription is removed the moment the
+  listener disconnects — the enforced form of `while <client> alive` (and
+  `pher when '… then stream'` is refused: a stored stream sub with no listener
+  would be a lie). Same surface for humans: `pher listen 'on demo.*'`. The SDK
+  also covers `emit`/`when`/`ls`/`rm`/`why`/`whyNot`/`status`/`tail` locally
+  and against remote nodes via `/rpc` (`PherClient.remote(url, {token})`).
 - **`@pheromone/core` Node addon** (napi-rs, `crates/pher-node`) — the same
   matcher in-process for TS consumers: `parse`/`fmt`/`canon`/`validate`/
   `evaluate`/`whyNot` plus a standing `Matcher` class. Build with

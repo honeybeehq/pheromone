@@ -24,6 +24,16 @@ pub enum Request {
         #[serde(default)]
         subject: Option<String>,
     },
+    /// Register a connection-scoped subscription (`then stream`) and stream
+    /// its deliveries down this connection until either side goes away.
+    Listen {
+        string: String,
+        #[serde(default)]
+        options: Vec<String>,
+        /// Listener name recorded as the lease lessee (`while <client> alive`).
+        #[serde(default)]
+        client: Option<String>,
+    },
     Why {
         #[serde(rename = "deliveryId")]
         delivery_id: String,

@@ -87,6 +87,10 @@ pub(crate) struct State {
     timers: Vec<Timer>,
     pending: HashMap<String, PendingWindow>,
     tails: Vec<TailClient>,
+    /// Live `then stream` listeners by subscription id. Dropping the sender
+    /// ends the listener's delivery loop; a vanished listener removes the
+    /// subscription — the enforced form of `while <client> alive`.
+    listeners: HashMap<String, mpsc::Sender<String>>,
     retention_secs: u64,
     semantic: crate::semantic::Semantic,
     judge_cfg: Option<crate::judge::JudgeConfig>,
@@ -144,6 +148,9 @@ impl State {
                 }
                 let sub = Subscription::from_json(&meta.json)
                     .with_context(|| format!("subscription {} corrupt", meta.id))?;
+                if sub.then.sink == Sink::Stream {
+                    continue; // its listener connection died with the old process
+                }
                 matcher.insert(meta.id.clone(), sub);
                 metas.insert(meta.id.clone(), meta);
             }
@@ -212,6 +219,7 @@ impl State {
             timers,
             pending,
             tails: Vec::new(),
+            listeners: HashMap::new(),
             retention_secs,
             semantic,
             judge_cfg: None,
@@ -279,7 +287,47 @@ impl State {
             pher_core::subscription::apply_option_words(&mut sub, option_words)
                 .map_err(|e| e.to_string())?;
         }
+        // Honesty gate: `then stream` has nowhere to deliver without a live
+        // listener connection — only `pher listen` / the SDK may register it.
+        if sub.then.sink == Sink::Stream {
+            return Err(
+                "'then stream' requires a live listener connection — use `pher listen` \
+                 or an SDK client, not `pher when`"
+                    .to_string(),
+            );
+        }
+        self.register_parsed(sub)
+    }
 
+    /// Registration path for `Listen` connections: the sink must be `stream`,
+    /// and a durable lifetime is tightened to `while <client> alive` — which
+    /// this path actually enforces via connection liveness.
+    fn register_listener(
+        &mut self,
+        string: &str,
+        option_words: &[String],
+        client: &str,
+    ) -> Result<Value, String> {
+        let mut sub = Subscription::parse(string).map_err(|e| e.to_string())?;
+        if !option_words.is_empty() {
+            pher_core::subscription::apply_option_words(&mut sub, option_words)
+                .map_err(|e| e.to_string())?;
+        }
+        if sub.then.sink != Sink::Stream {
+            return Err(format!(
+                "listen requires 'then stream', got 'then {}' — register push sinks with `pher when`",
+                sub.then.sink.name()
+            ));
+        }
+        if matches!(sub.lifetime, pher_core::Lifetime::Durable) {
+            sub.lifetime = pher_core::Lifetime::Lease {
+                lessee: client.to_string(),
+            };
+        }
+        self.register_parsed(sub)
+    }
+
+    fn register_parsed(&mut self, sub: Subscription) -> Result<Value, String> {
         // Honesty gate: a judge subscription needs a working provider config
         // NOW, not at first event — refuse registration with the exact fix.
         if sub.judge.is_some() {
@@ -349,7 +397,11 @@ impl State {
                     .to_string(),
             );
         }
-        if matches!(sub.lifetime, pher_core::Lifetime::Lease { .. }) {
+        // Stream subs are exempt: their lease IS enforced, by connection
+        // liveness — disconnect removes the subscription.
+        if matches!(sub.lifetime, pher_core::Lifetime::Lease { .. })
+            && sub.then.sink != Sink::Stream
+        {
             warnings.push(
                 "lease liveness (while ... alive) is not heartbeat-checked yet; \
                  treat as durable until slice 3"
@@ -1051,6 +1103,17 @@ impl State {
                 // `then hive spawn|send|flow ...` — hand off to the hive CLI.
                 spawn_cli_sink("hive", &sub.then.args, &delivery_json, delivery_id)
             }
+            Sink::Stream => {
+                // Delivery goes down the socket of whoever registered this
+                // subscription. No listener means the sub is mid-teardown.
+                delivery_json["deliveryId"] = json!(delivery_id);
+                match self.listeners.get(&block.subscription) {
+                    Some(tx) if tx.send(delivery_json.to_string()).is_ok() => {
+                        json!({ "sink": "stream", "delivered": true })
+                    }
+                    _ => json!({ "sink": "stream", "error": "listener gone" }),
+                }
+            }
         }
     }
 
@@ -1074,6 +1137,9 @@ impl State {
             self.metas.remove(id);
             self.timers.retain(|t| t.sub_id != id);
             self.pending.remove(id);
+            // Dropping the sender ends the listener's delivery loop, which
+            // closes its connection.
+            self.listeners.remove(id);
             self.semantic.on_remove(id);
             self.judge_budgets.remove(id);
             let _ = self.persist_subs();
@@ -1480,6 +1546,15 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<State>>) -> anyhow::Re
             handle_tail(after, subject, &stream, &state)?;
             return Ok(()); // tail owns the connection until the client leaves
         }
+        if let Request::Listen {
+            string,
+            options,
+            client,
+        } = request
+        {
+            handle_listen(&string, &options, client, &stream, &state)?;
+            return Ok(()); // listen owns the connection; disconnect = teardown
+        }
         let response = handle_rpc(request, &state);
         respond(&stream, &response)?;
     }
@@ -1512,6 +1587,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
                 "nextSeq": s.next_seq,
                 "armedTimers": s.timers.len(),
                 "tails": s.tails.len(),
+                "listeners": s.listeners.len(),
                 "retention": format!("{}s", s.retention_secs),
                 "semantic": s.semantic.status(),
                 "conditions": s.conditions.defs.len(),
@@ -1566,6 +1642,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
         }
         Request::WhyNot { sub, event } => rpc_why_not(&sub, &event, state),
         Request::Tail { .. } => err("tail is a streaming op; use the unix socket"),
+        Request::Listen { .. } => err("listen is a streaming op; use the unix socket"),
     }
 }
 
@@ -1711,6 +1788,86 @@ fn handle_tail(
         }
         last_sent = seq;
     }
+    Ok(())
+}
+
+/// A `Listen` connection: register the subscription with this connection as
+/// its sink, ack with the id, then stream deliveries until the client hangs
+/// up or the subscription is removed. Disconnect tears the subscription down
+/// — this is the enforced form of the lease lifetime.
+fn handle_listen(
+    string: &str,
+    options: &[String],
+    client: Option<String>,
+    stream: &UnixStream,
+    state: &Arc<Mutex<State>>,
+) -> anyhow::Result<()> {
+    let client = client.unwrap_or_else(|| "listener".to_string());
+    let (tx, rx) = mpsc::channel::<String>();
+    let (sub_id, ack) = {
+        let mut s = state.lock().unwrap();
+        match s.register_listener(string, options, &client) {
+            Ok(ack) => {
+                let id = ack
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                s.listeners.insert(id.clone(), tx);
+                (id, ack)
+            }
+            Err(e) => {
+                respond(stream, &err(e))?;
+                return Ok(());
+            }
+        }
+    };
+    respond(stream, &ack)?;
+
+    let teardown = |reason: &str| {
+        let mut s = state.lock().unwrap();
+        // Only the party that still finds the listener does the teardown, so
+        // the watchdog and the writer loop can't double-remove.
+        if s.listeners.remove(&sub_id).is_some() {
+            s.remove_sub(&sub_id, reason);
+        }
+    };
+
+    // EOF watchdog: deliveries may be rare, so a broken pipe alone would
+    // detect disconnects too late. A blocked read notices immediately.
+    {
+        let state = Arc::clone(state);
+        let sub_id = sub_id.clone();
+        let reader = stream.try_clone()?;
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {} // the connection is delivery-only; ignore input
+                }
+            }
+            let mut s = state.lock().unwrap();
+            if s.listeners.remove(&sub_id).is_some() {
+                s.remove_sub(&sub_id, "listener disconnected");
+            }
+        });
+    }
+
+    let mut writer = stream.try_clone()?;
+    for line in rx {
+        if writeln!(writer, "{line}").is_err() || writer.flush().is_err() {
+            teardown("listener disconnected");
+            break;
+        }
+    }
+    // Channel closed: the subscription was removed daemon-side (limit hit,
+    // rm, ttl), the client hung up, or teardown already ran. The watchdog's
+    // fd clone keeps the socket alive, so shut it down explicitly — that
+    // sends EOF to the client and unblocks the watchdog's read.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     Ok(())
 }
 

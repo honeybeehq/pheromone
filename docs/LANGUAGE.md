@@ -54,7 +54,7 @@ meaning       := "meaning" (descriptor | "any" "of" "[" descriptor ("," descript
 descriptor    := string [cmp number]           ; default threshold 0.75
 judge         := "judge" string "budget" int "/" period ["sample" float]
 expect        := "expect" subject ["where" expr] "within" duration "else"
-action        := sink rest-of-line             ; sink ∈ {buz, hive, http, cmd, hermes, pol, emit}
+action        := sink rest-of-line             ; sink ∈ {buz, hive, http, cmd, hermes, pol, emit, stream}
 option        := "for" duration | "while" ident "alive" | "every" duration
                  | "batch" duration | "since" duration | "limit" int
 ```
@@ -191,7 +191,15 @@ then cmd <shell>                                            # local command
 then hermes <invoke>                                        # human notification channels
 then pol fire <trigger>                                     # hand to Pollinate
 then emit <subject>                                         # re-emit onto the bus (composition)
+then stream                                                 # deliver to the connected listener (SDK / pher listen)
 ```
+
+`then stream` is the code-based subscriber path: it can only be registered over a live
+listener connection (`pher listen`, or an SDK client's `.on()`), deliveries are pushed
+down that connection, and the subscription is removed the moment the listener
+disconnects. It is the one place the lease lifetime (`while <client> alive`) is
+actually enforced — by connection liveness. `pher when '… then stream'` is refused:
+a stored stream subscription with no listener would be a lie.
 
 `then emit` is how subscriptions compose into pipelines; the delivery's `match` block is
 attached to the re-emitted event's metadata, and `correlation` is preserved — trails stay

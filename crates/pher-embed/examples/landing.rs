@@ -4,9 +4,7 @@ use pher_core::Envelope;
 use serde_json::json;
 
 fn main() -> anyhow::Result<()> {
-    let e = pher_embed::Embedder::new(
-        dirs_path().unwrap_or_else(|| "/tmp/pher-models".into()),
-    )?;
+    let e = pher_embed::Embedder::new(dirs_path().unwrap_or_else(|| "/tmp/pher-models".into()))?;
     let descriptor = "agent stuck on auth or credentials";
     let d = e.embed_one(descriptor)?;
 

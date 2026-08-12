@@ -104,6 +104,12 @@ enum Cmd {
         #[arg(long)]
         subject: Option<String>,
     },
+    /// Register a connection-scoped subscription and stream its deliveries
+    /// (the subscription is removed when you disconnect)
+    Listen {
+        /// Subscription text; `then stream` is appended if there is no then-clause
+        subscription: String,
+    },
     /// Show the full match record for a delivery
     Why {
         #[arg(name = "delivery-id")]
@@ -393,6 +399,34 @@ fn run() -> anyhow::Result<()> {
             }
             client::tail(&paths, &Request::Tail { after, subject }, |line| {
                 println!("{line}");
+                Ok(())
+            })?;
+        }
+        Cmd::Listen { subscription } => {
+            if remote {
+                bail!("listen is a streaming op — not supported over --node yet");
+            }
+            // Sugar: a bare `on ... where ...` gets `then stream` appended.
+            let text = if Subscription::parse(&subscription).is_ok() {
+                subscription
+            } else {
+                format!("{subscription} then stream")
+            };
+            Subscription::parse(&text)?; // surface parse errors before connecting
+            let request = Request::Listen {
+                string: text,
+                options: Vec::new(),
+                client: Some(format!("pher-listen-{}", std::process::id())),
+            };
+            client::tail(&paths, &request, |line| {
+                if let Some(canonical) = line.get("canonical").and_then(|c| c.as_str()) {
+                    eprintln!(
+                        "listening as {} — {canonical}",
+                        line["id"].as_str().unwrap_or("?")
+                    );
+                } else {
+                    println!("{line}");
+                }
                 Ok(())
             })?;
         }

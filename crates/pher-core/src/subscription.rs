@@ -66,6 +66,10 @@ pub enum Sink {
     Hermes,
     Pol,
     Emit,
+    /// Deliver to the live client connection that registered the
+    /// subscription (SDK/`pher listen`). Connection-scoped by construction:
+    /// the subscription dies when the listener disconnects.
+    Stream,
 }
 
 impl Sink {
@@ -78,6 +82,7 @@ impl Sink {
             "hermes" => Sink::Hermes,
             "pol" => Sink::Pol,
             "emit" => Sink::Emit,
+            "stream" => Sink::Stream,
             _ => return None,
         })
     }
@@ -91,6 +96,7 @@ impl Sink {
             Sink::Hermes => "hermes",
             Sink::Pol => "pol",
             Sink::Emit => "emit",
+            Sink::Stream => "stream",
         }
     }
 }

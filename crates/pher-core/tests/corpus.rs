@@ -18,6 +18,7 @@ const WORKED_EXAMPLES: &[&str] = &[
     r#"when on deploy.finished where payload.env == "prod" then emit deploy.prod.finished limit 1 for 30m"#,
     r#"on hive.seal, pol.job.failed from trmd-mbp then cmd echo multi-subject"#,
     r#"on ** where size(payload) > 0 then cmd echo catch-all batch 1h"#,
+    r#"on ci.* where payload.conclusion == "failure" then stream while sdk-42 alive"#,
 ];
 
 #[test]
