@@ -198,11 +198,17 @@ pub fn install(paths: &Paths) -> anyhow::Result<()> {
         // Re-installs: tear the old instance down first; ignore "not loaded".
         let _ =
             run_quiet(Command::new("launchctl").args(["bootout", &format!("{domain}/{LABEL}")]));
-        let loaded = run_quiet(Command::new("launchctl").args([
-            "bootstrap",
-            &domain,
-            plan.unit_path.to_str().context("non-utf8 plist path")?,
-        ]))?;
+        // bootout is asynchronous: an immediate bootstrap can race the old
+        // instance's teardown and fail. Retry briefly.
+        let plist = plan.unit_path.to_str().context("non-utf8 plist path")?;
+        let mut loaded = false;
+        for _ in 0..10 {
+            if run_quiet(Command::new("launchctl").args(["bootstrap", &domain, plist]))? {
+                loaded = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         if !loaded {
             bail!(
                 "launchctl bootstrap failed — inspect with: launchctl print {domain}/{LABEL}; \
