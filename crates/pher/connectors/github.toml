@@ -1,0 +1,24 @@
+# GitHub: repository activity as events.
+#   pher connect add github --token env:GITHUB_TOKEN --param owner=<org> --param repo=<repo>
+# Token: a fine-grained PAT with repo read access (classic PAT works too).
+name = "github"
+description = "GitHub repo events (pushes, PRs, issues, releases) as github.<type> events"
+docs = "https://docs.github.com/en/rest/activity/events"
+
+[auth]
+header = "Authorization"
+format = "Bearer {token}"
+
+[params]
+owner = "Repository owner (user or org)"
+repo = "Repository name"
+
+[[poll]]
+name = "events"
+url = "https://api.github.com/repos/{owner}/{repo}/events?per_page=50"
+interval = "60s"
+records = "$"
+subject = "github.{type}"
+id = "id"
+ts = "created_at"
+watermark = "created_at"

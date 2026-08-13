@@ -47,6 +47,30 @@ pub struct Config {
     pub bridges: Vec<BridgeEntry>,
     #[serde(default, rename = "grant")]
     pub grants: Vec<GrantEntry>,
+    #[serde(default, rename = "connector")]
+    pub connectors: Vec<ConnectorEntry>,
+}
+
+/// A vendor extractor instance (see `pher connect catalog`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorEntry {
+    /// Instance name (default: the manifest name).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Manifest name in the catalog.
+    #[serde(rename = "use")]
+    pub manifest: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default, rename = "token-env")]
+    pub token_env: Option<String>,
+    /// Any command whose stdout is the token — this is how secret managers
+    /// (hem, 1Password, pass) plug in without being a dependency.
+    #[serde(default, rename = "token-cmd")]
+    pub token_cmd: Option<String>,
+    #[serde(default)]
+    pub params: HashMap<String, String>,
 }
 
 /// Pull composition: a durable filtered listen against an upstream bus,
@@ -515,6 +539,85 @@ pub fn run(
                     act(format!("grant {name}: pruned"));
                     if !dry_run {
                         client::call_target(target, &Request::GrantRm { name: name.clone() })?;
+                    }
+                }
+            }
+        }
+    }
+
+    // -- connectors: reconcile by name -----------------------------------------
+    if !config.connectors.is_empty() || prune {
+        let cls = client::call_target(target, &Request::ConnectorLs)?;
+        let existing: HashMap<String, Value> = cls["connectors"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|c| Some((c.get("name")?.as_str()?.to_string(), c)))
+            .collect();
+        for entry in &config.connectors {
+            let name = entry.name.clone().unwrap_or_else(|| entry.manifest.clone());
+            let token = match (&entry.token, &entry.token_env, &entry.token_cmd) {
+                (Some(t), _, _) => t.clone(),
+                (None, Some(var), _) => std::env::var(var)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .with_context(|| format!("connector '{name}': token-env {var} is unset"))?,
+                (None, None, Some(cmd)) => {
+                    crate::connector::resolve_token(&format!("cmd:{cmd}"))
+                        .with_context(|| format!("connector '{name}': token-cmd failed"))?
+                }
+                (None, None, None) => String::new(),
+            };
+            let same = existing.get(&name).is_some_and(|c| {
+                c["use"].as_str() == Some(entry.manifest.as_str())
+                    && c["tokenFingerprint"].as_str()
+                        == Some(crate::connector::token_fingerprint(&token).as_str())
+                    && c["params"]
+                        .as_object()
+                        .map(|m| {
+                            m.len() == entry.params.len()
+                                && entry.params.iter().all(|(k, v)| {
+                                    m.get(k).and_then(|x| x.as_str()) == Some(v.as_str())
+                                })
+                        })
+                        .unwrap_or(entry.params.is_empty())
+            });
+            if same {
+                println!("  connector {name}: unchanged");
+                continue;
+            }
+            let existed = existing.contains_key(&name);
+            act(format!(
+                "connector {name}: {} (use {})",
+                if existed { "updated" } else { "created" },
+                entry.manifest
+            ));
+            if !dry_run {
+                client::call_target(
+                    target,
+                    &Request::ConnectorAdd {
+                        def: json!({
+                            "name": name,
+                            "use": entry.manifest,
+                            "token": token,
+                            "params": entry.params,
+                        }),
+                    },
+                )?;
+            }
+        }
+        if prune {
+            let desired: std::collections::HashSet<String> = config
+                .connectors
+                .iter()
+                .map(|c| c.name.clone().unwrap_or_else(|| c.manifest.clone()))
+                .collect();
+            for name in existing.keys() {
+                if !desired.contains(name) {
+                    act(format!("connector {name}: pruned"));
+                    if !dry_run {
+                        client::call_target(target, &Request::ConnectorRm { name: name.clone() })?;
                     }
                 }
             }

@@ -120,6 +120,12 @@ pub(crate) struct State {
     bridges: HashMap<String, crate::bridge::BridgeDef>,
     /// Cancel flags for running bridge workers.
     bridge_cancels: HashMap<String, Arc<std::sync::atomic::AtomicBool>>,
+    /// Connector instances (vendor extractors; tokens live in the 0600 file).
+    connectors: HashMap<String, crate::connector::ConnectorDef>,
+    connector_cancels: HashMap<String, Arc<std::sync::atomic::AtomicBool>>,
+    /// Per-poll cursor state, keyed "<instance>:<poll>"; persisted so a
+    /// restart never re-emits what a vendor already delivered.
+    connector_states: HashMap<String, crate::connector::PollState>,
     /// Log seq of the event currently being delivered — stamped into
     /// delivery records and stream lines so consumers can track a cursor.
     /// Every deliver() path sets it first (ingest, replay, timers, windows,
@@ -379,6 +385,18 @@ impl State {
             }
         }
 
+        let connectors: HashMap<String, crate::connector::ConnectorDef> =
+            std::fs::read_to_string(paths.connectors())
+                .ok()
+                .and_then(|t| serde_json::from_str::<Vec<crate::connector::ConnectorDef>>(&t).ok())
+                .map(|v| v.into_iter().map(|c| (c.name.clone(), c)).collect())
+                .unwrap_or_default();
+        let connector_states: HashMap<String, crate::connector::PollState> =
+            std::fs::read_to_string(paths.connector_state())
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+
         let bridges: HashMap<String, crate::bridge::BridgeDef> =
             std::fs::read_to_string(paths.bridges())
                 .ok()
@@ -402,6 +420,9 @@ impl State {
             grants,
             bridges,
             bridge_cancels: HashMap::new(),
+            connectors,
+            connector_cancels: HashMap::new(),
+            connector_states,
             current_seq: None,
             retention_secs,
             semantic,
@@ -994,6 +1015,36 @@ impl State {
             );
         }
         Ok(())
+    }
+
+    fn persist_connectors(&self) -> anyhow::Result<()> {
+        let defs: Vec<&crate::connector::ConnectorDef> = self.connectors.values().collect();
+        write_json_atomic(&self.paths.connectors(), &serde_json::to_value(defs)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                self.paths.connectors(),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn paths_clone(&self) -> Paths {
+        self.paths.clone()
+    }
+
+    pub(crate) fn connector_state(&self, key: &str) -> crate::connector::PollState {
+        self.connector_states.get(key).cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn set_connector_state(&mut self, key: &str, state: crate::connector::PollState) {
+        self.connector_states.insert(key.to_string(), state);
+        let _ = write_json_atomic(
+            &self.paths.connector_state(),
+            &serde_json::to_value(&self.connector_states).unwrap_or_default(),
+        );
     }
 
     /// Resolve a bearer token to a grant name (http auth).
@@ -1877,6 +1928,21 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         }
     }
 
+    // Connector workers for persisted instances.
+    {
+        let defs: Vec<crate::connector::ConnectorDef> =
+            state.lock().unwrap().connectors.values().cloned().collect();
+        for def in defs {
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            state
+                .lock()
+                .unwrap()
+                .connector_cancels
+                .insert(def.name.clone(), Arc::clone(&cancel));
+            crate::connector::spawn(Arc::clone(&state), def, cancel);
+        }
+    }
+
     // HTTP ingress (webhooks, remote emit, metric intake) if configured.
     if let Some(http_cfg) = http_cfg {
         crate::http::start(Arc::clone(&state), http_cfg)?;
@@ -1990,6 +2056,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
                 "outbox": s.outbox.len(),
                 "bridges": s.bridges.len(),
                 "grants": s.grants.len(),
+                "connectors": s.connectors.len(),
                 "retention": format!("{}s", s.retention_secs),
                 "semantic": s.semantic.status(),
                 "conditions": s.conditions.defs.len(),
@@ -2123,6 +2190,76 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
             }
             let removed = s.bridges.remove(&name).is_some();
             let _ = s.persist_bridges();
+            ok(json!({ "removed": removed }))
+        }
+        Request::ConnectorAdd { def } => {
+            let def: crate::connector::ConnectorDef = match serde_json::from_value(def) {
+                Ok(d) => d,
+                Err(e) => return err(format!("invalid connector: {e}")),
+            };
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let mut s = state.lock().unwrap();
+                let Some(manifest) = crate::connector::find_manifest(&s.paths, &def.manifest)
+                else {
+                    return err(format!(
+                        "no connector '{}' in the catalog — see `pher connect catalog`",
+                        def.manifest
+                    ));
+                };
+                for (param, description) in &manifest.params {
+                    if !def.params.contains_key(param) {
+                        return err(format!(
+                            "connector '{}' requires --param {param}=… ({description})",
+                            def.manifest
+                        ));
+                    }
+                }
+                if manifest.auth.is_some() && def.token.is_empty() {
+                    return err(format!(
+                        "connector '{}' requires a token (--token env:VAR | cmd:… | literal)",
+                        def.manifest
+                    ));
+                }
+                if let Some(old) = s.connector_cancels.remove(&def.name) {
+                    old.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                s.connectors.insert(def.name.clone(), def.clone());
+                if let Err(e) = s.persist_connectors() {
+                    return err(format!("cannot persist connector: {e}"));
+                }
+                s.connector_cancels
+                    .insert(def.name.clone(), Arc::clone(&cancel));
+            }
+            crate::connector::spawn(Arc::clone(state), def.clone(), cancel);
+            ok(json!({ "name": def.name, "use": def.manifest }))
+        }
+        Request::ConnectorLs => {
+            let s = state.lock().unwrap();
+            let mut connectors: Vec<Value> = s
+                .connectors
+                .values()
+                .map(|c| {
+                    json!({
+                        "name": c.name,
+                        "use": c.manifest,
+                        "params": c.params,
+                        "tokenFingerprint": crate::connector::token_fingerprint(&c.token),
+                    })
+                })
+                .collect();
+            connectors.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            ok(json!({ "connectors": connectors }))
+        }
+        Request::ConnectorRm { name } => {
+            let mut s = state.lock().unwrap();
+            if let Some(cancel) = s.connector_cancels.remove(&name) {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let removed = s.connectors.remove(&name).is_some();
+            let prefix = format!("{name}:");
+            s.connector_states.retain(|k, _| !k.starts_with(&prefix));
+            let _ = s.persist_connectors();
             ok(json!({ "removed": removed }))
         }
         Request::GrantSet { def } => {

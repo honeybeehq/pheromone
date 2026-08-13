@@ -90,6 +90,19 @@ impl Paths {
     pub fn grants(&self) -> PathBuf {
         self.home.join("grants.json")
     }
+
+    pub fn connectors(&self) -> PathBuf {
+        self.home.join("connectors.json")
+    }
+
+    pub fn connector_state(&self) -> PathBuf {
+        self.home.join("connector_state.json")
+    }
+
+    /// User-local connector manifests (override/extend the built-ins).
+    pub fn connectors_dir(&self) -> PathBuf {
+        self.home.join("connectors")
+    }
 }
 
 /// Atomic-ish JSON write: temp file + rename, so kill -9 never leaves a torn file.

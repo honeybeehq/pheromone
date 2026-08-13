@@ -156,6 +156,18 @@ What works today:
   captures `PHEROMONE_HOME` + `PHER_*` env at install time. `pher daemon
   status` / `uninstall` complete the set.
 
+- **Connectors** (`pher connect`) — SaaS vendors as event sources, where a
+  connector is DATA, not code: a TOML manifest (auth header shape, poll
+  endpoints, watermark cursor, subject mapping) executed by one generic
+  engine. `pher connect add sentry --token env:SENTRY_TOKEN --param
+  org=acme` and `sentry.issue.*` events flow; built-in catalog (sentry,
+  github, stripe) plus drop-in manifests in `~/.pheromone/connectors/`.
+  First poll baselines (live-from-now); watermark + id-window dedup persist
+  across restarts and vendor outages (verified: outage catch-up emits
+  exactly once). The `[exec]` escape hatch supervises any process emitting
+  envelope JSONL — a plugin protocol, not a plugin API. Tokens resolve
+  CLI-side from literal / `env:VAR` / `cmd:…` (secret managers plug in via
+  cmd:, never as a dependency) and are stored 0600, listed as fingerprints.
 - **The live console** (`pher ui`) — served by the daemon itself at
   `http://<PHER_HTTP>/ui`, zero build step: live event feed (via the new
   `POST /tail` NDJSON endpoint — the raw firehose, admin-only, records no

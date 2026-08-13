@@ -63,3 +63,18 @@ name = "teammate-anna"
 token-env = "PHER_TOKEN_ANNA"
 allow = 'on team.**, ci.**'
 emit = 'on team.anna.**'
+
+# -- connectors: SaaS vendors as event sources --------------------------------
+# One generic engine executes catalog manifests (pher connect catalog);
+# tokens resolve at apply time — token-env reads the environment, token-cmd
+# runs any command whose stdout is the token (hem, 1Password, pass, …).
+
+[[connector]]
+use = "sentry"
+token-env = "SENTRY_TOKEN"
+params = { org = "your-org" }
+
+[[connector]]
+use = "github"
+token-cmd = "hem get project/yourproject/github-token --field token"
+params = { owner = "your-org", repo = "your-repo" }

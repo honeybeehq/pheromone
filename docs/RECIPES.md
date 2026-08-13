@@ -166,3 +166,16 @@ await pher.on('on demo.* where payload.n > 1', (d) =>
   console.log(d.event.subject, d.match.tiers));
 await pher.emit("demo.hello", { n: 5 });
 ```
+
+## 13. Connect a SaaS vendor
+
+```bash
+pher connect catalog                 # what's available
+pher connect add github --token env:GITHUB_TOKEN --param owner=acme --param repo=api
+pher listen 'on github.pushevent'    # pushes, PRs, releases… as bus events
+# your own vendor: drop a manifest in ~/.pheromone/connectors/ — ~20 lines
+# of TOML (auth header, poll URL, interval, subject template, id, watermark)
+```
+
+First poll establishes the watermark and emits nothing (live-from-now).
+Cursors persist: daemon restarts and vendor outages never re-emit.

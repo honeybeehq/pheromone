@@ -66,6 +66,17 @@ pub enum Request {
     BridgeRm {
         name: String,
     },
+    /// Upsert a connector instance: a vendor extractor described by a
+    /// manifest from the catalog, with its resolved token and params.
+    /// Tokens are resolved by the CALLER (literal / env: / cmd:) — the
+    /// daemon never shells out for secrets.
+    ConnectorAdd {
+        def: Value,
+    },
+    ConnectorLs,
+    ConnectorRm {
+        name: String,
+    },
     /// Upsert a grant: a named bearer token whose read/write surface is a
     /// pair of subscription-language filters (tiers 1-2 only).
     GrantSet {

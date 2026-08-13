@@ -2,6 +2,7 @@ mod apply;
 mod bridge;
 mod client;
 mod conditions;
+mod connector;
 mod daemon;
 mod db;
 mod http;
@@ -142,6 +143,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CursorCmd,
     },
+    /// Connect a SaaS vendor: extract its events onto the bus
+    Connect {
+        #[command(subcommand)]
+        cmd: ConnectCmd,
+    },
     /// Manage bridges (pull filtered streams from upstream buses)
     Bridge {
         #[command(subcommand)]
@@ -190,6 +196,31 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NodeCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum ConnectCmd {
+    /// Add/replace a connector, e.g.: pher connect add sentry --token env:SENTRY_TOKEN --param org=acme
+    Add {
+        /// Manifest name from the catalog (see: pher connect catalog)
+        manifest: String,
+        /// Instance name (default: the manifest name)
+        #[arg(long)]
+        name: Option<String>,
+        /// Token source: literal, env:VAR, or cmd:<command> (secret managers
+        /// like hem/1Password plug in via cmd:, e.g. cmd:hem get x --field y)
+        #[arg(long)]
+        token: Option<String>,
+        /// Manifest params, repeatable: --param org=acme
+        #[arg(long = "param")]
+        params: Vec<String>,
+    },
+    /// List configured connectors (tokens shown as fingerprints)
+    Ls,
+    /// Remove a connector
+    Rm { name: String },
+    /// List available connector manifests (built-in + ~/.pheromone/connectors)
+    Catalog,
 }
 
 #[derive(Subcommand)]
@@ -592,6 +623,89 @@ fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Connect { cmd } => match cmd {
+            ConnectCmd::Add {
+                manifest,
+                name,
+                token,
+                params,
+            } => {
+                // Token resolution is strictly CLI-side: the daemon stores the
+                // resolved value (0600) and never shells out for secrets.
+                let token = match token {
+                    Some(spec) => connector::resolve_token(&spec)?,
+                    None => String::new(),
+                };
+                let mut param_map = serde_json::Map::new();
+                for p in params {
+                    let (k, v) = p.split_once('=').context("--param expects key=value")?;
+                    param_map.insert(k.to_string(), Value::String(v.to_string()));
+                }
+                let instance = name.unwrap_or_else(|| manifest.clone());
+                let response = client::call_target(
+                    &target,
+                    &Request::ConnectorAdd {
+                        def: serde_json::json!({
+                            "name": instance,
+                            "use": manifest,
+                            "token": token,
+                            "params": param_map,
+                        }),
+                    },
+                )?;
+                println!(
+                    "connector {} → extracting via '{}' (events land under its vendor subjects)",
+                    response["name"].as_str().unwrap_or("?"),
+                    response["use"].as_str().unwrap_or("?")
+                );
+            }
+            ConnectCmd::Ls => {
+                let response = client::call_target(&target, &Request::ConnectorLs)?;
+                let connectors = response["connectors"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if connectors.is_empty() {
+                    println!("no connectors (see: pher connect catalog)");
+                }
+                for c in connectors {
+                    println!(
+                        "{}  use={}  [{}]  {}",
+                        c["name"].as_str().unwrap_or("?"),
+                        c["use"].as_str().unwrap_or("?"),
+                        c["tokenFingerprint"].as_str().unwrap_or("-"),
+                        serde_json::to_string(&c["params"]).unwrap_or_default(),
+                    );
+                }
+            }
+            ConnectCmd::Rm { name } => {
+                let response =
+                    client::call_target(&target, &Request::ConnectorRm { name: name.clone() })?;
+                if response["removed"].as_bool() == Some(true) {
+                    println!("removed {name} (worker winds down)");
+                } else {
+                    bail!("no connector '{name}'");
+                }
+            }
+            ConnectCmd::Catalog => {
+                for (name, manifest, origin) in connector::catalog(&paths) {
+                    let params: Vec<String> = manifest.params.keys().cloned().collect();
+                    println!(
+                        "{name}  [{origin}]  {}{}",
+                        manifest.description,
+                        if params.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  (params: {})", params.join(", "))
+                        }
+                    );
+                }
+                println!(
+                    "\nadd your own: drop a manifest in {}",
+                    paths.connectors_dir().display()
+                );
+            }
+        },
         Cmd::Bridge { cmd } => match cmd {
             BridgeCmd::Add {
                 name,

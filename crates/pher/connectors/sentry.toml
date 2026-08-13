@@ -1,0 +1,23 @@
+# Sentry: unresolved issues as events.
+#   pher connect add sentry --token env:SENTRY_TOKEN --param org=<slug>
+# Token: an auth token with org:read + project:read (Settings → Auth Tokens).
+name = "sentry"
+description = "Sentry issues (new/regressed errors) as sentry.issue.<level> events"
+docs = "https://docs.sentry.io/api/"
+
+[auth]
+header = "Authorization"
+format = "Bearer {token}"
+
+[params]
+org = "Sentry organization slug"
+
+[[poll]]
+name = "issues"
+url = "https://sentry.io/api/0/organizations/{org}/issues/?query=is:unresolved&sort=date"
+interval = "60s"
+records = "$"
+subject = "sentry.issue.{level}"
+id = "id"
+ts = "lastSeen"
+watermark = "lastSeen"
