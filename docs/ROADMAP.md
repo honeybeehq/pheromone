@@ -26,7 +26,7 @@ The crown jewel first, consumable from day one.
 **Exit criterion:** an agent (or Apiary) can parse, validate, explain, and dry-run any v1
 subscription string against a bag of events, in-process, with no daemon.
 
-## Slice 2 — `pherd`: the local bus
+## Slice 2 — `pherd`: the local trail
 
 - Daemon: ingest endpoint (unix socket + localhost HTTP), SQLite (WAL) state store,
   segmented event log behind the storage trait, subject-trie hot path.
@@ -69,7 +69,7 @@ restart, no loss, cursor resume.
 ## Slice 5 — tier 4 (judge) + `expect`
 
 - Batched judge client (claude-haiku-class), prompt caching, verdict cache, budgets with
-  fail-closed + `budget_exhausted` bus event, `sample`.
+  fail-closed + `budget_exhausted` trail event, `sample`.
 - `expect ... within ... else` — the timer table, `$origin` binding.
 
 ## Slice 6 — cross-node

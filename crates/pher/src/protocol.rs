@@ -55,7 +55,7 @@ pub enum Request {
     CursorRm {
         name: String,
     },
-    /// Upsert a bridge: a durable pull from an upstream bus — its /listen
+    /// Upsert a bridge: a durable pull from an upstream trail — its /listen
     /// filtered by `sub`, re-ingested locally with envelope identity
     /// preserved. `url`/`token` are resolved from the node registry by the
     /// caller (`pher apply` / `pher bridge add`).

@@ -1,5 +1,5 @@
 //! SQLite storage for the growing logs: events, deliveries, judge verdicts,
-//! the semantic vector window, and the cross-bus dedup window. One WAL-mode
+//! the semantic vector window, and the cross-trail dedup window. One WAL-mode
 //! database (`pher.db`), so kill -9 keeps every committed transaction and
 //! reads are indexed instead of whole-file scans — the JSONL logs stopped
 //! scaling the moment a real tap (hive, hundreds of events/min) landed.
@@ -306,7 +306,7 @@ impl Db {
         Ok(rows)
     }
 
-    // -- cross-bus dedup window --------------------------------------------------
+    // -- cross-trail dedup window --------------------------------------------------
 
     pub fn forwarded_insert(&self, id: &str) -> anyhow::Result<()> {
         self.conn.execute(

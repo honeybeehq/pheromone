@@ -128,7 +128,7 @@ judge "Is this crash user-facing?" budget 50/day sample 0.5
 
 - `budget <n>/<period>` is **mandatory** — no unbounded LLM spend by omission. When the
   budget is exhausted, the subscription's judge tier fails closed (no match) and a
-  `pher.subscription.budget_exhausted` event is emitted on the bus itself.
+  `pher.subscription.budget_exhausted` event is emitted on the trail itself.
 - Verdicts cached by `(subscription-id, event-fingerprint)`.
 - Batched: multiple pending events per model call; the subscription question is a stable
   prompt prefix → prompt caching makes per-verdict cost tiny.
@@ -190,7 +190,7 @@ then http POST <url> ...                                    # webhooks out
 then cmd <shell>                                            # local command
 then hermes <invoke>                                        # human notification channels
 then pol fire <trigger>                                     # hand to Pollinate
-then emit <subject>                                         # re-emit onto the bus (composition)
+then emit <subject>                                         # re-emit onto the trail (composition)
 then stream                                                 # deliver to the connected listener (SDK / pher listen)
 ```
 
@@ -202,7 +202,7 @@ actually enforced — by connection liveness. `pher when '… then stream'` is r
 a stored stream subscription with no listener would be a lie.
 
 `then emit` is how subscriptions compose into pipelines; the delivery's `match` block is
-attached to the re-emitted event's metadata, and `correlation` is preserved — trails stay
+attached to the re-emitted event's metadata, and `correlation` is preserved — threads stay
 intact across hops. Cycle guard: a hop-count in event metadata, hard-capped (default 8).
 
 ## The delivery contract

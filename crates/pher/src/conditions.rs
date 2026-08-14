@@ -1,7 +1,7 @@
 //! The metric condition engine (ARCHITECTURE: "metrics never enter as raw
 //! datapoints"). Conditions are evaluated here, at the tap edge; only
 //! condition *transitions* (`metric.condition.entered` / `.cleared`) become
-//! bus events. The raw firehose never hits the matcher or the log.
+//! trail events. The raw firehose never hits the matcher or the log.
 //!
 //! Semantics: a condition ENTERS when its predicate holds continuously for
 //! `hold` (measured across received datapoints), and CLEARS on the first
@@ -67,7 +67,7 @@ pub struct ConditionState {
     pub last_value: f64,
 }
 
-/// A transition to be emitted onto the bus.
+/// A transition to be emitted onto the trail.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transition {
     pub condition: String,
@@ -156,7 +156,7 @@ impl Conditions {
         self.defs.iter().find(|d| d.name == name)
     }
 
-    /// The bus event payload for a transition.
+    /// The trail event payload for a transition.
     pub fn event_payload(&self, t: &Transition) -> Value {
         let def = self.def(&t.condition);
         json!({

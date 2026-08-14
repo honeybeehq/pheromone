@@ -133,9 +133,9 @@ structures.
   policy patterns apply for the rest).
 - Secrets via Hem refs in tap/sink config, never inline.
 
-## Observability of the bus itself
+## Observability of the trail itself
 
-The bus eats its own dog food: `pher.subscription.registered/evaporated/budget_exhausted`,
+The trail eats its own dog food: `pher.subscription.registered/evaporated/budget_exhausted`,
 `pher.delivery.failed/quarantined`, `pher.tap.up/down/lagging`, `pher.node.online/offline`
-are ordinary events on the bus, subscribable like anything else. `pher doctor` for the
+are ordinary events on the trail, subscribable like anything else. `pher doctor` for the
 portless-style one-shot diagnosis.

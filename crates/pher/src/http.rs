@@ -5,7 +5,7 @@
 //!   secret is configured; events land as `webhook.<name>`.
 //! - `POST /emit` — remote emit (other tailnet nodes, scripts, taps).
 //! - `POST /metric` — datapoint intake for the condition engine; only
-//!   condition transitions reach the bus, never the datapoints themselves.
+//!   condition transitions reach the trail, never the datapoints themselves.
 //!
 //! Bind via `PHER_HTTP` (e.g. `127.0.0.1:4870`, or a tailnet address).
 //! Binding beyond loopback REQUIRES `PHER_HTTP_TOKEN` — refused otherwise.
@@ -91,7 +91,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             .map(|h| h.value.as_str().to_string())
     };
 
-    // Three auth tiers: the admin token operates the bus; a grant token
+    // Three auth tiers: the admin token operates the trail; a grant token
     // speaks and listens through its filters; anonymous gets health checks.
     // A tokenless (loopback-only) bind trusts everyone as admin.
     let bearer = header("authorization").and_then(|v| v.strip_prefix("Bearer ").map(String::from));
@@ -185,7 +185,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             }
         }
         ("GET", "/.well-known/pheromone") => {
-            // Bus discovery: enough to point a bridge or SDK at, no secrets.
+            // Trail discovery: enough to point a bridge or SDK at, no secrets.
             respond(
                 request,
                 200,
@@ -206,7 +206,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                 Principal::Admin => {}
                 Principal::Grant(name) => {
                     // Grants speak (filtered emit) and track their position;
-                    // operating the bus needs the admin token.
+                    // operating the trail needs the admin token.
                     match &rpc {
                         Request::Emit { event } => {
                             if let Err(e) = state.lock().unwrap().check_grant_emit(name, event) {
@@ -446,7 +446,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
 const UI_HTML: &str = include_str!("ui.html");
 
 enum Principal {
-    /// The bus operator (PHER_HTTP_TOKEN, or any caller on a tokenless
+    /// The trail operator (PHER_HTTP_TOKEN, or any caller on a tokenless
     /// loopback bind).
     Admin,
     /// A named grant: emit through its emit filter, listen through its

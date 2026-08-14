@@ -1,4 +1,4 @@
-# pheromone.toml — declarative bus config, reconciled with `pher apply`.
+# pheromone.toml — declarative trail config, reconciled with `pher apply`.
 #
 #   pher apply                      # against the local daemon
 #   pher --node hub apply           # against a remote node, over /rpc
@@ -42,8 +42,8 @@ name = "metal1"
 url = "http://metal1:4870"
 token-env = "PHER_HTTP_TOKEN_METAL1"
 
-# -- bridges: pull composition between buses ----------------------------------
-# A bridge is a durable filtered listen against an upstream bus, re-ingested
+# -- bridges: pull composition between trails ---------------------------------
+# A bridge is a durable filtered listen against an upstream trail, re-ingested
 # locally: same event ids, hops incremented, deduped, cursor-resumed across
 # outages. The upstream evaluates the subscription (its tiers, its budgets).
 

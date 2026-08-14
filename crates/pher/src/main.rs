@@ -27,7 +27,7 @@ use store::Paths;
 #[command(
     name = "pher",
     version,
-    about = "Pheromone — a distributed event bus for agent ecosystems (prototype: tiers 1-2, local bus)"
+    about = "Pheromone — event trails for agent ecosystems"
 )]
 struct Cli {
     /// Target a remote node: a name from `pher node add`, or a URL
@@ -59,7 +59,7 @@ enum Cmd {
         #[arg(long)]
         matches_only: bool,
     },
-    /// Emit an event onto the bus
+    /// Emit an event onto the trail
     Emit {
         subject: String,
         /// JSON payload (default null)
@@ -143,12 +143,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CursorCmd,
     },
-    /// Connect a SaaS vendor: extract its events onto the bus
+    /// Connect a SaaS vendor: extract its events onto the trail
     Connect {
         #[command(subcommand)]
         cmd: ConnectCmd,
     },
-    /// Manage bridges (pull filtered streams from upstream buses)
+    /// Manage bridges (follow filtered streams from upstream trails)
     Bridge {
         #[command(subcommand)]
         cmd: BridgeCmd,
@@ -181,7 +181,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
-    /// Run an ecosystem tap (feeds the local bus)
+    /// Run an ecosystem tap (feeds the local trail)
     Tap {
         #[command(subcommand)]
         cmd: TapCmd,

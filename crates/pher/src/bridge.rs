@@ -1,5 +1,5 @@
-//! Bridges: pull composition between buses. A bridge is a durable `/listen`
-//! against an upstream bus — filtered by an ordinary subscription — whose
+//! Bridges: pull composition between trails. A bridge is a durable `/listen`
+//! against an upstream trail — filtered by an ordinary subscription — whose
 //! deliveries are re-ingested locally with envelope identity preserved
 //! (same event id, origin node, timestamps; hops incremented). Robustness
 //! is inherited wholesale from the listen/cursor machinery: the upstream
@@ -8,8 +8,8 @@
 //! reconnect uses backoff and resets on progress.
 //!
 //! The upstream evaluates the full cascade (its tiers, its budgets); this
-//! side only admits. Composition without a federation protocol: the bus
-//! graph is whatever bridges and forwards exist, and cycles die at the hop
+//! side only admits. Composition without a federation protocol: the trail
+//! network is whatever bridges and forwards exist, and cycles die at the hop
 //! cap.
 
 use std::io::{BufRead, BufReader};

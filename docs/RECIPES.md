@@ -86,7 +86,7 @@ pher emit job.finished --correlation batch-8    # timer disarmed, nothing fires
 
 ## 6. Metrics → conditions → events
 
-Raw datapoints never hit the bus; only condition transitions do.
+Raw datapoints never hit the trail; only condition transitions do.
 
 ```bash
 pher condition add p95_high --metric p95_latency --gt 800 --for 10s --label env=prod
@@ -134,27 +134,27 @@ pher listen 'on ci.**' --cursor my-watcher     # → replays exactly what you mi
 pher cursor ls
 ```
 
-## 11. Two buses on one machine (bridge + grant)
+## 11. Two trails on one machine (bridge + grant)
 
 ```bash
-# Bus A ("company") on 4890 with a grant:
-PHEROMONE_HOME=/tmp/bus-a PHER_HTTP=127.0.0.1:4890 PHER_HTTP_TOKEN=admintok pher daemon run &
+# Trail A ("company") on 4890 with a grant:
+PHEROMONE_HOME=/tmp/trail-a PHER_HTTP=127.0.0.1:4890 PHER_HTTP_TOKEN=admintok pher daemon run &
 cat > /tmp/a.toml <<'EOF'
 [[grant]]
 name = "reader"
 token = "reader-token-0123456789"
 allow = 'on public.**'
 EOF
-PHEROMONE_HOME=/tmp/bus-a pher apply /tmp/a.toml
+PHEROMONE_HOME=/tmp/trail-a pher apply /tmp/a.toml
 
-# Bus B pulls public.** from A using the grant:
-PHEROMONE_HOME=/tmp/bus-b pher daemon run &
-PHEROMONE_HOME=/tmp/bus-b pher bridge add from-a --from http://127.0.0.1:4890 \
+# Trail B follows public.** from A using the grant:
+PHEROMONE_HOME=/tmp/trail-b pher daemon run &
+PHEROMONE_HOME=/tmp/trail-b pher bridge add from-a --from http://127.0.0.1:4890 \
   --token reader-token-0123456789 --sub 'on public.**'
 
-PHEROMONE_HOME=/tmp/bus-a pher emit public.announce --payload '{"v": 1}'
-PHEROMONE_HOME=/tmp/bus-b pher tail --after 0 | grep public.announce   # same event id, hops: 1
-PHEROMONE_HOME=/tmp/bus-a pher emit private.secret --payload '{}'      # never crosses
+PHEROMONE_HOME=/tmp/trail-a pher emit public.announce --payload '{"v": 1}'
+PHEROMONE_HOME=/tmp/trail-b pher tail --after 0 | grep public.announce   # same event id, hops: 1
+PHEROMONE_HOME=/tmp/trail-a pher emit private.secret --payload '{}'      # never crosses
 ```
 
 ## 12. SDK in five lines
@@ -172,7 +172,7 @@ await pher.emit("demo.hello", { n: 5 });
 ```bash
 pher connect catalog                 # what's available
 pher connect add github --token env:GITHUB_TOKEN --param owner=acme --param repo=api
-pher listen 'on github.pushevent'    # pushes, PRs, releases… as bus events
+pher listen 'on github.pushevent'    # pushes, PRs, releases… as trail events
 # your own vendor: drop a manifest in ~/.pheromone/connectors/ — ~20 lines
 # of TOML (auth header, poll URL, interval, subject template, id, watermark)
 ```

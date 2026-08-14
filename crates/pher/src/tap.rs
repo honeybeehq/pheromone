@@ -1,6 +1,6 @@
 //! Ecosystem taps. The flagship is the hive ledger tap: the Honeybee ledger
 //! stream (~160 well-namespaced event types, zero programmatic subscribers
-//! until now) piped onto the bus as `hive.<type>` events.
+//! until now) piped onto the trail as `hive.<type>` events.
 //!
 //! Prototype note: this consumes `hive events --follow --json` (the CLI is the
 //! stable read surface and works even while the hive daemon is down) rather
@@ -18,7 +18,7 @@ use crate::client::{self, Conn, Target};
 use crate::protocol::{PartialEvent, Request};
 use crate::store::Paths;
 
-/// How the tap reaches its bus: a persistent local socket, or per-event
+/// How the tap reaches its trail: a persistent local socket, or per-event
 /// HTTP to a remote hub (leaf machines need no local daemon at all).
 enum Sender<'a> {
     Local(Conn),
@@ -35,14 +35,14 @@ impl Sender<'_> {
 }
 
 /// Ledger fields that identify the acting session/bee, in preference order.
-/// The first one present becomes the envelope correlation, so trails join
+/// The first one present becomes the envelope correlation, so threads join
 /// spawn → prompt → seal across the whole vocabulary.
 const CORRELATION_FIELDS: &[&str] = &["session", "bee", "name", "flight", "id"];
 
 /// Reconnect bookkeeping: where the tap was in the ledger, and what it has
 /// already forwarded. `seen` dedups the resume overlap — re-emitting a
 /// ledger line would mint a fresh envelope id, so without this, retries
-/// would duplicate events on the bus.
+/// would duplicate events on the trail.
 struct TapState {
     /// Unix secs of the last forwarded ledger event.
     last_ts: Option<u64>,
@@ -147,7 +147,7 @@ fn follow_once(
             continue;
         };
         // Edge filtering: heartbeat-grade ledger types (e.g. state.verified
-        // liveness probes at hundreds/min) never reach the bus or its log.
+        // liveness probes at hundreds/min) never reach the trail or its log.
         let typ = event
             .subject
             .strip_prefix("hive.")
@@ -191,7 +191,7 @@ fn ledger_ts(line: &str) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-/// Map one ledger JSON line to a bus event. Returns None for unparseable
+/// Map one ledger JSON line to a trail event. Returns None for unparseable
 /// lines (the ledger is append-only JSONL; torn lines happen at rotation).
 fn map_ledger_line(line: &str) -> Option<PartialEvent> {
     let v: Value = serde_json::from_str(line.trim()).ok()?;

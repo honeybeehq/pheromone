@@ -73,7 +73,7 @@ pub struct ConnectorEntry {
     pub params: HashMap<String, String>,
 }
 
-/// Pull composition: a durable filtered listen against an upstream bus,
+/// Pull composition: a durable filtered listen against an upstream trail,
 /// re-ingested locally. `from` names a [[node]].
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

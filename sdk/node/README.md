@@ -1,6 +1,6 @@
 # @pheromone/client
 
-Talk to the Pheromone event bus from code: emit events, register subscriptions,
+Talk to a Pheromone trail from code: emit events, register subscriptions,
 and receive deliveries as callbacks.
 
 ```js

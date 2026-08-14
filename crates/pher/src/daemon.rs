@@ -633,7 +633,7 @@ impl State {
         self.metas.insert(id.clone(), meta);
         self.matcher.insert(id.clone(), sub.clone());
         self.persist_subs().map_err(|e| e.to_string())?;
-        self.emit_bus_event("pher.subscription.registered", json!({ "id": id }));
+        self.emit_trail_event("pher.subscription.registered", json!({ "id": id }));
 
         // Replay: run the backlog through the matcher first, then live.
         // Stream sinks replay in attach_listener instead — AFTER the listener
@@ -889,7 +889,7 @@ impl State {
             &serde_json::to_value(&self.judge_budgets).unwrap_or_default(),
         );
         if notify {
-            self.emit_bus_event(
+            self.emit_trail_event(
                 "pher.subscription.budget_exhausted",
                 json!({ "id": sub_id }),
             );
@@ -960,7 +960,7 @@ impl State {
         self.admit_remote(event)
     }
 
-    /// Admit an event that originated on another bus (push via /deliver, or
+    /// Admit an event that originated on another trail (push via /deliver, or
     /// pull via a bridge). Dedup is by EVENT id — the envelope's identity is
     /// preserved across any topology, so the same event arriving via two
     /// routes (or retried at-least-once) ingests exactly once. Persisted
@@ -1384,7 +1384,7 @@ impl State {
                     });
                 }
                 // The re-emitted event carries the match block in its payload
-                // metadata and preserves correlation, so trails stay intact.
+                // metadata and preserves correlation, so threads stay intact.
                 let re = PartialEvent {
                     subject: subject.clone(),
                     payload: Some(json!({
@@ -1477,8 +1477,8 @@ impl State {
         }
     }
 
-    /// The bus eats its own dog food: lifecycle events are ordinary events.
-    fn emit_bus_event(&mut self, subject: &str, payload: Value) {
+    /// The trail eats its own dog food: lifecycle events are ordinary events.
+    fn emit_trail_event(&mut self, subject: &str, payload: Value) {
         let _ = self.ingest(
             PartialEvent {
                 subject: subject.to_string(),
@@ -1505,7 +1505,7 @@ impl State {
             let _ = self.persist_subs();
             let _ = self.persist_timers();
             let _ = self.persist_pending();
-            self.emit_bus_event(
+            self.emit_trail_event(
                 "pher.subscription.evaporated",
                 json!({ "id": id, "reason": reason }),
             );
@@ -1742,7 +1742,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
             s.next_seq
         );
         let node = s.node.clone();
-        s.emit_bus_event("pher.node.online", json!({ "node": node }));
+        s.emit_trail_event("pher.node.online", json!({ "node": node }));
     }
 
     // Judge worker: verdicts happen off the state lock; delivery re-acquires.
@@ -1785,7 +1785,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         eprintln!("pherd: judge call failed for {}: {e}", job.sub_id);
-                        s.emit_bus_event(
+                        s.emit_trail_event(
                             "pher.judge.error",
                             json!({ "subscription": job.sub_id, "event": job.event.id, "error": e }),
                         );
@@ -1845,7 +1845,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
                         if expired {
                             // Evaporation bound: give up loudly, once.
                             s.outbox.remove(pos);
-                            s.emit_bus_event(
+                            s.emit_trail_event(
                                 "pher.delivery.failed",
                                 json!({
                                     "deliveryId": entry.delivery_id,
@@ -1863,7 +1863,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
                             let attempts = e.attempts;
                             if first_failure {
                                 // Transition event, not a per-retry firehose.
-                                s.emit_bus_event(
+                                s.emit_trail_event(
                                     "pher.delivery.retrying",
                                     json!({
                                         "deliveryId": entry.delivery_id,
@@ -2146,7 +2146,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
             {
                 let mut s = state.lock().unwrap();
                 if def.cursor.is_empty() {
-                    // Scoped to this consuming bus, so two team members
+                    // Scoped to this consuming trail, so two team members
                     // bridging the same upstream never share a position.
                     def.cursor = format!("bridge:{}@{}", def.name, s.node);
                 }

@@ -1,6 +1,6 @@
 # Pheromone
 
-**A distributed event bus for agent ecosystems.** Emit signals from anything readable — agent harnesses, container runtimes, CI, log drains, crash trackers, metrics providers — and subscribe with one primitive:
+**Event trails for agent ecosystems** — a distributed alternative to event buses and webhooks. Anything readable lays a trail: agent harnesses, container runtimes, CI, log drains, crash trackers, metrics providers. Follow one with a single primitive:
 
 ```
 pher when 'on hive.seal where payload.status == "blocked"
@@ -16,10 +16,16 @@ Way, way simpler than Kafka. Specialized for agent production and consumption. D
 integrated with the Honeybee ecosystem (Honeybee, Pollinate, Apiary, Kit), pluggable into
 everything else.
 
+The vocabulary is the ant colony's, because the mechanics are too. Producers **lay a
+trail** (the event stream a node carries); consumers **follow** it (subscriptions and
+cursors — pick the trail back up exactly where you left off); trails **evaporate**
+unless retained (retention, TTLs, leases, budgets); bridges join trails into a **trail
+network** (the mesh). Correlation chains across events are **threads**.
+
 ## Status
 
 **Prototype (roadmap slices 1–5 substantially complete).** All four tiers of the cost
-cascade are live: `on` → `where` → `meaning` → `judge`, end to end, with the local bus,
+cascade are live: `on` → `where` → `meaning` → `judge`, end to end, with the local trail,
 all sinks, delivery shaping, and the hive ledger tap.
 
 What works today:
@@ -29,12 +35,12 @@ What works today:
   subject trie with `*`/`**`, match-explanation blocks.
 - **Offline authoring loop** — `pher test '<sub>' --against events.jsonl` dry-runs a
   subscription against a bag of events with per-tier verdicts (see `testdata/`).
-- **A local bus** (`pher daemon run`) — `emit`, `when`, `ls`, `rm`, `tail` (cursor
+- **A local trail** (`pher daemon run`) — `emit`, `when`, `ls`, `rm`, `tail` (cursor
   resume), `why <delivery-id>`, `why-not <sub-id> <event-id>`. JSONL event log +
   crash-safe state under `~/.pheromone/`; kill -9 loses nothing.
 - **Sinks — all of them:** `cmd`, `emit` (hop-capped cycle guard, correlation preserved),
   `buz`, `http` (validated POST/PUT/... off-thread, failures come back as
-  `pher.delivery.failed` bus events), `hermes`, `pol`, `hive` (CLI handoff).
+  `pher.delivery.failed` trail events), `hermes`, `pol`, `hive` (CLI handoff).
 - **Delivery shaping:** `every` (leading edge + trailing collapsed event per window) and
   `batch` (one delivery per window, capped queue with drop accounting), persisted so
   kill -9 keeps queued events.
@@ -75,7 +81,7 @@ What works today:
   the tap edge and only transitions become events (`metric.condition.entered`
   / `.cleared`) — the raw firehose never hits the matcher or the log.
 - **Hive ledger tap** (`pher tap hive`) — the flagship: follows
-  `hive events --follow --json` and puts every ledger event on the bus as
+  `hive events --follow --json` and puts every ledger event on the trail as
   `hive.<type>`, correlation mapped from session/bee fields. The ~160-type
   stream with zero programmatic subscribers has its subscriber.
 - **Code-based subscribers** — `then stream` + the `@pheromone/client` Node SDK
@@ -105,20 +111,20 @@ What works today:
   backoff and resumes from its last-forwarded ledger timestamp, deduping the
   overlap. Verified with an outage drill: hub down → forward queued →
   hub up → delayed arrival, exactly once, dedup surviving kill -9.
-- **Composable buses (bridges + grants).** A bus is just a pherd; meshes are
+- **The trail network (bridges + grants).** A trail is just a pherd; the network is
   built from two primitives, both speaking the subscription language.
   *Bridges* pull: `[[bridge]] from/sub` (or `pher bridge add`) holds a durable
-  filtered listen against an upstream bus and re-ingests deliveries locally —
+  filtered listen against an upstream trail and re-ingests deliveries locally —
   envelope identity preserved (same event id, hops incremented), admission
   deduped by event id, position cursor-resumed across outages, worker
-  supervised by the daemon with backoff. Derived buses are just buses whose
+  supervised by the daemon with backoff. Derived trails are just trails whose
   inputs are bridges. *Grants* bound tokens: `[[grant]] allow/emit` gives a
   named bearer token a consume filter and a publish filter — enforcement IS
   the matcher (tiers 1–2 only; deterministic authorization), applied at the
   listen stream and at emit admission. Grant tokens can emit (filtered),
-  listen (filtered), and commit cursors; operating the bus requires the admin
+  listen (filtered), and commit cursors; operating the trail requires the admin
   token. `pher grant ls` shows token fingerprints, never tokens.
-  `GET /.well-known/pheromone` makes a bus discoverable. Honesty note:
+  `GET /.well-known/pheromone` makes a trail discoverable. Honesty note:
   grants are boundary enforcement, not cryptography — delivered events
   belong to their recipient.
 - **Declarative config** — `pheromone.toml` + `pher apply [--prune] [--dry-run]`
