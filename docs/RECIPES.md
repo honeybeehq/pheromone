@@ -149,7 +149,7 @@ PHEROMONE_HOME=/tmp/trail-a pher apply /tmp/a.toml
 
 # Trail B follows public.** from A using the grant:
 PHEROMONE_HOME=/tmp/trail-b pher daemon run &
-PHEROMONE_HOME=/tmp/trail-b pher bridge add from-a --from http://127.0.0.1:4890 \
+PHEROMONE_HOME=/tmp/trail-b pher follow http://127.0.0.1:4890 \
   --token reader-token-0123456789 --sub 'on public.**'
 
 PHEROMONE_HOME=/tmp/trail-a pher emit public.announce --payload '{"v": 1}'

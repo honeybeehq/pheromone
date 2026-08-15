@@ -113,7 +113,7 @@ What works today:
   hub up → delayed arrival, exactly once, dedup surviving kill -9.
 - **The trail network (bridges + grants).** A trail is just a pherd; the network is
   built from two primitives, both speaking the subscription language.
-  *Bridges* pull: `[[bridge]] from/sub` (or `pher bridge add`) holds a durable
+  *Bridges* pull: `[[bridge]] from/sub` (or `pher follow company --sub 'on ci.**'`) holds a durable
   filtered listen against an upstream trail and re-ingests deliveries locally —
   envelope identity preserved (same event id, hops incremented), admission
   deduped by event id, position cursor-resumed across outages, worker

@@ -148,6 +148,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConnectCmd,
     },
+    /// Follow an upstream trail: a filtered stream, re-ingested locally
+    /// (sugar for `pher bridge add`)
+    Follow {
+        /// Upstream: a node name from `pher node add`, or a URL
+        from: String,
+        /// Subscription text ('then stream' implied), e.g. 'on ci.**'
+        #[arg(long)]
+        sub: String,
+        /// Bridge name (default: derived from the upstream name)
+        #[arg(long)]
+        name: Option<String>,
+        /// Upstream bearer token (defaults to the node's registered token)
+        #[arg(long)]
+        token: Option<String>,
+        /// Upstream cursor name (default: bridge:<name>@<node>)
+        #[arg(long)]
+        cursor: Option<String>,
+    },
     /// Manage bridges (follow filtered streams from upstream trails)
     Bridge {
         #[command(subcommand)]
@@ -706,6 +724,26 @@ fn run() -> anyhow::Result<()> {
                 );
             }
         },
+        Cmd::Follow {
+            from,
+            sub,
+            name,
+            token,
+            cursor,
+        } => {
+            // "Follow the company trail": the bridge name defaults to the
+            // upstream's name (sanitized when it's a URL).
+            let name = name.unwrap_or_else(|| {
+                from.trim_start_matches("http://")
+                    .trim_start_matches("https://")
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    .collect::<String>()
+                    .trim_matches('-')
+                    .to_string()
+            });
+            follow_trail(&target, &paths, name, from, sub, token, cursor)?;
+        }
         Cmd::Bridge { cmd } => match cmd {
             BridgeCmd::Add {
                 name,
@@ -714,34 +752,7 @@ fn run() -> anyhow::Result<()> {
                 token,
                 cursor,
             } => {
-                // Resolve the upstream from the node registry, or take a URL.
-                let (url, node_token) =
-                    if from.starts_with("http://") || from.starts_with("https://") {
-                        (from.trim_end_matches('/').to_string(), None)
-                    } else {
-                        let nodes = client::load_nodes(&paths);
-                        let node = nodes
-                            .iter()
-                            .find(|n| n.name == from)
-                            .with_context(|| format!("unknown node '{from}' — pher node add"))?;
-                        (node.url.clone(), node.token.clone())
-                    };
-                let response = client::call_target(
-                    &target,
-                    &Request::BridgeAdd {
-                        def: serde_json::json!({
-                            "name": name,
-                            "url": url,
-                            "token": token.or(node_token),
-                            "sub": sub,
-                            "cursor": cursor.unwrap_or_default(),
-                        }),
-                    },
-                )?;
-                println!(
-                    "bridge {name} → pulling from {url} (cursor {})",
-                    response["cursor"].as_str().unwrap_or("?")
-                );
+                follow_trail(&target, &paths, name, from, sub, token, cursor)?;
             }
             BridgeCmd::Ls => {
                 let response = client::call_target(&target, &Request::BridgeLs)?;
@@ -1055,4 +1066,45 @@ fn partial_envelope(mut v: Value) -> anyhow::Result<Envelope> {
         obj.entry(key).or_insert(default);
     }
     Ok(serde_json::from_value(v)?)
+}
+
+/// Register (or replace) a bridge that follows an upstream trail. Shared by
+/// `pher follow` and `pher bridge add`.
+fn follow_trail(
+    target: &client::Target,
+    paths: &Paths,
+    name: String,
+    from: String,
+    sub: String,
+    token: Option<String>,
+    cursor: Option<String>,
+) -> anyhow::Result<()> {
+    // Resolve the upstream from the node registry, or take a URL.
+    let (url, node_token) = if from.starts_with("http://") || from.starts_with("https://") {
+        (from.trim_end_matches('/').to_string(), None)
+    } else {
+        let nodes = client::load_nodes(paths);
+        let node = nodes
+            .iter()
+            .find(|n| n.name == from)
+            .with_context(|| format!("unknown node '{from}' — pher node add"))?;
+        (node.url.clone(), node.token.clone())
+    };
+    let response = client::call_target(
+        target,
+        &Request::BridgeAdd {
+            def: serde_json::json!({
+                "name": name,
+                "url": url,
+                "token": token.or(node_token),
+                "sub": sub,
+                "cursor": cursor.unwrap_or_default(),
+            }),
+        },
+    )?;
+    println!(
+        "following {url} as '{name}' (cursor {})",
+        response["cursor"].as_str().unwrap_or("?")
+    );
+    Ok(())
 }
