@@ -17,6 +17,10 @@ exist stop at topic/subject matching.
   code or a separate stream processor. The heavyweight baseline the proposal defines itself
   against. Redpanda's 2026 "Agentic Data Plane" is governance/identity for agents touching
   data, not subscription semantics.
+- **S2 (s2.dev)** — serverless stream store on S3: basins/streams/records, durable-before-ack,
+  infinite retention, seq/timestamp/tail reads, fencing tokens; MIT `s2-lite` for self-host.
+  No matching at all — a *log substrate*, not a competitor. Candidate hub/cloud event log and
+  trail-network transport; see [S2.md](S2.md).
 - **MQTT (Mosquitto, EMQX, HiveMQ)** — topic wildcards; EMQX has a SQL-ish rule engine.
   Lightweight but no semantic tier, no agent ergonomics.
 - **CloudEvents ecosystem** — Knative Triggers support **CESQL** boolean filter expressions
@@ -125,4 +129,5 @@ ingestion breadth.
 - semantic-router: https://www.aurelio.ai/semantic-router · vLLM semantic router: https://github.com/vllm-project/semantic-router
 - Neural Router: https://arxiv.org/abs/2605.25701
 - Governance-aware vector subscriptions: https://arxiv.org/abs/2603.20833
+- S2: https://s2.dev/ · https://s2.dev/docs/platform/architecture · https://s2.dev/docs/s2-lite
 - Semantic Operators (VLDB): https://www.vldb.org/pvldb/vol18/p4171-patel.pdf
