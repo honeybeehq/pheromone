@@ -70,7 +70,7 @@ velocity-to-v1 ever trumps differentiation, Go + embedded NATS is the coherent p
 | Envelope | CloudEvents-compatible JSON | `{id, ts, node, source, type, subject, correlation, payload, ttlClass}`; free interop with Knative/EventBridge producers |
 | State/index store | SQLite (WAL), one DB per node | `~/.pheromone/pher.db`: subscriptions, offsets, deliveries, timers (`expect`), FTS5, vectors |
 | Vectors | sqlite-vec, same DB | 384-dim; no second process. FTS5 gives a free lexical tier |
-| Event bodies | Segmented append log, behind a storage trait | v1 local segments; growth path: segments → object storage (Parquet) for archive/replay/analytics; SQLite stays the index. Sharding by subject namespace when a node saturates. The trait keeps "simpler than Kafka" true while leaving the ceiling open |
+| Event bodies | `TrailLog` trait: SQLite locally; WAL chunks + CAS'd manifest on object storage (S3/MinIO) for hub/cloud | Local: SQLite, µs acks. Cloud: stateless pherds, object store is the only durable state, leader fenced by manifest epoch, compaction to segments, partitions by subject hash when one log saturates. Design: [SCALE.md](SCALE.md) |
 | Embeddings | Local ONNX, bge-small class (384-dim), ort/fastembed-rs | ~30–80MB quantized, CPU ms-scale. One embed per event, shared across subscriptions. Provider API (Voyage/OpenAI) optional config — must work offline on a laptop |
 | Judge | claude-haiku-class, batched, prompt-cached | Stable question prefix → cached; pluggable provider interface, one great default; hard budgets, fail-closed |
 | IDs | Honeybee-style short ids (`PH.4k2`) | House style |
