@@ -461,10 +461,9 @@ fn run() -> anyhow::Result<()> {
                 },
             )?;
             println!(
-                "emitted {} (seq {}, {} delivery/ies)",
+                "emitted {} (seq {})",
                 response["id"].as_str().unwrap_or("?"),
-                response["seq"],
-                response["deliveries"]
+                response["seq"]
             );
         }
         Cmd::When {

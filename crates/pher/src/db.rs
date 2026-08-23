@@ -58,6 +58,10 @@ impl Db {
             );
             CREATE TABLE IF NOT EXISTS forwarded (
                 id TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
         )?;
         let mut db = Db { conn };
@@ -203,6 +207,45 @@ impl Db {
         };
         rows.retain(|(_, e)| !e.id.is_empty());
         Ok(rows)
+    }
+
+    /// The next `max` events with seq > after, ascending — the follower's
+    /// read shape (oldest unprocessed first, bounded).
+    pub fn events_next(&self, after: u64, max: usize) -> anyhow::Result<Vec<(u64, Envelope)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT seq, envelope FROM events WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+        )?;
+        let mut rows: Vec<_> = stmt
+            .query_map(params![after, max as u64], row_to_event)?
+            .filter_map(Result::ok)
+            .collect();
+        rows.retain(|(_, e)| !e.id.is_empty());
+        Ok(rows)
+    }
+
+    // -- meta (small durable markers) ----------------------------------------
+
+    /// Log position the matcher has processed through (inclusive). Absent on
+    /// a database created before the ingest/match split.
+    pub fn matched_through(&self) -> anyhow::Result<Option<u64>> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'matched_through'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|v| v.parse().ok()))
+    }
+
+    pub fn set_matched_through(&self, seq: u64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('matched_through', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![seq.to_string()],
+        )?;
+        Ok(())
     }
 
     /// Events at or after an RFC3339 timestamp (time-based `since` replay).

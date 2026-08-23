@@ -126,7 +126,7 @@ export class PherClient {
     if (source) event.source = source;
     if (correlation) event.correlation = correlation;
     const r = await this._t.call({ op: "emit", event });
-    return { id: r.id, seq: r.seq, deliveries: r.deliveries };
+    return { id: r.id, seq: r.seq };
   }
 
   /** Register a durable subscription (must use a push sink, not stream). */

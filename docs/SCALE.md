@@ -22,19 +22,25 @@ Comb Log; Comb uses Pheromone only as a non-authoritative change-hint channel (�
 
 ## What Pheromone owes: Phase A — the structural split (Comb §8.3, §23.2)
 
-Before any storage change, split today's single critical section in `daemon.rs`
-(`ingest_envelope` assigns seq, writes SQLite, runs the cascade, enqueues delivery under one
-`Mutex<State>`) into:
+**Done 2026-08-23 (ingest/follower split).** `daemon.rs` no longer matches at ingest:
 
 ```
-ingest → TrailLog.append → matcher follows from a cursor → cascade → delivery
+ingest → append (seq, SQLite, tails, nudge) → ack {id, seq}
+follower thread: follow_step(32) from `matched_through` → cascade → delivery → commit position
 ```
 
-Exit criteria (Comb §23.2): matching cost no longer blocks ingest; replay = start a follower
-at a position; local mode stays kill-safe and µs-latency; per-trail order and at-least-once
-+ `deliveryId` dedup preserved; benchmarks and tests green. Still SQLite, still one binary.
+- `matched_through` is a `meta` row in `pher.db`, committed after each follower batch. A
+  crash between append and commit replays the gap on restart — at-least-once, nothing
+  lost; `deliveryId`s of replayed deliveries get a fresh counter (same event id).
+- Pre-split databases have no marker and start caught up (those events were matched
+  synchronously when they were ingested).
+- The `emit` ack dropped `deliveries` (it was already partial: tiers 3–4 and shaping
+  windows returned 0). `pher status` reports `matchedThrough` next to `nextSeq`.
+- Lock discipline: the follower holds the state lock for at most one batch of 32
+  cascades; emitters interleave. Not yet parallel matching — that needs shard leases
+  (Phase C/§8.13) and is unnecessary until one follower saturates.
 
-Then: lift `Db::append_event/max_seq/events_after/events_since_ts/gc` into `TrailLog` as
+Remaining for Phase A: lift `Db::append_event/max_seq/events_after/events_since_ts/gc` into `TrailLog` as
 `SqliteLog`; `event_by_id` becomes a side index (SQLite locally; Comb `.idx` segments in
 the cloud).
 

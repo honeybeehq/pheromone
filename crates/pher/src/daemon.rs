@@ -96,6 +96,10 @@ struct PendingWindow {
 /// Evaporation bound for batch queues (principle 6: no unbounded buffers).
 const MAX_BATCH_QUEUE: usize = 1000;
 
+/// Log entries the follower processes per lock acquisition. Small enough
+/// that an emitter never waits behind more than a few ms of cascade.
+const FOLLOWER_BATCH: usize = 32;
+
 pub(crate) struct State {
     paths: Paths,
     /// SQLite storage for the growing logs (events, deliveries, verdicts,
@@ -105,6 +109,13 @@ pub(crate) struct State {
     matcher: Matcher,
     metas: HashMap<String, SubMeta>,
     next_seq: u64,
+    /// Log seq the matcher has processed through (inclusive). Ingest only
+    /// appends; the follower advances this as it runs the cascade, and
+    /// commits it to the db after each batch. A crash between append and
+    /// commit replays the gap on restart — at-least-once, never lost.
+    matched_through: u64,
+    /// Nudge for the follower thread (an append happened).
+    follower_tx: Option<mpsc::Sender<()>>,
     timers: Vec<Timer>,
     pending: HashMap<String, PendingWindow>,
     tails: Vec<TailClient>,
@@ -310,6 +321,13 @@ impl State {
 
         let db = crate::db::Db::open(&paths)?;
         let next_seq = db.max_seq()?.map(|s| s + 1).unwrap_or(1);
+        // A database from before the ingest/match split has no marker: every
+        // event in it was matched synchronously at ingest, so start caught up.
+        let matched_through = match db.matched_through()? {
+            Some(m) => m.min(next_seq - 1),
+            None => next_seq - 1,
+        };
+        db.set_matched_through(matched_through)?;
 
         let timers: Vec<Timer> = std::fs::read_to_string(paths.timers())
             .ok()
@@ -412,6 +430,8 @@ impl State {
             matcher,
             metas,
             next_seq,
+            matched_through,
+            follower_tx: None,
             timers,
             pending,
             tails: Vec::new(),
@@ -683,29 +703,79 @@ impl State {
             ttl_class: None,
             hops: (hops > 0).then_some(hops),
         };
-        let (seq, deliveries) = self.ingest_envelope(event.clone())?;
-        Ok(ok(json!({
-            "id": event.id,
-            "seq": seq,
-            "deliveries": deliveries,
-        })))
+        let seq = self.ingest_envelope(event.clone())?;
+        Ok(ok(json!({ "id": event.id, "seq": seq })))
     }
 
-    fn ingest_envelope(&mut self, event: Envelope) -> Result<(u64, u64), String> {
+    /// Append to the log and return the assigned seq. Durable (SQLite) and
+    /// visible to tails before return; the cascade runs later in the
+    /// follower (`follow_step`), so ingest latency never includes matching.
+    fn ingest_envelope(&mut self, event: Envelope) -> Result<u64, String> {
         let seq = self.next_seq;
-        self.next_seq += 1;
-        self.current_seq = Some(seq);
         self.db
             .append_event(seq, &event)
             .map_err(|e| e.to_string())?;
+        self.next_seq += 1;
         self.notify_tails(seq, &event);
+        if let Some(tx) = &self.follower_tx {
+            let _ = tx.send(());
+        }
+        Ok(seq)
+    }
+
+    /// Follower step: run the cascade over the next `max` unprocessed log
+    /// entries and commit the position. Returns how many were processed
+    /// (0 = caught up). Called under the state lock in small batches so
+    /// ingest interleaves; tests call it directly to drain synchronously.
+    pub(crate) fn follow_step(&mut self, max: usize) -> usize {
+        let batch = match self.db.events_next(self.matched_through, max) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("pherd: follower read failed: {e}");
+                return 0;
+            }
+        };
+        if batch.is_empty() {
+            return 0;
+        }
+        let mut processed = 0;
+        for (seq, event) in batch {
+            if let Err(e) = self.process_event(seq, &event) {
+                eprintln!("pherd: cascade failed for {} (seq {seq}): {e}", event.id);
+            }
+            self.matched_through = seq;
+            processed += 1;
+        }
+        if let Err(e) = self.db.set_matched_through(self.matched_through) {
+            eprintln!("pherd: cannot commit follower position: {e}");
+        }
+        processed
+    }
+
+    /// Drain the follower until caught up.
+    #[cfg(test)]
+    pub(crate) fn drain(&mut self) -> usize {
+        let mut n = 0;
+        loop {
+            let k = self.follow_step(64);
+            if k == 0 {
+                return n;
+            }
+            n += k;
+        }
+    }
+
+    /// The cascade for one log entry: tiers 1-2 → delivery/shaping/expect,
+    /// then tiers 3-4. Returns the count of immediate deliveries.
+    fn process_event(&mut self, seq: u64, event: &Envelope) -> Result<u64, String> {
+        self.current_seq = Some(seq);
 
         // Expect bookkeeping first: an incoming event can disarm timers.
-        self.disarm_matching_timers(&event);
+        self.disarm_matching_timers(event);
 
         let matched_ids: Vec<String> = self
             .matcher
-            .match_ids(&event)
+            .match_ids(event)
             .into_iter()
             .map(String::from)
             .collect();
@@ -725,7 +795,7 @@ impl State {
                 self.persist_timers().map_err(|e| e.to_string())?;
                 continue;
             }
-            if let Some(n) = self.try_deliver(&sub_id, &event) {
+            if let Some(n) = self.try_deliver(&sub_id, event) {
                 deliveries += n;
             }
         }
@@ -736,7 +806,7 @@ impl State {
         // for async verdicts (tier-4 matches deliver on verdict, not ingest).
         let pending_subs: Vec<String> = self
             .matcher
-            .pending_ids(&event)
+            .pending_ids(event)
             .into_iter()
             .map(String::from)
             .collect();
@@ -746,7 +816,7 @@ impl State {
                 .any(|id| self.matcher.get(id).is_some_and(|s| s.meaning.is_some()));
             let mut event_vec: Option<Vec<f32>> = None;
             if needs_embedding {
-                match self.semantic.embed_event(&event) {
+                match self.semantic.embed_event(event) {
                     Ok(v) => event_vec = Some(v),
                     Err(e) => {
                         eprintln!("pherd: semantic tier unavailable for {}: {e}", event.id)
@@ -780,9 +850,9 @@ impl State {
                     continue;
                 }
                 if sub.judge.is_some() {
-                    deliveries += self.judge_gate(&sub_id, &sub, &event, meaning_record);
+                    deliveries += self.judge_gate(&sub_id, &sub, event, meaning_record);
                 } else if let Some(record) = meaning_record {
-                    deliveries += self.deliver_semantic(&sub_id, &sub, &event, record);
+                    deliveries += self.deliver_semantic(&sub_id, &sub, event, record);
                 }
             }
             if let Some(vec) = event_vec {
@@ -790,7 +860,7 @@ impl State {
                 self.semantic.record_event(now, &event.id, vec);
             }
         }
-        Ok((seq, deliveries))
+        Ok(deliveries)
     }
 
     /// Tier 4 admission: cached verdicts apply instantly (replay never
@@ -984,8 +1054,8 @@ impl State {
             ));
         }
         event.hops = Some(hops);
-        let (seq, deliveries) = self.ingest_envelope(event.clone())?;
-        Ok(json!({ "ok": true, "id": event.id, "seq": seq, "deliveries": deliveries }))
+        let seq = self.ingest_envelope(event.clone())?;
+        Ok(json!({ "ok": true, "id": event.id, "seq": seq }))
     }
 
     fn persist_grants(&self) -> anyhow::Result<()> {
@@ -1795,6 +1865,23 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         });
     }
 
+    // Follower: the matcher runs here, off the ingest path. Small batches
+    // under the lock so emitters interleave; the nudge keeps the happy path
+    // at one wake-up per append, the 1s tick is the safety net.
+    {
+        let (ftx, frx) = mpsc::channel::<()>();
+        state.lock().unwrap().follower_tx = Some(ftx);
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || loop {
+            let processed = state.lock().unwrap().follow_step(FOLLOWER_BATCH);
+            if processed == 0 {
+                let _ = frx.recv_timeout(Duration::from_secs(1));
+                // Collapse a burst of nudges into one pass.
+                while frx.try_recv().is_ok() {}
+            }
+        });
+    }
+
     // Outbox worker: outbound HTTP deliveries with retry. Attempts happen
     // off the state lock; a nudge after enqueue keeps the happy path fast,
     // the 1s tick catches scheduled retries.
@@ -2049,6 +2136,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
                 "build": if cfg!(debug_assertions) { "debug" } else { "release" },
                 "subscriptions": s.matcher.len(),
                 "nextSeq": s.next_seq,
+                "matchedThrough": s.matched_through,
                 "armedTimers": s.timers.len(),
                 "tails": s.tails.len(),
                 "listeners": s.listeners.len(),
@@ -2722,5 +2810,128 @@ mod grant_tests {
         };
         assert_eq!(def.fingerprint().len(), 12);
         assert!(def.compile().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod follower_tests {
+    use super::*;
+
+    fn fresh_home(tag: &str) -> Paths {
+        let home = std::env::temp_dir().join(format!("pher-follower-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        Paths { home }
+    }
+
+    fn partial(subject: &str) -> PartialEvent {
+        PartialEvent {
+            subject: subject.to_string(),
+            payload: Some(json!({ "k": 1 })),
+            event_type: None,
+            source: Some("test".to_string()),
+            correlation: None,
+        }
+    }
+
+    #[test]
+    fn ingest_appends_only_and_follower_runs_the_cascade() {
+        let paths = fresh_home("split");
+        let mut s = State::load(paths).unwrap();
+        s.register("on a.b then emit c.d", &[], None).unwrap();
+        s.drain(); // the registration's own pher.subscription.registered event
+
+        let ack = s.ingest(partial("a.b"), 0).unwrap();
+        let seq = ack["seq"].as_u64().unwrap();
+        assert!(
+            ack.get("deliveries").is_none(),
+            "ack carries no match result"
+        );
+        // Durable and visible before any matching happened.
+        assert_eq!(s.db.max_seq().unwrap(), Some(seq));
+        assert!(s.matched_through < seq);
+        assert!(s.db.event_by_id("nope").unwrap().is_none());
+        assert_eq!(
+            s.db.events_next(seq, 10).unwrap().len(),
+            0,
+            "no re-emit yet"
+        );
+
+        assert_eq!(s.follow_step(32), 1);
+        assert_eq!(s.matched_through, seq);
+        assert_eq!(s.db.matched_through().unwrap(), Some(seq));
+        let re = s.db.events_next(seq, 10).unwrap();
+        let subjects: Vec<_> = re.iter().map(|(_, e)| e.subject.clone()).collect();
+        assert_eq!(
+            re.len(),
+            1,
+            "the emit sink re-ingested one event: {subjects:?}"
+        );
+        assert_eq!(re[0].1.subject, "c.d");
+        assert_eq!(re[0].1.hops, Some(1));
+
+        // Draining processes the re-emitted event too (no match, position moves).
+        assert_eq!(s.drain(), 1);
+        assert_eq!(s.matched_through, re[0].0);
+        assert_eq!(s.follow_step(32), 0);
+    }
+
+    #[test]
+    fn follower_position_survives_restart_and_replays_the_gap() {
+        let paths = fresh_home("restart");
+        {
+            let mut s = State::load(paths.clone()).unwrap();
+            s.drain();
+            s.register("on a.b then emit c.d", &[], None).unwrap();
+            s.ingest(partial("a.b"), 0).unwrap();
+            s.ingest(partial("a.b"), 0).unwrap();
+            // "Crash" before the follower ran.
+        }
+        let mut s = State::load(paths).unwrap();
+        let head = s.db.max_seq().unwrap().unwrap();
+        assert!(s.matched_through < head, "gap is remembered across restart");
+        s.drain();
+        assert_eq!(s.matched_through, s.db.max_seq().unwrap().unwrap());
+        let cds: Vec<_> =
+            s.db.events_after(Some(0), None)
+                .unwrap()
+                .into_iter()
+                .filter(|(_, e)| e.subject == "c.d")
+                .collect();
+        assert_eq!(
+            cds.len(),
+            2,
+            "both unprocessed events matched after restart"
+        );
+    }
+
+    #[test]
+    fn pre_split_database_starts_caught_up() {
+        let paths = fresh_home("legacy");
+        {
+            let db = crate::db::Db::open(&paths).unwrap();
+            for seq in 1..=5u64 {
+                let ev = Envelope {
+                    id: format!("E.{seq}"),
+                    ts: "2026-08-01T00:00:00Z".into(),
+                    node: "n".into(),
+                    source: "s".into(),
+                    event_type: "a.b".into(),
+                    subject: "a.b".into(),
+                    correlation: None,
+                    payload: Value::Null,
+                    ttl_class: None,
+                    hops: None,
+                };
+                db.append_event(seq, &ev).unwrap();
+            }
+            assert!(db.matched_through().unwrap().is_none());
+        }
+        let mut s = State::load(paths).unwrap();
+        assert_eq!(
+            s.matched_through, 5,
+            "old events were matched at ingest; never replay them"
+        );
+        assert_eq!(s.follow_step(32), 0);
     }
 }

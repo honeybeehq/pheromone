@@ -31,8 +31,9 @@ export interface Delivery {
 
 export interface EmitResult {
   id: string;
+  /** Log position. The event is durable and tail-visible when emit returns;
+   * matching runs in the daemon's follower, so deliveries land after the ack. */
   seq: number;
-  deliveries: number;
 }
 
 export interface WhenResult {
