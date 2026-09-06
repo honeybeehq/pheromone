@@ -70,7 +70,9 @@ retry after persist failure cannot leave two timers. Catch-up
 returns an error and the listener disconnects rather than advancing
 past an undurable arm. The follower does not move `matched_through`
 onto a seq whose cascade failed; the same seq is retried. That is not
-a catch-up-style disconnect. `last_sent` is output dedup
+a catch-up-style disconnect. For one event, every matching listener's
+timer persist runs before any delivery, limit, or shaping, so a failed
+expect persist cannot leave a sibling stream already delivered. `last_sent` is output dedup
 only; it is not the limit/shaping/expect boundary. Hold overflow is the
 same lag disconnect as the live queue.
 

@@ -833,7 +833,7 @@ impl State {
                 ids.push(id);
             }
         }
-        let mut deliveries = 0u64;
+        let mut proceed = Vec::new();
         for sub_id in ids {
             if !matches!(
                 self.hold_listen_catchup(&sub_id, seq, event),
@@ -841,7 +841,17 @@ impl State {
             ) {
                 continue;
             }
-            deliveries += self.apply_to_listener(&sub_id, seq, event)?;
+            proceed.push(sub_id);
+        }
+        // Fallible timer persist for every matching listener before any
+        // irreversible delivery, limit, or shaping. Otherwise a later persist
+        // failure retries the seq and re-delivers listeners that already ran.
+        for sub_id in &proceed {
+            self.apply_timer_phase(sub_id, seq, event)?;
+        }
+        let mut deliveries = 0u64;
+        for sub_id in &proceed {
+            deliveries += self.apply_delivery_phase(sub_id, seq, event);
         }
 
         // Tiers 3-4: subscriptions whose tiers 1-2 passed but carry `meaning`
@@ -1647,21 +1657,36 @@ impl State {
         seq: u64,
         event: &Envelope,
     ) -> Result<u64, String> {
+        self.apply_timer_phase(sub_id, seq, event)?;
+        Ok(self.apply_delivery_phase(sub_id, seq, event))
+    }
+
+    fn apply_timer_phase(
+        &mut self,
+        sub_id: &str,
+        seq: u64,
+        event: &Envelope,
+    ) -> Result<(), String> {
         self.current_seq = Some(seq);
         self.disarm_listener_timers(sub_id, event)?;
         let Some(sub) = self.matcher.get(sub_id).cloned() else {
-            return Ok(0);
+            return Ok(());
         };
-        match check(&sub, event, None) {
-            Check::Matched => {
-                if sub.expect.is_some() {
-                    self.arm_expect_timer(sub_id, &sub, event, seq)?;
-                    Ok(0)
-                } else {
-                    Ok(self.try_deliver(sub_id, event).unwrap_or(0))
-                }
-            }
-            _ => Ok(0),
+        if matches!(check(&sub, event, None), Check::Matched) && sub.expect.is_some() {
+            self.arm_expect_timer(sub_id, &sub, event, seq)?;
+        }
+        Ok(())
+    }
+
+    fn apply_delivery_phase(&mut self, sub_id: &str, seq: u64, event: &Envelope) -> u64 {
+        self.current_seq = Some(seq);
+        let Some(sub) = self.matcher.get(sub_id).cloned() else {
+            return 0;
+        };
+        if matches!(check(&sub, event, None), Check::Matched) && sub.expect.is_none() {
+            self.try_deliver(sub_id, event).unwrap_or(0)
+        } else {
+            0
         }
     }
 
@@ -3437,10 +3462,15 @@ mod follower_tests {
     }
 
     fn persisted_timer_origin_ids(s: &State, sub_id: &str) -> Vec<String> {
-        let Ok(text) = std::fs::read_to_string(s.paths.timers()) else {
-            return Vec::new();
+        let path = s.paths.timers();
+        let text = match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => panic!("read timers {}: {e}", path.display()),
+            Ok(t) if t.trim().is_empty() => return Vec::new(),
+            Ok(t) => t,
         };
-        let timers: Vec<Timer> = serde_json::from_str(&text).unwrap_or_default();
+        let timers: Vec<Timer> = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("parse timers {}: {e}", path.display()));
         timers
             .into_iter()
             .filter(|t| t.sub_id == sub_id)
@@ -4452,6 +4482,55 @@ mod follower_tests {
             assert!(timer_origin_ids(&s, &att.id).is_empty());
             assert!(persisted_timer_origin_ids(&s, &att.id).is_empty());
         }
+    }
+
+    #[test]
+    fn review_timer_retry_does_not_repeat_successful_listener() {
+        let paths = fresh_home("review-partial-cascade");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let plain = attach_listener(
+            &state,
+            "on job.started then stream limit 2",
+            &[],
+            "test",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let expect = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        let before = s.matched_through;
+        ingest_job(&mut s, "job.started", "review-partial");
+        let head = s.log.head_seq().unwrap();
+        let origin = s.log.read(Pos::local(head), 1).unwrap().pop().unwrap().1;
+        let order = s.matcher.match_ids(&origin);
+        assert_eq!(
+            order,
+            vec![plain.id.as_str(), expect.id.as_str()],
+            "fixture must deliver before failed timer arm"
+        );
+        s.fail_persist_timers = true;
+        s.follow_step(256);
+        assert_eq!(s.matched_through, before);
+        assert!(
+            drain_rx(&plain.rx).is_empty(),
+            "timer persist must fail before irreversible delivery"
+        );
+        s.fail_persist_timers = false;
+        s.follow_step(256);
+        assert_eq!(timer_origin_ids(&s, &expect.id).len(), 1);
+        assert_eq!(drain_rx(&plain.rx), vec![origin.id.clone()]);
+        assert!(
+            s.matcher.get(&plain.id).is_some(),
+            "limit must not be consumed twice on retry"
+        );
+        s.follow_step(256);
+        assert!(
+            drain_rx(&plain.rx).is_empty(),
+            "retry must not repeat delivery to an already successful listener"
+        );
     }
 
     #[test]
