@@ -20,13 +20,15 @@ Two rusqlite connections to `pher.db`. SqliteLog is the only writer of
 `events` and `log_state`. Seed is one `BEGIN IMMEDIATE` (`INSERT OR IGNORE`
 head/floor). Concurrent first opens cannot lower a persisted head. Leftover
 pre-A1 rows are adopted only when head is still 0 in that transaction.
-First-open is serialized with an atomic `pher.db.initlock` directory
-(create_dir). `Connection::open` is retried on SQLITE_BUSY before any
-pragma: that call can fail with code 5 while the busy handler is still
-unset. Then `busy_timeout` is installed, and WAL/schema/seed retry
-SQLITE_BUSY and SQLITE_LOCKED (code + "database is locked" display,
-32 attempts, 1–50ms). Tested with 24 isolated adopt-head pairs and
-24 isolated 4-way fresh-path opens.
+
+Pinned rusqlite 0.32.1 installs `sqlite3_busy_timeout(5000)` inside
+`Connection::open`. First-open still wraps WAL/schema/seed in a bounded
+retry on typed `ErrorCode::DatabaseBusy` and `DatabaseLocked` (32
+attempts, 1–50ms), because `PRAGMA journal_mode=WAL` does not always
+invoke the busy handler. Independently verified at de71087 (40
+processes / 960 fresh paths). No mkdir init lock; no string-error
+classification. Tests: 24 isolated adopt-head pairs and 24 isolated
+4-way fresh-path opens.
 
 ## Retention vs since
 

@@ -4,7 +4,7 @@
 //! floor). Sequence numbers are assigned here, never by callers. Head survives
 //! a full trim so the next append cannot reuse a seq.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -21,8 +21,8 @@ pub const MAX_READ: usize = 4096;
 pub const LOG_PAGE: usize = 256;
 /// SQLite INTEGER is signed. Seq values above this cannot be stored.
 pub const SEQ_MAX: u64 = i64::MAX as u64;
-/// Short wait so WAL/schema init returns BUSY quickly when the handler
-/// is not invoked; the retry loop below is the real bound.
+/// Inner first-open attempt. rusqlite 0.32.1 already sets 5000ms on
+/// Connection::open; WAL/schema still retry via `retry_busy`.
 pub(crate) const INIT_BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 /// Writer operations after init (append, seed retry leftover).
 pub(crate) const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -30,20 +30,13 @@ const INIT_ATTEMPTS: u32 = 32;
 const INIT_BACKOFF_CAP: Duration = Duration::from_millis(50);
 
 pub(crate) fn sqlite_busy_or_locked(err: &rusqlite::Error) -> bool {
-    match err.sqlite_error_code() {
-        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => true,
-        _ => {
-            let s = err.to_string().to_ascii_lowercase();
-            s.contains("database is locked") || s.contains("database table is locked")
-        }
-    }
+    matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 pub(crate) fn is_busy_or_locked_anyhow(err: &anyhow::Error) -> bool {
-    let s = format!("{err:#}").to_ascii_lowercase();
-    if s.contains("database is locked") || s.contains("database table is locked") {
-        return true;
-    }
     err.chain().any(|cause| {
         cause
             .downcast_ref::<rusqlite::Error>()
@@ -68,62 +61,6 @@ pub(crate) fn retry_busy<T>(mut once: impl FnMut() -> anyhow::Result<T>) -> anyh
         }
     }
     Err(last.expect("busy retry exhausted"))
-}
-
-fn retry_sqlite<T>(mut once: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
-    let mut backoff = Duration::from_millis(1);
-    let mut last = None;
-    for attempt in 1..=INIT_ATTEMPTS {
-        match once() {
-            Ok(v) => return Ok(v),
-            Err(e) if sqlite_busy_or_locked(&e) && attempt < INIT_ATTEMPTS => {
-                last = Some(e);
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(INIT_BACKOFF_CAP);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(last.expect("sqlite busy retry exhausted"))
-}
-
-fn init_lock_dir(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_os_string();
-    s.push(".initlock");
-    PathBuf::from(s)
-}
-
-/// Serializes first-open WAL conversion across connections/processes.
-/// `create_dir` is the atomic lock. Drop removes it only if this caller holds it.
-pub(crate) struct InitDirLock {
-    dir: PathBuf,
-    held: bool,
-}
-
-impl Drop for InitDirLock {
-    fn drop(&mut self) {
-        if self.held {
-            let _ = std::fs::remove_dir(&self.dir);
-        }
-    }
-}
-
-pub(crate) fn acquire_init_lock(db_path: &Path) -> anyhow::Result<InitDirLock> {
-    let dir = init_lock_dir(db_path);
-    let mut backoff = Duration::from_millis(1);
-    for _ in 1..=INIT_ATTEMPTS {
-        match std::fs::create_dir(&dir) {
-            Ok(()) => {
-                return Ok(InitDirLock { dir, held: true });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(INIT_BACKOFF_CAP);
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(InitDirLock { dir, held: false })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,40 +144,39 @@ pub struct SqliteLog {
 
 impl SqliteLog {
     pub fn open_path(path: &Path) -> anyhow::Result<SqliteLog> {
-        let _init = acquire_init_lock(path)?;
         retry_busy(|| Self::open_path_once(path))
     }
 
     fn open_path_once(path: &Path) -> anyhow::Result<SqliteLog> {
-        // Connection::open itself can return SQLITE_BUSY before any timeout
-        // is installed (concurrent create / WAL conversion).
-        let conn = retry_sqlite(|| Connection::open(path))
-            .with_context(|| format!("cannot open {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        // rusqlite 0.32.1 already calls sqlite3_busy_timeout(5000) in
+        // Connection::open. PRAGMA journal_mode=WAL still sometimes returns
+        // SQLITE_BUSY without invoking that handler; retry_busy wraps this
+        // whole first-open. The explicit timeout here is the inner attempt.
         conn.busy_timeout(INIT_BUSY_TIMEOUT)?;
-        retry_sqlite(|| conn.pragma_update(None, "journal_mode", "WAL"))?;
-        retry_sqlite(|| conn.pragma_update(None, "synchronous", "FULL"))?;
-        retry_sqlite(|| {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS events (
-                    seq      INTEGER PRIMARY KEY,
-                    id       TEXT NOT NULL,
-                    ts       TEXT NOT NULL,
-                    subject  TEXT NOT NULL,
-                    envelope TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS events_id ON events(id);
-                CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
-                CREATE TABLE IF NOT EXISTS log_state (
-                    key   TEXT PRIMARY KEY,
-                    value INTEGER NOT NULL
-                );",
-            )
-        })?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS events (
+                seq      INTEGER PRIMARY KEY,
+                id       TEXT NOT NULL,
+                ts       TEXT NOT NULL,
+                subject  TEXT NOT NULL,
+                envelope TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS events_id ON events(id);
+            CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+            CREATE TABLE IF NOT EXISTS log_state (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );",
+        )?;
         conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
         let log = SqliteLog {
             conn: Mutex::new(conn),
         };
-        retry_busy(|| log.seed_state())?;
+        log.seed_state()?;
         Ok(log)
     }
 
@@ -894,16 +830,6 @@ mod tests {
             .unwrap();
         assert!(log.read(Pos::local(SEQ_MAX + 1), 8).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn busy_detection_matches_locked_display() {
-        assert!(is_busy_or_locked_anyhow(&anyhow::anyhow!(
-            "database is locked"
-        )));
-        assert!(is_busy_or_locked_anyhow(&anyhow::anyhow!(
-            "cannot open /tmp/pher.db: database is locked"
-        )));
     }
 
     fn unique_dir(tag: &str) -> std::path::PathBuf {

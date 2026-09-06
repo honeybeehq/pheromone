@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::store::Paths;
-use crate::traillog::{acquire_init_lock, retry_busy, INIT_BUSY_TIMEOUT, WRITER_BUSY_TIMEOUT};
+use crate::traillog::{retry_busy, INIT_BUSY_TIMEOUT, WRITER_BUSY_TIMEOUT};
 
 pub struct Db {
     conn: Connection,
@@ -26,7 +26,6 @@ impl Db {
     pub fn open(paths: &Paths) -> anyhow::Result<Db> {
         paths.ensure()?;
         let path = paths.home.join("pher.db");
-        let _init = acquire_init_lock(&path)?;
         let conn = retry_busy(|| {
             let conn = Connection::open(&path)
                 .with_context(|| format!("cannot open {}", path.display()))?;
