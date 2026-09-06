@@ -13,6 +13,7 @@ mod semantic;
 mod service;
 mod store;
 mod tap;
+mod traillog;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};

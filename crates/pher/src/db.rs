@@ -1,8 +1,7 @@
-//! SQLite storage for the growing logs: events, deliveries, judge verdicts,
-//! the semantic vector window, and the cross-trail dedup window. One WAL-mode
-//! database (`pher.db`), so kill -9 keeps every committed transaction and
-//! reads are indexed instead of whole-file scans — the JSONL logs stopped
-//! scaling the moment a real tap (hive, hundreds of events/min) landed.
+//! SQLite storage for control state: deliveries, judge verdicts, the semantic
+//! vector window, forwarded-dedup, matcher position, and `event_by_id` (a side
+//! index over `events`). Event allocation and retention live in `SqliteLog`.
+//! One WAL-mode database (`pher.db`).
 //!
 //! Small operator state (subs, timers, cursors, grants, bridges, outbox,
 //! conditions) stays as human-readable JSON files: tiny, atomic via
@@ -150,78 +149,7 @@ impl Db {
         Ok(())
     }
 
-    // -- events ---------------------------------------------------------------
-
-    pub fn append_event(&self, seq: u64, event: &Envelope) -> anyhow::Result<()> {
-        self.conn.execute(
-            "INSERT INTO events (seq, id, ts, subject, envelope) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                seq,
-                event.id,
-                event.ts,
-                event.subject,
-                serde_json::to_string(event)?
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn max_seq(&self) -> anyhow::Result<Option<u64>> {
-        Ok(self
-            .conn
-            .query_row("SELECT MAX(seq) FROM events", [], |r| {
-                r.get::<_, Option<u64>>(0)
-            })?)
-    }
-
-    /// Events with seq > after, ascending. `limit_last` keeps only the most
-    /// recent N of the range (console feeds want context, not history).
-    pub fn events_after(
-        &self,
-        after: Option<u64>,
-        limit_last: Option<usize>,
-    ) -> anyhow::Result<Vec<(u64, Envelope)>> {
-        let mut rows = match limit_last {
-            Some(n) => {
-                let mut stmt = self.conn.prepare_cached(
-                    "SELECT seq, envelope FROM (
-                        SELECT seq, envelope FROM events WHERE seq > ?1 ORDER BY seq DESC LIMIT ?2
-                     ) ORDER BY seq ASC",
-                )?;
-                let rows: Vec<_> = stmt
-                    .query_map(params![after.unwrap_or(0), n as u64], row_to_event)?
-                    .filter_map(Result::ok)
-                    .collect();
-                rows
-            }
-            None => {
-                let mut stmt = self.conn.prepare_cached(
-                    "SELECT seq, envelope FROM events WHERE seq > ?1 ORDER BY seq ASC",
-                )?;
-                let rows: Vec<_> = stmt
-                    .query_map(params![after.unwrap_or(0)], row_to_event)?
-                    .filter_map(Result::ok)
-                    .collect();
-                rows
-            }
-        };
-        rows.retain(|(_, e)| !e.id.is_empty());
-        Ok(rows)
-    }
-
-    /// The next `max` events with seq > after, ascending — the follower's
-    /// read shape (oldest unprocessed first, bounded).
-    pub fn events_next(&self, after: u64, max: usize) -> anyhow::Result<Vec<(u64, Envelope)>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT seq, envelope FROM events WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
-        )?;
-        let mut rows: Vec<_> = stmt
-            .query_map(params![after, max as u64], row_to_event)?
-            .filter_map(Result::ok)
-            .collect();
-        rows.retain(|(_, e)| !e.id.is_empty());
-        Ok(rows)
-    }
+    // -- events (side index only; SqliteLog owns allocation and retention) ---
 
     // -- meta (small durable markers) ----------------------------------------
 
@@ -246,18 +174,6 @@ impl Db {
             params![seq.to_string()],
         )?;
         Ok(())
-    }
-
-    /// Events at or after an RFC3339 timestamp (time-based `since` replay).
-    pub fn events_since_ts(&self, ts: &str) -> anyhow::Result<Vec<(u64, Envelope)>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT seq, envelope FROM events WHERE ts >= ?1 ORDER BY seq ASC")?;
-        let rows = stmt
-            .query_map(params![ts], row_to_event)?
-            .filter_map(Result::ok)
-            .collect();
-        Ok(rows)
     }
 
     pub fn event_by_id(&self, id: &str) -> anyhow::Result<Option<Envelope>> {
@@ -381,8 +297,6 @@ impl Db {
         forwarded_keep: usize,
     ) -> anyhow::Result<()> {
         self.conn
-            .execute("DELETE FROM events WHERE ts < ?1", params![ts_cutoff])?;
-        self.conn
             .execute("DELETE FROM deliveries WHERE ts < ?1", params![ts_cutoff])?;
         self.conn
             .execute("DELETE FROM verdicts WHERE ts < ?1", params![unix_cutoff])?;
@@ -394,24 +308,6 @@ impl Db {
         )?;
         Ok(())
     }
-}
-
-fn row_to_event(r: &rusqlite::Row) -> rusqlite::Result<(u64, Envelope)> {
-    let seq: u64 = r.get(0)?;
-    let text: String = r.get(1)?;
-    let event = serde_json::from_str::<Envelope>(&text).unwrap_or_else(|_| Envelope {
-        id: String::new(),
-        ts: String::new(),
-        node: String::new(),
-        source: String::new(),
-        event_type: String::new(),
-        subject: String::new(),
-        correlation: None,
-        payload: Value::Null,
-        ttl_class: None,
-        hops: None,
-    });
-    Ok((seq, event))
 }
 
 fn f32s_to_blob(v: &[f32]) -> Vec<u8> {
@@ -444,6 +340,7 @@ pub fn migrated_backup_paths(paths: &Paths) -> Vec<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traillog::TrailLog;
 
     fn open_tmp(name: &str) -> (Db, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("pher-db-{name}-{}", std::process::id()));
@@ -453,42 +350,38 @@ mod tests {
         (Db::open(&paths).unwrap(), dir)
     }
 
-    fn ev(seq: u64, subject: &str) -> Envelope {
-        Envelope {
-            id: format!("PH.{seq}"),
-            ts: format!("2026-08-12T00:00:{seq:02}.000Z"),
+    #[test]
+    fn event_by_id_reads_sqlite_log_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "pher-db-byid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths { home: dir.clone() };
+        let db = Db::open(&paths).unwrap();
+        let log = crate::traillog::SqliteLog::open(&paths).unwrap();
+        log.append(&[Envelope {
+            id: "PH.5".into(),
+            ts: "2026-08-12T00:00:05.000Z".into(),
             node: "n".into(),
             source: "s".into(),
-            event_type: subject.into(),
-            subject: subject.into(),
+            event_type: "demo.tick".into(),
+            subject: "demo.tick".into(),
             correlation: None,
-            payload: serde_json::json!({"n": seq}),
+            payload: serde_json::json!({"n": 5}),
             ttl_class: None,
             hops: None,
-        }
-    }
-
-    #[test]
-    fn events_roundtrip_ranges_and_gc() {
-        let (db, dir) = open_tmp("events");
-        for i in 1..=10u64 {
-            db.append_event(i, &ev(i, "demo.tick")).unwrap();
-        }
-        assert_eq!(db.max_seq().unwrap(), Some(10));
-        assert_eq!(db.events_after(Some(7), None).unwrap().len(), 3);
-        let last2 = db.events_after(None, Some(2)).unwrap();
-        assert_eq!(
-            last2.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-            vec![9, 10]
-        );
+        }])
+        .unwrap();
         assert_eq!(
             db.event_by_id("PH.5").unwrap().unwrap().payload["n"],
             serde_json::json!(5)
         );
         assert!(db.event_by_id("PH.nope").unwrap().is_none());
-        assert_eq!(db.events_since_ts("2026-08-12T00:00:08").unwrap().len(), 3);
-        db.gc("2026-08-12T00:00:06", 0, 10).unwrap();
-        assert_eq!(db.events_after(None, None).unwrap().len(), 5);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -527,14 +420,20 @@ not json — torn line survives migration
         .unwrap();
         std::fs::write(paths.forwarded(), "{\"id\":\"D1\"}\n{\"id\":\"D1\"}\n").unwrap();
         let db = Db::open(&paths).unwrap();
-        assert_eq!(db.events_after(None, None).unwrap().len(), 2);
+        assert_eq!(db.event_by_id("PH.a").unwrap().unwrap().subject, "a.b");
+        assert_eq!(db.event_by_id("PH.b").unwrap().unwrap().subject, "a.c");
         assert_eq!(db.load_forwarded(10).unwrap(), vec!["D1"]);
         assert!(!paths.events().exists());
         assert!(paths.home.join("events.jsonl.migrated").exists());
-        // Re-open: no double import.
+        let log = crate::traillog::SqliteLog::open(&paths).unwrap();
+        assert_eq!(
+            log.head_seq().unwrap(),
+            2,
+            "jsonl import seeds log_state.head from MAX(seq)"
+        );
         drop(db);
         let db = Db::open(&paths).unwrap();
-        assert_eq!(db.events_after(None, None).unwrap().len(), 2);
+        assert_eq!(db.event_by_id("PH.a").unwrap().unwrap().id, "PH.a");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

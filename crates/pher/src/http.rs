@@ -134,7 +134,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             let after = v.get("after").and_then(|a| a.as_u64());
             let subject = v.get("subject").and_then(|s| s.as_str()).map(String::from);
             let last = v.get("last").and_then(|l| l.as_u64()).map(|l| l as usize);
-            let (backlog, rx, _) =
+            let attached =
                 match crate::daemon::attach_tail(&state, after, subject, last.or(Some(100))) {
                     Ok(t) => t,
                     Err(e) => return respond(request, 400, e),
@@ -145,19 +145,32 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                 return;
             }
             let mut last_sent = after.unwrap_or(0);
-            for (seq, event) in backlog {
-                if write_chunk(
-                    &mut writer,
-                    &format!("{}\n", json!({"seq": seq, "event": event})),
-                )
-                .is_err()
-                {
-                    return;
-                }
-                last_sent = seq;
+            let mut write_ok = true;
+            crate::daemon::page_tail_backlog(
+                &attached.log,
+                attached.after,
+                attached.last,
+                attached.pattern.as_ref(),
+                attached.through,
+                |seq, event| {
+                    if write_chunk(
+                        &mut writer,
+                        &format!("{}\n", json!({"seq": seq, "event": event})),
+                    )
+                    .is_err()
+                    {
+                        write_ok = false;
+                        return false;
+                    }
+                    last_sent = seq;
+                    true
+                },
+            );
+            if !write_ok {
+                return;
             }
             loop {
-                match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                match attached.rx.recv_timeout(std::time::Duration::from_secs(5)) {
                     Ok(line) => {
                         let seq = serde_json::from_str::<Value>(&line)
                             .ok()

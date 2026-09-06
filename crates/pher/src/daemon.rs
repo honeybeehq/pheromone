@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc;
@@ -14,6 +14,7 @@ use pher_core::{ids, Envelope, Matcher, Sink, SubjectPattern, Subscription};
 
 use crate::protocol::{err, ok, PartialEvent, Request};
 use crate::store::{write_json_atomic, Paths};
+use crate::traillog::{for_each_page, Pos, SqliteLog, TrailError, TrailLog, LOG_PAGE};
 
 const DEFAULT_RETENTION_SECS: u64 = 7 * 86400;
 const MAX_EMIT_HOPS: u32 = 8;
@@ -105,10 +106,11 @@ pub(crate) struct State {
     /// SQLite storage for the growing logs (events, deliveries, verdicts,
     /// vectors, forwarded-dedup). Small operator state stays in JSON files.
     db: crate::db::Db,
+    /// Event log. Owns sequence allocation and the retention floor.
+    log: Arc<SqliteLog>,
     node: String,
     matcher: Matcher,
     metas: HashMap<String, SubMeta>,
-    next_seq: u64,
     /// Log seq the matcher has processed through (inclusive). Ingest only
     /// appends; the follower advances this as it runs the cascade, and
     /// commits it to the db after each batch. A crash between append and
@@ -320,12 +322,14 @@ impl State {
         }
 
         let db = crate::db::Db::open(&paths)?;
-        let next_seq = db.max_seq()?.map(|s| s + 1).unwrap_or(1);
+        // After Db so jsonl event import is visible when we seed log_state.head.
+        let log = Arc::new(SqliteLog::open(&paths)?);
+        let head = log.head_seq()?;
         // A database from before the ingest/match split has no marker: every
         // event in it was matched synchronously at ingest, so start caught up.
         let matched_through = match db.matched_through()? {
-            Some(m) => m.min(next_seq - 1),
-            None => next_seq - 1,
+            Some(m) => m.min(head),
+            None => head,
         };
         db.set_matched_through(matched_through)?;
 
@@ -426,10 +430,10 @@ impl State {
         let mut state = State {
             paths,
             db,
+            log,
             node,
             matcher,
             metas,
-            next_seq,
             matched_through,
             follower_tx: None,
             timers,
@@ -662,12 +666,7 @@ impl State {
         if sub.then.sink != Sink::Stream {
             if let Some(replay) = sub.replay.clone() {
                 let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
-                for (seq, event) in self.read_events_since_ts(&cutoff) {
-                    self.current_seq = Some(seq);
-                    if let Some(n) = self.try_deliver(&id, &event) {
-                        replayed += n;
-                    }
-                }
+                replayed += self.replay_from_ts(&id, &cutoff);
             }
         }
 
@@ -711,16 +710,15 @@ impl State {
     /// visible to tails before return; the cascade runs later in the
     /// follower (`follow_step`), so ingest latency never includes matching.
     fn ingest_envelope(&mut self, event: Envelope) -> Result<u64, String> {
-        let seq = self.next_seq;
-        self.db
-            .append_event(seq, &event)
+        let pos = self
+            .log
+            .append(std::slice::from_ref(&event))
             .map_err(|e| e.to_string())?;
-        self.next_seq += 1;
-        self.notify_tails(seq, &event);
+        self.notify_tails(pos.seq, &event);
         if let Some(tx) = &self.follower_tx {
             let _ = tx.send(());
         }
-        Ok(seq)
+        Ok(pos.seq)
     }
 
     /// Follower step: run the cascade over the next `max` unprocessed log
@@ -728,22 +726,39 @@ impl State {
     /// (0 = caught up). Called under the state lock in small batches so
     /// ingest interleaves; tests call it directly to drain synchronously.
     pub(crate) fn follow_step(&mut self, max: usize) -> usize {
-        let batch = match self.db.events_next(self.matched_through, max) {
+        let from = Pos::local(self.matched_through.saturating_add(1));
+        let n = max.clamp(1, LOG_PAGE);
+        let batch = match self.log.read(from, n) {
             Ok(b) => b,
+            Err(TrailError::Trimmed { resume_at }) => {
+                self.matched_through = resume_at.seq.saturating_sub(1);
+                match self.log.read(resume_at, n) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("pherd: follower read failed: {e}");
+                        let _ = self.db.set_matched_through(self.matched_through);
+                        return 0;
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("pherd: follower read failed: {e}");
                 return 0;
             }
         };
         if batch.is_empty() {
+            let _ = self.db.set_matched_through(self.matched_through);
             return 0;
         }
         let mut processed = 0;
-        for (seq, event) in batch {
-            if let Err(e) = self.process_event(seq, &event) {
-                eprintln!("pherd: cascade failed for {} (seq {seq}): {e}", event.id);
+        for (pos, event) in batch {
+            if let Err(e) = self.process_event(pos.seq, &event) {
+                eprintln!(
+                    "pherd: cascade failed for {} (seq {}): {e}",
+                    event.id, pos.seq
+                );
             }
-            self.matched_through = seq;
+            self.matched_through = pos.seq;
             processed += 1;
         }
         if let Err(e) = self.db.set_matched_through(self.matched_through) {
@@ -1697,12 +1712,58 @@ impl State {
 
     // -- events / tail / introspection -------------------------------------
 
-    fn read_events(&self, after: Option<u64>) -> Vec<(u64, Envelope)> {
-        self.db.events_after(after, None).unwrap_or_default()
+    fn log_head(&self) -> u64 {
+        self.log
+            .head()
+            .ok()
+            .and_then(|h| h.first().map(|p| p.seq))
+            .unwrap_or(0)
     }
 
-    fn read_events_since_ts(&self, ts: &str) -> Vec<(u64, Envelope)> {
-        self.db.events_since_ts(ts).unwrap_or_default()
+    /// Page `since` catch-up: seek by envelope.ts, then inclusive seq reads.
+    fn replay_from_ts(&mut self, sub_id: &str, ts: &str) -> u64 {
+        let from = match self.log.seek_ts(0, ts) {
+            Ok(p) => p.seq,
+            Err(e) => {
+                eprintln!("pherd: seek_ts failed: {e}");
+                return 0;
+            }
+        };
+        self.replay_from_seq(sub_id, from).1
+    }
+
+    /// Page deliveries from `from_seq` inclusive. Returns (first seq seen, count).
+    fn replay_from_seq(&mut self, sub_id: &str, from_seq: u64) -> (Option<u64>, u64) {
+        let mut first = None;
+        let mut replayed = 0u64;
+        let mut from = from_seq;
+        loop {
+            let page = match self.log.read(Pos::local(from.max(1)), LOG_PAGE) {
+                Ok(p) => p,
+                Err(TrailError::Trimmed { resume_at }) => {
+                    from = resume_at.seq;
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("pherd: log read failed: {e}");
+                    break;
+                }
+            };
+            if page.is_empty() {
+                break;
+            }
+            for (pos, event) in page {
+                if first.is_none() {
+                    first = Some(pos.seq);
+                }
+                self.current_seq = Some(pos.seq);
+                if let Some(n) = self.try_deliver(sub_id, &event) {
+                    replayed += n;
+                }
+                from = pos.seq.saturating_add(1);
+            }
+        }
+        (first, replayed)
     }
 
     fn notify_tails(&mut self, seq: u64, event: &Envelope) {
@@ -1720,6 +1781,9 @@ impl State {
     fn gc(&mut self) -> anyhow::Result<()> {
         let cutoff = unix_to_ts(now_unix().saturating_sub(self.retention_secs));
         let cutoff_unix = now_unix().saturating_sub(self.retention_secs);
+        if let Err(e) = self.log.trim_before(&cutoff) {
+            eprintln!("pherd: log trim failed: {e}");
+        }
         self.db.gc(&cutoff, cutoff_unix, MAX_FORWARDED_SEEN)?;
         self.semantic.gc(cutoff_unix);
         // Cursors evaporate with the events they point into: one not
@@ -1809,7 +1873,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
             sock_path.display(),
             s.node,
             s.matcher.len(),
-            s.next_seq
+            s.log_head() + 1
         );
         let node = s.node.clone();
         s.emit_trail_event("pher.node.online", json!({ "node": node }));
@@ -2135,7 +2199,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
                 "node": s.node,
                 "build": if cfg!(debug_assertions) { "debug" } else { "release" },
                 "subscriptions": s.matcher.len(),
-                "nextSeq": s.next_seq,
+                "nextSeq": s.log_head() + 1,
                 "matchedThrough": s.matched_through,
                 "armedTimers": s.timers.len(),
                 "tails": s.tails.len(),
@@ -2214,7 +2278,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
                 .map(|(name, e)| json!({ "name": name, "seq": e.seq, "committedAt": unix_to_ts(e.ts) }))
                 .collect();
             cursors.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-            ok(json!({ "cursors": cursors, "head": s.next_seq.saturating_sub(1) }))
+            ok(json!({ "cursors": cursors, "head": s.log_head() }))
         }
         Request::CursorRm { name } => {
             let mut s = state.lock().unwrap();
@@ -2486,15 +2550,16 @@ fn rpc_why_not(sub: &str, event: &str, state: &Arc<Mutex<State>>) -> Value {
     ok(json!({ "report": report }))
 }
 
-/// Attach a raw-event tail: register the live feed and snapshot the backlog
-/// atomically (seq dedup at the handoff makes the seam exact). Shared by the
-/// unix socket and HTTP /tail. `last` truncates the backlog to its tail —
-/// consoles want recent context, not a week of history.
-pub(crate) type TailAttachment = (
-    Vec<(u64, Envelope)>,
-    mpsc::Receiver<String>,
-    Option<SubjectPattern>,
-);
+/// Attach a raw-event tail: register the live feed and snapshot the head
+/// so catch-up pages `seq <= through` while live lines are `seq > through`.
+pub(crate) struct TailAttachment {
+    pub rx: mpsc::Receiver<String>,
+    pub pattern: Option<SubjectPattern>,
+    pub after: Option<u64>,
+    pub last: Option<usize>,
+    pub through: u64,
+    pub log: Arc<SqliteLog>,
+}
 
 pub(crate) fn attach_tail(
     state: &Arc<Mutex<State>>,
@@ -2512,23 +2577,66 @@ pub(crate) fn attach_tail(
         tx,
         subject: pattern.clone(),
     });
-    // With a subject pattern the SQL limit can't apply (matching happens
-    // here), so over-fetch a bounded window and trim after filtering.
-    let fetch = match (&pattern, last) {
-        (None, n) => n,
-        (Some(_), Some(n)) => Some((n * 20).clamp(1000, 20_000)),
-        (Some(_), None) => None,
-    };
-    let mut backlog = s.db.events_after(after, fetch).unwrap_or_default();
-    if let Some(p) = &pattern {
-        backlog.retain(|(_, e)| p.matches(&e.subject));
+    let through = s.log_head();
+    Ok(TailAttachment {
+        rx,
+        pattern,
+        after,
+        last,
+        through,
+        log: Arc::clone(&s.log),
+    })
+}
+
+/// Page historical tail lines. `last` keeps a ring of that many matches;
+/// unfiltered `last` starts near `through` so we do not scan the whole log.
+pub(crate) fn page_tail_backlog(
+    log: &SqliteLog,
+    after: Option<u64>,
+    last: Option<usize>,
+    pattern: Option<&SubjectPattern>,
+    through: u64,
+    mut emit: impl FnMut(u64, Envelope) -> bool,
+) {
+    let from = after.unwrap_or(0).saturating_add(1);
+    if last == Some(0) {
+        return;
     }
     if let Some(n) = last {
-        if backlog.len() > n {
-            backlog.drain(..backlog.len() - n);
+        let mut ring: VecDeque<(u64, Envelope)> = VecDeque::new();
+        let start = if pattern.is_none() {
+            let keep = n as u64;
+            from.max(through.saturating_add(1).saturating_sub(keep))
+        } else {
+            from
+        };
+        let _ = for_each_page(log, start, Some(through), |seq, event| {
+            if let Some(p) = pattern {
+                if !p.matches(&event.subject) {
+                    return true;
+                }
+            }
+            if ring.len() == n {
+                ring.pop_front();
+            }
+            ring.push_back((seq, event));
+            true
+        });
+        for (seq, event) in ring {
+            if !emit(seq, event) {
+                break;
+            }
         }
+        return;
     }
-    Ok((backlog, rx, pattern))
+    let _ = for_each_page(log, from, Some(through), |seq, event| {
+        if let Some(p) = pattern {
+            if !p.matches(&event.subject) {
+                return true;
+            }
+        }
+        emit(seq, event)
+    });
 }
 
 fn handle_tail(
@@ -2537,7 +2645,7 @@ fn handle_tail(
     stream: &UnixStream,
     state: &Arc<Mutex<State>>,
 ) -> anyhow::Result<()> {
-    let (backlog, rx, _pattern) = match attach_tail(state, after, subject, None) {
+    let attached = match attach_tail(state, after, subject, None) {
         Ok(t) => t,
         Err(e) => {
             respond(stream, &e)?;
@@ -2546,13 +2654,28 @@ fn handle_tail(
     };
     let mut writer = stream.try_clone()?;
     let mut last_sent = after.unwrap_or(0);
-    for (seq, event) in backlog {
-        let line = json!({ "seq": seq, "event": event }).to_string();
-        writeln!(writer, "{line}")?;
-        last_sent = seq;
+    let mut write_ok = true;
+    page_tail_backlog(
+        &attached.log,
+        attached.after,
+        attached.last,
+        attached.pattern.as_ref(),
+        attached.through,
+        |seq, event| {
+            let line = json!({ "seq": seq, "event": event }).to_string();
+            if writeln!(writer, "{line}").is_err() {
+                write_ok = false;
+                return false;
+            }
+            last_sent = seq;
+            true
+        },
+    );
+    if !write_ok {
+        return Ok(());
     }
     writer.flush()?;
-    for line in rx {
+    for line in attached.rx {
         let seq = serde_json::from_str::<Value>(&line)
             .ok()
             .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
@@ -2608,30 +2731,19 @@ pub(crate) fn attach_listener(
     let mut replayed = 0u64;
     let mut gap_expired = 0u64;
     if let Some(after) = resume_after {
-        let backlog = s.read_events(Some(after));
-        if let Some((first_seq, _)) = backlog.first() {
-            // Retention already evaporated part of the gap.
+        let (first, n) = s.replay_from_seq(&id, after.saturating_add(1));
+        replayed = n;
+        if let Some(first_seq) = first {
             gap_expired = first_seq.saturating_sub(after + 1);
-        }
-        for (seq, event) in backlog {
-            s.current_seq = Some(seq);
-            if let Some(n) = s.try_deliver(&id, &event) {
-                replayed += n;
-            }
         }
     } else if let Some(replay) = sub.as_ref().and_then(|sub| sub.replay.clone()) {
         let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
-        for (seq, event) in s.read_events_since_ts(&cutoff) {
-            s.current_seq = Some(seq);
-            if let Some(n) = s.try_deliver(&id, &event) {
-                replayed += n;
-            }
-        }
+        replayed = s.replay_from_ts(&id, &cutoff);
     }
 
     // Ack tells the consumer exactly where it stands: the log head (start a
     // cursor even with no traffic), what was replayed, and what is gone.
-    ack["seq"] = json!(s.next_seq.saturating_sub(1));
+    ack["seq"] = json!(s.log_head());
     ack["replayed"] = json!(replayed);
     if let Some(after) = resume_after {
         ack["resumedFrom"] = json!(after);
@@ -2816,6 +2928,7 @@ mod grant_tests {
 #[cfg(test)]
 mod follower_tests {
     use super::*;
+    use crate::traillog::TrailLog;
 
     fn fresh_home(tag: &str) -> Paths {
         let home = std::env::temp_dir().join(format!("pher-follower-{tag}-{}", std::process::id()));
@@ -2848,11 +2961,11 @@ mod follower_tests {
             "ack carries no match result"
         );
         // Durable and visible before any matching happened.
-        assert_eq!(s.db.max_seq().unwrap(), Some(seq));
+        assert_eq!(s.log.head_seq().unwrap(), seq);
         assert!(s.matched_through < seq);
         assert!(s.db.event_by_id("nope").unwrap().is_none());
         assert_eq!(
-            s.db.events_next(seq, 10).unwrap().len(),
+            s.log.read(Pos::local(seq + 1), 10).unwrap().len(),
             0,
             "no re-emit yet"
         );
@@ -2860,7 +2973,7 @@ mod follower_tests {
         assert_eq!(s.follow_step(32), 1);
         assert_eq!(s.matched_through, seq);
         assert_eq!(s.db.matched_through().unwrap(), Some(seq));
-        let re = s.db.events_next(seq, 10).unwrap();
+        let re = s.log.read(Pos::local(seq + 1), 10).unwrap();
         let subjects: Vec<_> = re.iter().map(|(_, e)| e.subject.clone()).collect();
         assert_eq!(
             re.len(),
@@ -2872,7 +2985,7 @@ mod follower_tests {
 
         // Draining processes the re-emitted event too (no match, position moves).
         assert_eq!(s.drain(), 1);
-        assert_eq!(s.matched_through, re[0].0);
+        assert_eq!(s.matched_through, re[0].0.seq);
         assert_eq!(s.follow_step(32), 0);
     }
 
@@ -2888,16 +3001,17 @@ mod follower_tests {
             // "Crash" before the follower ran.
         }
         let mut s = State::load(paths).unwrap();
-        let head = s.db.max_seq().unwrap().unwrap();
+        let head = s.log.head_seq().unwrap();
         assert!(s.matched_through < head, "gap is remembered across restart");
         s.drain();
-        assert_eq!(s.matched_through, s.db.max_seq().unwrap().unwrap());
-        let cds: Vec<_> =
-            s.db.events_after(Some(0), None)
-                .unwrap()
-                .into_iter()
-                .filter(|(_, e)| e.subject == "c.d")
-                .collect();
+        assert_eq!(s.matched_through, s.log.head_seq().unwrap());
+        let cds: Vec<_> = s
+            .log
+            .read(Pos::local(1), LOG_PAGE)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| e.subject == "c.d")
+            .collect();
         assert_eq!(
             cds.len(),
             2,
@@ -2910,6 +3024,7 @@ mod follower_tests {
         let paths = fresh_home("legacy");
         {
             let db = crate::db::Db::open(&paths).unwrap();
+            let log = SqliteLog::open(&paths).unwrap();
             for seq in 1..=5u64 {
                 let ev = Envelope {
                     id: format!("E.{seq}"),
@@ -2923,7 +3038,7 @@ mod follower_tests {
                     ttl_class: None,
                     hops: None,
                 };
-                db.append_event(seq, &ev).unwrap();
+                log.append(&[ev]).unwrap();
             }
             assert!(db.matched_through().unwrap().is_none());
         }
@@ -2932,6 +3047,63 @@ mod follower_tests {
             s.matched_through, 5,
             "old events were matched at ingest; never replay them"
         );
+        assert_eq!(s.follow_step(32), 0);
+    }
+
+    #[test]
+    fn follower_jumps_trimmed_prefix_and_survives_restart() {
+        let paths = fresh_home("trim-follow");
+        let mut s = State::load(paths.clone()).unwrap();
+        let old = Envelope {
+            id: "PH.old".into(),
+            ts: "2020-01-01T00:00:00Z".into(),
+            node: "n".into(),
+            source: "test".into(),
+            event_type: "keep.a".into(),
+            subject: "keep.a".into(),
+            correlation: None,
+            payload: json!({}),
+            ttl_class: None,
+            hops: None,
+        };
+        s.log.append(&[old.clone(), old]).unwrap();
+        assert_eq!(s.log.head_seq().unwrap(), 2);
+        assert_eq!(s.matched_through, 0, "appended off the ingest path");
+        s.log.trim_before("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(s.log.floor().unwrap(), 2);
+        assert_eq!(s.follow_step(32), 0);
+        assert_eq!(s.matched_through, 2);
+        drop(s);
+        let mut s = State::load(paths).unwrap();
+        assert_eq!(s.matched_through, 2);
+        assert_eq!(s.follow_step(32), 0);
+        assert!(matches!(
+            s.log.read(Pos::local(1), LOG_PAGE),
+            Err(TrailError::Trimmed { .. })
+        ));
+    }
+
+    #[test]
+    fn follower_pages_a_long_backlog() {
+        let paths = fresh_home("pages");
+        let mut s = State::load(paths).unwrap();
+        for i in 0..80 {
+            s.ingest(
+                PartialEvent {
+                    subject: format!("page.{i}"),
+                    payload: Some(json!({ "i": i })),
+                    event_type: None,
+                    source: Some("test".into()),
+                    correlation: None,
+                },
+                0,
+            )
+            .unwrap();
+        }
+        assert_eq!(s.log.head_seq().unwrap(), 80);
+        assert_eq!(s.matched_through, 0);
+        assert_eq!(s.drain(), 80);
+        assert_eq!(s.matched_through, 80);
         assert_eq!(s.follow_step(32), 0);
     }
 }
