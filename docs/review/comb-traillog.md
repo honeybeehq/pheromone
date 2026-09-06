@@ -40,6 +40,15 @@ backlog also fail closed on corrupt/trim rather than skipping. Ack does
 not include an `evaluate()` estimate as `replayed`. `after = u64::MAX`
 does not overflow. No bounded send waits under `Mutex<State>`.
 
+Catch-up applies matching, limits, and shaping once in sequence order.
+The follower does not deliver seqs `<=` the captured head to that
+listener (catch-up owns that range, including follower backlog not yet
+processed at attach). Live matches above the captured head wait in a
+`LIVE_QUEUE`-capped hold until catch-up finishes, so a later live event
+cannot consume `limit` or arm shaping before history. `last_sent` is
+output dedup only; it is not the limit/shaping boundary. Hold overflow
+is the same lag disconnect as the live queue.
+
 `read` and `seek_ts` each run floor + query in one SQLite transaction so a
 peer trim cannot turn a prefix into a silent empty page.
 
@@ -53,7 +62,11 @@ Negative stored head/floor is corrupt. `seq > i64::MAX` is
 - `append([])` → `EmptyBatch`.
 - `read` max `1..=4096`.
 - Live queue 256; slow consumer is disconnected.
+- Catch-up live-hold 256; overflow is lag disconnect.
 - SQLite seq ceiling `i64::MAX`.
+- Stream catch-up is tiers 1–2. Meaning/judge on live events during
+  catch-up still run on the follower path. Stream+expect absence timers
+  are not armed for catch-up-owned seqs.
 
 ## Protocol still local-shaped (ObjectLog later)
 

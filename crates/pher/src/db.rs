@@ -202,6 +202,25 @@ impl Db {
         Ok(row.and_then(|t| serde_json::from_str(&t).ok()))
     }
 
+    /// Event ids recorded in the delivery ledger. Tests use this to check
+    /// side effects, not only stream output.
+    #[cfg(test)]
+    pub fn delivery_event_ids(&self) -> Vec<String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT record FROM deliveries ORDER BY rowid")
+            .expect("deliveries query");
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .expect("deliveries rows")
+            .filter_map(Result::ok)
+            .filter_map(|t| {
+                serde_json::from_str::<Value>(&t)
+                    .ok()
+                    .and_then(|v| v.get("event")?.get("id")?.as_str().map(str::to_string))
+            })
+            .collect()
+    }
+
     // -- verdicts ------------------------------------------------------------
 
     pub fn append_verdict(&self, key: &str, ts: u64, record: &Value) -> anyhow::Result<()> {

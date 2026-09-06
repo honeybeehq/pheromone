@@ -281,6 +281,22 @@ pub(crate) fn filter_matches(filter: &Subscription, event: &Envelope) -> bool {
 pub(crate) struct ListenerHandle {
     tx: mpsc::SyncSender<String>,
     filter: Option<Subscription>,
+    /// Inclusive seq catch-up covers. The follower never applies matching,
+    /// limits, or shaping at or below this seq for this listener.
+    catchup_through: Option<u64>,
+    /// Some while catch-up is in flight: live matches with seq above
+    /// `catchup_through` wait here (cap `LIVE_QUEUE`) so they cannot
+    /// consume limits/shaping before history. None once released.
+    held_live: Option<VecDeque<(u64, Envelope)>>,
+}
+
+enum ListenCatchupHold {
+    /// Follower/live path may apply matching, limits, and shaping.
+    Proceed,
+    /// seq <= captured through: catch-up owns this seq.
+    Skip,
+    /// seq > through, catch-up still in flight: held until release.
+    Held,
 }
 
 /// A pending tier-4 evaluation, processed off-lock by the judge worker.
@@ -809,6 +825,12 @@ impl State {
             let Some(sub) = self.matcher.get(&sub_id).cloned() else {
                 continue;
             };
+            if !matches!(
+                self.hold_listen_catchup(&sub_id, seq, event),
+                ListenCatchupHold::Proceed
+            ) {
+                continue;
+            }
             if let Some(expect) = &sub.expect {
                 // Origin match arms the absence timer; the action fires on expiry.
                 self.timers.push(Timer {
@@ -850,6 +872,9 @@ impl State {
             }
             let now = now_unix();
             for sub_id in pending_subs {
+                if self.listener_catchup_owns(&sub_id, seq) {
+                    continue;
+                }
                 let Some(sub) = self.matcher.get(&sub_id).cloned() else {
                     continue;
                 };
@@ -1598,6 +1623,57 @@ impl State {
             },
             0,
         );
+    }
+
+    fn listener_catchup_owns(&self, sub_id: &str, seq: u64) -> bool {
+        self.listeners
+            .get(sub_id)
+            .and_then(|h| h.catchup_through)
+            .is_some_and(|through| seq <= through)
+    }
+
+    /// Catch-up owns seqs <= captured through. Live matches above that seq
+    /// wait until catch-up finishes so limits/shaping run once in seq order.
+    fn hold_listen_catchup(
+        &mut self,
+        sub_id: &str,
+        seq: u64,
+        event: &Envelope,
+    ) -> ListenCatchupHold {
+        {
+            let Some(handle) = self.listeners.get_mut(sub_id) else {
+                return ListenCatchupHold::Proceed;
+            };
+            if handle.catchup_through.is_some_and(|through| seq <= through) {
+                return ListenCatchupHold::Skip;
+            }
+            let Some(held) = handle.held_live.as_mut() else {
+                return ListenCatchupHold::Proceed;
+            };
+            if held.len() < LIVE_QUEUE {
+                held.push_back((seq, event.clone()));
+                return ListenCatchupHold::Held;
+            }
+        }
+        self.remove_sub(sub_id, "listener lagged");
+        ListenCatchupHold::Held
+    }
+
+    fn release_listen_catchup(&mut self, sub_id: &str) {
+        let Some(held) = self
+            .listeners
+            .get_mut(sub_id)
+            .and_then(|h| h.held_live.take())
+        else {
+            return;
+        };
+        for (seq, event) in held {
+            if self.matcher.get(sub_id).is_none() {
+                break;
+            }
+            self.current_seq = Some(seq);
+            let _ = self.try_deliver(sub_id, &event);
+        }
     }
 
     fn remove_sub(&mut self, id: &str, reason: &str) -> bool {
@@ -2778,8 +2854,15 @@ pub(crate) fn attach_listener(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    s.listeners
-        .insert(id.clone(), ListenerHandle { tx, filter });
+    s.listeners.insert(
+        id.clone(),
+        ListenerHandle {
+            tx,
+            filter,
+            catchup_through: None,
+            held_live: None,
+        },
+    );
 
     let sub = s.matcher.get(&id).cloned();
     let through = match s.log.head_seq() {
@@ -2846,6 +2929,12 @@ pub(crate) fn attach_listener(
                 "catch-up replay evaluates tiers 1-2 only; meaning/judge verdicts \
                  were not recorded for this subscription while it was away"
             ));
+        }
+    }
+    if catchup_from.is_some() {
+        if let Some(handle) = s.listeners.get_mut(&id) {
+            handle.catchup_through = Some(through);
+            handle.held_live = Some(VecDeque::new());
         }
     }
     drop(s);
@@ -2934,6 +3023,8 @@ pub(crate) fn replay_listen_catchup(
             break;
         }
     }
+    let mut s = state.lock().unwrap();
+    s.release_listen_catchup(sub_id);
     Ok(replayed)
 }
 
@@ -3176,6 +3267,43 @@ mod follower_tests {
             source: Some("test".to_string()),
             correlation: None,
         }
+    }
+
+    fn plant(s: &State, id: &str) {
+        s.log
+            .append(&[Envelope {
+                id: id.into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: "t.x".into(),
+                subject: "t.x".into(),
+                correlation: None,
+                payload: json!({ "id": id }),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+    }
+
+    fn line_event_id(line: &str) -> String {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| {
+                v.get("event")
+                    .and_then(|e| e.get("id"))
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    }
+
+    fn drain_rx(rx: &mpsc::Receiver<String>) -> Vec<String> {
+        let mut ids = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            ids.push(line_event_id(&line));
+        }
+        ids
     }
 
     #[test]
@@ -3655,6 +3783,208 @@ mod follower_tests {
         assert!(
             att.rx.try_recv().is_ok(),
             "live arrival during catch-up goes on the bounded queue, not the catch-up page"
+        );
+    }
+
+    #[test]
+    fn listen_limit_applies_in_seq_order_when_live_arrives_before_catchup() {
+        let paths = fresh_home("limit-order");
+        let mut s = State::load(paths).unwrap();
+        plant(&s, "PH.h1");
+        plant(&s, "PH.h2");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream limit 1",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.ingest(
+                PartialEvent {
+                    subject: "t.x".into(),
+                    payload: Some(json!({ "live": true })),
+                    event_type: None,
+                    source: Some("test".into()),
+                    correlation: None,
+                },
+                0,
+            )
+            .unwrap();
+            s.drain();
+        }
+        let mut catchup = Vec::new();
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |line| {
+                catchup.push(line_event_id(line));
+                true
+            },
+        )
+        .unwrap();
+        let live = drain_rx(&att.rx);
+        let delivered = state.lock().unwrap().db.delivery_event_ids();
+        assert_eq!(n, 1, "one-shot must fire on the first historical match");
+        assert_eq!(catchup, vec!["PH.h1".to_string()]);
+        assert!(
+            live.is_empty(),
+            "live match must not consume the limit before history: {live:?}"
+        );
+        assert_eq!(delivered, vec!["PH.h1".to_string()]);
+        assert!(
+            state.lock().unwrap().matcher.get(&att.id).is_none(),
+            "limit 1 retires the matcher after the historical delivery"
+        );
+    }
+
+    #[test]
+    fn listen_held_live_applies_after_history_when_limit_allows() {
+        let paths = fresh_home("limit-held");
+        let mut s = State::load(paths).unwrap();
+        plant(&s, "PH.h1");
+        plant(&s, "PH.h2");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream limit 3",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        let live_id = {
+            let mut s = state.lock().unwrap();
+            let ack = s
+                .ingest(
+                    PartialEvent {
+                        subject: "t.x".into(),
+                        payload: Some(json!({ "live": true })),
+                        event_type: None,
+                        source: Some("test".into()),
+                        correlation: None,
+                    },
+                    0,
+                )
+                .unwrap();
+            s.drain();
+            ack["id"].as_str().unwrap().to_string()
+        };
+        let mut catchup = Vec::new();
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |line| {
+                catchup.push(line_event_id(line));
+                true
+            },
+        )
+        .unwrap();
+        let live = drain_rx(&att.rx);
+        let delivered = state.lock().unwrap().db.delivery_event_ids();
+        assert_eq!(catchup, vec!["PH.h1".to_string(), "PH.h2".to_string()]);
+        assert_eq!(live, vec![live_id.clone()]);
+        assert_eq!(
+            delivered,
+            vec!["PH.h1".to_string(), "PH.h2".to_string(), live_id]
+        );
+        assert!(
+            state.lock().unwrap().matcher.get(&att.id).is_none(),
+            "limit 3 retires after history then the held live match"
+        );
+    }
+
+    #[test]
+    fn listen_follower_backlog_does_not_double_deliver_catchup_range() {
+        let paths = fresh_home("follow-dup");
+        let s = State::load(paths).unwrap();
+        plant(&s, "PH.h1");
+        plant(&s, "PH.h2");
+        assert_eq!(s.matched_through, 0, "follower has not processed history");
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.drain();
+        }
+        assert!(
+            drain_rx(&att.rx).is_empty(),
+            "follower must not deliver seq <= captured through"
+        );
+        let mut catchup = Vec::new();
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |line| {
+                catchup.push(line_event_id(line));
+                true
+            },
+        )
+        .unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.drain();
+        }
+        let live = drain_rx(&att.rx);
+        let delivered = state.lock().unwrap().db.delivery_event_ids();
+        assert_eq!(catchup, vec!["PH.h1".to_string(), "PH.h2".to_string()]);
+        assert!(
+            live.is_empty(),
+            "follower must not replay catch-up seqs after release: {live:?}"
+        );
+        assert_eq!(delivered, vec!["PH.h1".to_string(), "PH.h2".to_string()]);
+
+        let live_id = {
+            let mut s = state.lock().unwrap();
+            let ack = s
+                .ingest(
+                    PartialEvent {
+                        subject: "t.x".into(),
+                        payload: Some(json!({ "after": true })),
+                        event_type: None,
+                        source: Some("test".into()),
+                        correlation: None,
+                    },
+                    0,
+                )
+                .unwrap();
+            s.drain();
+            ack["id"].as_str().unwrap().to_string()
+        };
+        assert_eq!(drain_rx(&att.rx), vec![live_id.clone()]);
+        assert_eq!(
+            state.lock().unwrap().db.delivery_event_ids(),
+            vec!["PH.h1".to_string(), "PH.h2".to_string(), live_id]
         );
     }
 
