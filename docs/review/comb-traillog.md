@@ -62,7 +62,9 @@ arm shaping, or skip expect arm/disarm before history. A held origin arms
 its absence timer; a completion that arrives while the origin is held
 stays in the hold and disarms in seq order. Timer persist failures
 propagate through that cascade: a failed arm truncates the in-memory
-timer; a failed disarm restores the previous timer list. Catch-up
+timer; a failed disarm restores the previous timer list so memory
+matches disk. Arming the same origin is idempotent, so a follower
+retry after persist failure cannot leave two timers. Catch-up
 returns an error and the listener disconnects rather than advancing
 past an undurable arm. The follower does not move `matched_through`
 onto a seq whose cascade failed; the same seq is retried. That is not

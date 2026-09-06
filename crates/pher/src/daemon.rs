@@ -1675,6 +1675,15 @@ impl State {
         let Some(expect) = &sub.expect else {
             return Ok(());
         };
+        // Same origin must not grow a second timer if persist failed after
+        // push, or if the follower retries the seq.
+        if self
+            .timers
+            .iter()
+            .any(|t| t.sub_id == sub_id && t.origin.id == event.id)
+        {
+            return self.persist_timers().map_err(|e| e.to_string());
+        }
         let n = self.timers.len();
         self.timers.push(Timer {
             sub_id: sub_id.to_string(),
@@ -3427,6 +3436,18 @@ mod follower_tests {
             .collect()
     }
 
+    fn persisted_timer_origin_ids(s: &State, sub_id: &str) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(s.paths.timers()) else {
+            return Vec::new();
+        };
+        let timers: Vec<Timer> = serde_json::from_str(&text).unwrap_or_default();
+        timers
+            .into_iter()
+            .filter(|t| t.sub_id == sub_id)
+            .map(|t| t.origin.id)
+            .collect()
+    }
+
     #[test]
     fn ingest_appends_only_and_follower_runs_the_cascade() {
         let paths = fresh_home("split");
@@ -4292,6 +4313,26 @@ mod follower_tests {
             timer_origin_ids(&state.lock().unwrap(), &att.id),
             vec!["PH.start".to_string()]
         );
+        assert_eq!(
+            persisted_timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()]
+        );
+        let n2 = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n2, 0);
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()],
+            "same-origin catch-up replay must not duplicate the timer"
+        );
     }
 
     #[test]
@@ -4300,14 +4341,14 @@ mod follower_tests {
         let s = State::load(paths).unwrap();
         let state = Arc::new(Mutex::new(s));
         let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
-        let prior = {
+        let (prior, origin_id) = {
             let mut s = state.lock().unwrap();
             s.drain();
             let prior = s.matched_through;
             s.fail_persist_timers = true;
-            ingest_job(&mut s, "job.started", "batch-12");
+            let origin_id = ingest_job(&mut s, "job.started", "batch-12");
             s.drain();
-            prior
+            (prior, origin_id)
         };
         {
             let s = state.lock().unwrap();
@@ -4315,18 +4356,39 @@ mod follower_tests {
                 s.matched_through, prior,
                 "failed persist must not consume the origin seq"
             );
-            assert!(timer_origin_ids(&s, &att.id).is_empty());
+            assert!(
+                timer_origin_ids(&s, &att.id).is_empty(),
+                "failed arm persist must roll back the in-memory timer"
+            );
+            assert!(
+                persisted_timer_origin_ids(&s, &att.id).is_empty(),
+                "failed arm persist must not leave the origin on disk"
+            );
         }
         {
             let mut s = state.lock().unwrap();
+            s.drain();
+            assert!(
+                timer_origin_ids(&s, &att.id).is_empty(),
+                "retry while persist still failing must not accumulate timers"
+            );
             s.fail_persist_timers = false;
             s.drain();
+            s.drain();
         }
-        assert_eq!(timer_origin_ids(&state.lock().unwrap(), &att.id).len(), 1);
-        assert!(
-            state.lock().unwrap().matched_through > prior,
-            "retry after durable persist must advance past the origin"
-        );
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                timer_origin_ids(&s, &att.id),
+                vec![origin_id.clone()],
+                "same-origin follower retry must arm exactly once"
+            );
+            assert_eq!(persisted_timer_origin_ids(&s, &att.id), vec![origin_id]);
+            assert!(
+                s.matched_through > prior,
+                "retry after durable persist must advance past the origin"
+            );
+        }
     }
 
     #[test]
@@ -4365,16 +4427,31 @@ mod follower_tests {
             assert_eq!(
                 timer_origin_ids(&s, &att.id),
                 vec!["PH.start".to_string()],
-                "failed disarm persist must restore the timer"
+                "failed disarm persist must keep the timer in memory"
+            );
+            assert_eq!(
+                persisted_timer_origin_ids(&s, &att.id),
+                vec!["PH.start".to_string()],
+                "failed disarm persist must leave the timer on disk"
             );
             assert_eq!(s.matched_through, prior);
         }
         {
             let mut s = state.lock().unwrap();
+            s.drain();
+            assert_eq!(
+                timer_origin_ids(&s, &att.id),
+                vec!["PH.start".to_string()],
+                "retry while persist still failing must not drop the disk timer from memory"
+            );
             s.fail_persist_timers = false;
             s.drain();
         }
-        assert!(timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty());
+        {
+            let s = state.lock().unwrap();
+            assert!(timer_origin_ids(&s, &att.id).is_empty());
+            assert!(persisted_timer_origin_ids(&s, &att.id).is_empty());
+        }
     }
 
     #[test]
