@@ -9,7 +9,7 @@ use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use pher_core::matcher::{evaluate, why_not, MatchBlock, Outcome};
+use pher_core::matcher::{check, evaluate, why_not, Check, MatchBlock, Outcome};
 use pher_core::{ids, Envelope, Matcher, Sink, SubjectPattern, Subscription};
 
 use crate::protocol::{err, ok, PartialEvent, Request};
@@ -281,12 +281,13 @@ pub(crate) fn filter_matches(filter: &Subscription, event: &Envelope) -> bool {
 pub(crate) struct ListenerHandle {
     tx: mpsc::SyncSender<String>,
     filter: Option<Subscription>,
-    /// Inclusive seq catch-up covers. The follower never applies matching,
-    /// limits, or shaping at or below this seq for this listener.
+    /// Inclusive seq catch-up covers. The follower never applies this
+    /// listener's cascade at or below this seq.
     catchup_through: Option<u64>,
-    /// Some while catch-up is in flight: live matches with seq above
-    /// `catchup_through` wait here (cap `LIVE_QUEUE`) so they cannot
-    /// consume limits/shaping before history. None once released.
+    /// Some while catch-up is in flight: live events this listener cares
+    /// about (on-matches and expect follow-ups) with seq above
+    /// `catchup_through` wait here (cap `LIVE_QUEUE`). Applied after
+    /// catch-up through the same per-listener path. None once released.
     held_live: Option<VecDeque<(u64, Envelope)>>,
 }
 
@@ -811,40 +812,26 @@ impl State {
     fn process_event(&mut self, seq: u64, event: &Envelope) -> Result<u64, String> {
         self.current_seq = Some(seq);
 
-        // Expect bookkeeping first: an incoming event can disarm timers.
-        self.disarm_matching_timers(event);
-
-        let matched_ids: Vec<String> = self
+        let mut ids: Vec<String> = self
             .matcher
             .match_ids(event)
             .into_iter()
             .map(String::from)
             .collect();
+        for id in self.expect_followup_ids(event) {
+            if !ids.iter().any(|x| x == &id) {
+                ids.push(id);
+            }
+        }
         let mut deliveries = 0u64;
-        for sub_id in matched_ids {
-            let Some(sub) = self.matcher.get(&sub_id).cloned() else {
-                continue;
-            };
+        for sub_id in ids {
             if !matches!(
                 self.hold_listen_catchup(&sub_id, seq, event),
                 ListenCatchupHold::Proceed
             ) {
                 continue;
             }
-            if let Some(expect) = &sub.expect {
-                // Origin match arms the absence timer; the action fires on expiry.
-                self.timers.push(Timer {
-                    sub_id: sub_id.clone(),
-                    origin: event.clone(),
-                    deadline: now_unix() + expect.within.secs(),
-                    seq: Some(seq),
-                });
-                self.persist_timers().map_err(|e| e.to_string())?;
-                continue;
-            }
-            if let Some(n) = self.try_deliver(&sub_id, event) {
-                deliveries += n;
-            }
+            deliveries += self.apply_to_listener(&sub_id, seq, event);
         }
 
         // Tiers 3-4: subscriptions whose tiers 1-2 passed but carry `meaning`
@@ -889,14 +876,8 @@ impl State {
                     }
                     meaning_record = Some(record);
                 }
-                if let Some(expect) = &sub.expect {
-                    self.timers.push(Timer {
-                        sub_id: sub_id.clone(),
-                        origin: event.clone(),
-                        deadline: now_unix() + expect.within.secs(),
-                        seq: Some(seq),
-                    });
-                    self.persist_timers().map_err(|e| e.to_string())?;
+                if sub.expect.is_some() {
+                    self.arm_expect_timer(&sub_id, &sub, event, seq);
                     continue;
                 }
                 if sub.judge.is_some() {
@@ -1632,8 +1613,100 @@ impl State {
             .is_some_and(|through| seq <= through)
     }
 
-    /// Catch-up owns seqs <= captured through. Live matches above that seq
-    /// wait until catch-up finishes so limits/shaping run once in seq order.
+    fn expect_followup_ids(&self, event: &Envelope) -> Vec<String> {
+        self.matcher
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                let expect = self.matcher.get(id)?.expect.as_ref()?;
+                expect
+                    .subject
+                    .matches(&event.subject)
+                    .then(|| id.to_string())
+            })
+            .collect()
+    }
+
+    /// Per-listener cascade: disarm expect timers, then arm or
+    /// shape/limit-deliver. Catch-up, hold release, and the follower share
+    /// this path so listen+expect keeps arm/disarm order across handoff.
+    fn apply_to_listener(&mut self, sub_id: &str, seq: u64, event: &Envelope) -> u64 {
+        self.current_seq = Some(seq);
+        self.disarm_listener_timers(sub_id, event);
+        let Some(sub) = self.matcher.get(sub_id).cloned() else {
+            return 0;
+        };
+        match check(&sub, event, None) {
+            Check::Matched => {
+                if sub.expect.is_some() {
+                    self.arm_expect_timer(sub_id, &sub, event, seq);
+                    0
+                } else {
+                    self.try_deliver(sub_id, event).unwrap_or(0)
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn arm_expect_timer(&mut self, sub_id: &str, sub: &Subscription, event: &Envelope, seq: u64) {
+        let Some(expect) = &sub.expect else {
+            return;
+        };
+        self.timers.push(Timer {
+            sub_id: sub_id.to_string(),
+            origin: event.clone(),
+            deadline: now_unix() + expect.within.secs(),
+            seq: Some(seq),
+        });
+        let _ = self.persist_timers();
+    }
+
+    fn disarm_listener_timers(&mut self, sub_id: &str, event: &Envelope) {
+        let Some(sub) = self.matcher.get(sub_id) else {
+            let before = self.timers.len();
+            self.timers.retain(|t| t.sub_id != sub_id);
+            if self.timers.len() != before {
+                let _ = self.persist_timers();
+            }
+            return;
+        };
+        let Some(expect) = &sub.expect else {
+            return;
+        };
+        if !expect.subject.matches(&event.subject) {
+            return;
+        }
+        let where_expr = expect.where_expr.clone();
+        let mut disarmed = false;
+        self.timers.retain(|timer| {
+            if timer.sub_id != sub_id {
+                return true;
+            }
+            let joined = match &where_expr {
+                None => true,
+                Some(w) => pher_core::expr::eval_bool(
+                    w,
+                    &pher_core::EvalCtx::new(event, Some(&timer.origin)),
+                )
+                .unwrap_or(false),
+            };
+            if joined {
+                disarmed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if disarmed {
+            let _ = self.persist_timers();
+        }
+    }
+
+    /// Catch-up owns seqs <= captured through. Live matches and expect
+    /// follow-ups above that seq wait until catch-up finishes so the
+    /// per-listener cascade (expect arm/disarm, limits, shaping) runs once
+    /// in seq order.
     fn hold_listen_catchup(
         &mut self,
         sub_id: &str,
@@ -1671,8 +1744,7 @@ impl State {
             if self.matcher.get(sub_id).is_none() {
                 break;
             }
-            self.current_seq = Some(seq);
-            let _ = self.try_deliver(sub_id, &event);
+            let _ = self.apply_to_listener(sub_id, seq, &event);
         }
     }
 
@@ -1699,41 +1771,6 @@ impl State {
     }
 
     // -- expect timers -----------------------------------------------------
-
-    fn disarm_matching_timers(&mut self, event: &Envelope) {
-        let mut disarmed = false;
-        let matcher = &self.matcher;
-        self.timers.retain(|timer| {
-            let Some(sub) = matcher.get(&timer.sub_id) else {
-                disarmed = true;
-                return false;
-            };
-            let Some(expect) = &sub.expect else {
-                disarmed = true;
-                return false;
-            };
-            if !expect.subject.matches(&event.subject) {
-                return true;
-            }
-            let joined = match &expect.where_expr {
-                None => true,
-                Some(w) => pher_core::expr::eval_bool(
-                    w,
-                    &pher_core::EvalCtx::new(event, Some(&timer.origin)),
-                )
-                .unwrap_or(false),
-            };
-            if joined {
-                disarmed = true;
-                false
-            } else {
-                true
-            }
-        });
-        if disarmed {
-            let _ = self.persist_timers();
-        }
-    }
 
     fn fire_expired_timers(&mut self) {
         let now = now_unix();
@@ -1861,10 +1898,7 @@ impl State {
                         continue;
                     }
                 }
-                self.current_seq = Some(pos.seq);
-                if let Some(n) = self.try_deliver(sub_id, &event) {
-                    replayed += n;
-                }
+                replayed += self.apply_to_listener(sub_id, pos.seq, &event);
                 from = pos
                     .seq
                     .checked_add(1)
@@ -3001,8 +3035,7 @@ pub(crate) fn replay_listen_catchup(
                     continue;
                 }
             }
-            s.current_seq = Some(pos.seq);
-            let _ = s.try_deliver(sub_id, &event);
+            let _ = s.apply_to_listener(sub_id, pos.seq, &event);
             from = match pos.seq.checked_add(1) {
                 Some(n) => n,
                 None => {
@@ -3304,6 +3337,50 @@ mod follower_tests {
             ids.push(line_event_id(&line));
         }
         ids
+    }
+
+    const LISTEN_EXPECT: &str = "on job.started expect job.finished where correlation == $origin.correlation within 30s else then stream";
+
+    fn plant_job(s: &State, id: &str, subject: &str, corr: &str) {
+        s.log
+            .append(&[Envelope {
+                id: id.into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: subject.into(),
+                subject: subject.into(),
+                correlation: Some(corr.into()),
+                payload: json!({}),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+    }
+
+    fn ingest_job(s: &mut State, subject: &str, corr: &str) -> String {
+        s.ingest(
+            PartialEvent {
+                subject: subject.into(),
+                payload: Some(json!({})),
+                event_type: None,
+                source: Some("test".into()),
+                correlation: Some(corr.into()),
+            },
+            0,
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn timer_origin_ids(s: &State, sub_id: &str) -> Vec<String> {
+        s.timers
+            .iter()
+            .filter(|t| t.sub_id == sub_id)
+            .map(|t| t.origin.id.clone())
+            .collect()
     }
 
     #[test]
@@ -3986,6 +4063,141 @@ mod follower_tests {
             state.lock().unwrap().db.delivery_event_ids(),
             vec!["PH.h1".to_string(), "PH.h2".to_string(), live_id]
         );
+    }
+
+    #[test]
+    fn listen_held_origin_arms_expect_timer_not_deliver() {
+        let paths = fresh_home("expect-arm");
+        let mut s = State::load(paths).unwrap();
+        s.matched_through = s.log.head_seq().unwrap_or(0);
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        let origin_id = {
+            let mut s = state.lock().unwrap();
+            let id = ingest_job(&mut s, "job.started", "batch-7");
+            s.drain();
+            id
+        };
+        assert!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty(),
+            "origin must wait in the hold, not arm before catch-up"
+        );
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 0, "expect origin is not an immediate delivery");
+        assert!(drain_rx(&att.rx).is_empty());
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec![origin_id.clone()]
+        );
+        {
+            let mut s = state.lock().unwrap();
+            s.timers[0].deadline = 0;
+            s.fire_expired_timers();
+        }
+        assert_eq!(
+            state.lock().unwrap().db.delivery_event_ids(),
+            vec![origin_id]
+        );
+    }
+
+    #[test]
+    fn listen_held_completion_disarms_held_origin() {
+        let paths = fresh_home("expect-disarm");
+        let mut s = State::load(paths).unwrap();
+        s.matched_through = s.log.head_seq().unwrap_or(0);
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            ingest_job(&mut s, "job.started", "batch-8");
+            s.drain();
+            ingest_job(&mut s, "job.finished", "batch-8");
+            s.drain();
+        }
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty(),
+            "completion must disarm the held origin in seq order"
+        );
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+        assert!(drain_rx(&att.rx).is_empty());
+        {
+            let mut s = state.lock().unwrap();
+            s.fire_expired_timers();
+        }
+        assert!(
+            state.lock().unwrap().db.delivery_event_ids().is_empty(),
+            "disarmed expect must not fire"
+        );
+    }
+
+    #[test]
+    fn listen_catchup_expect_origin_and_completion_no_delivery() {
+        let paths = fresh_home("expect-hist");
+        let mut s = State::load(paths).unwrap();
+        plant_job(&s, "PH.start", "job.started", "batch-9");
+        plant_job(&s, "PH.done", "job.finished", "batch-9");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert!(timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty());
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+    }
+
+    #[test]
+    fn listen_catchup_expect_origin_arms_timer() {
+        let paths = fresh_home("expect-hist-arm");
+        let mut s = State::load(paths).unwrap();
+        plant_job(&s, "PH.start", "job.started", "batch-10");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()]
+        );
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
     }
 
     #[test]
