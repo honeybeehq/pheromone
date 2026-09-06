@@ -58,8 +58,12 @@ hold until catch-up finishes, so a later live event cannot consume `limit`,
 arm shaping, or skip expect arm/disarm before history. A held origin arms
 its absence timer; a completion that arrives while the origin is held
 stays in the hold and disarms in seq order. Timer persist failures
-propagate through that cascade: catch-up returns an error and the
-listener disconnects rather than advancing past an undurable arm. `last_sent` is output dedup
+propagate through that cascade: a failed arm truncates the in-memory
+timer; a failed disarm restores the previous timer list. Catch-up
+returns an error and the listener disconnects rather than advancing
+past an undurable arm. The follower does not move `matched_through`
+onto a seq whose cascade failed; the same seq is retried. That is not
+a catch-up-style disconnect. `last_sent` is output dedup
 only; it is not the limit/shaping/expect boundary. Hold overflow is the
 same lag disconnect as the live queue.
 

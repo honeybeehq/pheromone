@@ -793,6 +793,7 @@ impl State {
                     "pherd: cascade failed for {} (seq {}): {e}",
                     event.id, pos.seq
                 );
+                break;
             }
             self.matched_through = pos.seq;
             processed += 1;
@@ -1690,10 +1691,14 @@ impl State {
 
     fn disarm_listener_timers(&mut self, sub_id: &str, event: &Envelope) -> Result<(), String> {
         let Some(sub) = self.matcher.get(sub_id) else {
+            let snapshot = self.timers.clone();
             let before = self.timers.len();
             self.timers.retain(|t| t.sub_id != sub_id);
             if self.timers.len() != before {
-                self.persist_timers().map_err(|e| e.to_string())?;
+                if let Err(e) = self.persist_timers() {
+                    self.timers = snapshot;
+                    return Err(e.to_string());
+                }
             }
             return Ok(());
         };
@@ -1704,6 +1709,7 @@ impl State {
             return Ok(());
         }
         let where_expr = expect.where_expr.clone();
+        let snapshot = self.timers.clone();
         let mut disarmed = false;
         self.timers.retain(|timer| {
             if timer.sub_id != sub_id {
@@ -1725,7 +1731,10 @@ impl State {
             }
         });
         if disarmed {
-            self.persist_timers().map_err(|e| e.to_string())?;
+            if let Err(e) = self.persist_timers() {
+                self.timers = snapshot;
+                return Err(e.to_string());
+            }
         }
         Ok(())
     }
@@ -4267,6 +4276,105 @@ mod follower_tests {
             state.lock().unwrap().matcher.get(&att.id).is_some(),
             "replay error is fail-closed; caller detaches"
         );
+        state.lock().unwrap().fail_persist_timers = false;
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()]
+        );
+    }
+
+    #[test]
+    fn follower_does_not_advance_matched_through_on_timer_persist_failure() {
+        let paths = fresh_home("follow-persist");
+        let s = State::load(paths).unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let prior = {
+            let mut s = state.lock().unwrap();
+            s.drain();
+            let prior = s.matched_through;
+            s.fail_persist_timers = true;
+            ingest_job(&mut s, "job.started", "batch-12");
+            s.drain();
+            prior
+        };
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.matched_through, prior,
+                "failed persist must not consume the origin seq"
+            );
+            assert!(timer_origin_ids(&s, &att.id).is_empty());
+        }
+        {
+            let mut s = state.lock().unwrap();
+            s.fail_persist_timers = false;
+            s.drain();
+        }
+        assert_eq!(timer_origin_ids(&state.lock().unwrap(), &att.id).len(), 1);
+        assert!(
+            state.lock().unwrap().matched_through > prior,
+            "retry after durable persist must advance past the origin"
+        );
+    }
+
+    #[test]
+    fn follower_disarm_persist_failure_restores_timer() {
+        let paths = fresh_home("disarm-persist");
+        let mut s = State::load(paths).unwrap();
+        plant_job(&s, "PH.start", "job.started", "batch-13");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()]
+        );
+        let prior = {
+            let mut s = state.lock().unwrap();
+            s.drain();
+            let prior = s.matched_through;
+            s.fail_persist_timers = true;
+            ingest_job(&mut s, "job.finished", "batch-13");
+            s.drain();
+            prior
+        };
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                timer_origin_ids(&s, &att.id),
+                vec!["PH.start".to_string()],
+                "failed disarm persist must restore the timer"
+            );
+            assert_eq!(s.matched_through, prior);
+        }
+        {
+            let mut s = state.lock().unwrap();
+            s.fail_persist_timers = false;
+            s.drain();
+        }
+        assert!(timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty());
     }
 
     #[test]
