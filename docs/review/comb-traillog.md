@@ -70,7 +70,11 @@ retry after persist failure cannot leave two timers. Catch-up
 returns an error and the listener disconnects rather than advancing
 past an undurable arm. The follower does not move `matched_through`
 onto a seq whose cascade failed; the same seq is retried. That is not
-a catch-up-style disconnect. For one event, every matching listener's
+a catch-up-style disconnect. Parent regressions
+`review_failed_timer_arm_does_not_advance_follower` and
+`review_failed_disarm_retry_clears_durable_timer` cover unconsumed
+cursor after injected arm failure, and a successful disarm retry that
+clears the durable timer file. For one event, every matching listener's
 timer persist runs before any delivery, limit, or shaping, so a failed
 expect persist cannot leave a sibling stream already delivered. `last_sent` is output dedup
 only; it is not the limit/shaping/expect boundary. Hold overflow is the
