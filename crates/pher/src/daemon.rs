@@ -163,9 +163,17 @@ pub(crate) struct State {
     outbox: Vec<OutboxEntry>,
     /// Nudges the outbox worker after an enqueue (fallback: 1s tick).
     outbox_tx: Option<mpsc::Sender<()>>,
+    /// Last seq each listener fully applied. Retry of a failed seq skips
+    /// these so delivery/limit/shaping are not repeated.
+    applied_seqs: HashMap<String, u64>,
     /// Test seam: persist_timers returns Err so catch-up/follower fail closed.
     #[cfg(test)]
     fail_persist_timers: bool,
+    /// Test seam: fail on this 1-based persist_timers call (others succeed).
+    #[cfg(test)]
+    fail_persist_on_nth: Option<u32>,
+    #[cfg(test)]
+    persist_call_n: u32,
 }
 
 /// Evaporation bound for the forwarded-delivery dedup window.
@@ -482,8 +490,13 @@ impl State {
             outbox,
             outbox_tx: None,
             catchup_lines: None,
+            applied_seqs: HashMap::new(),
             #[cfg(test)]
             fail_persist_timers: false,
+            #[cfg(test)]
+            fail_persist_on_nth: None,
+            #[cfg(test)]
+            persist_call_n: 0,
         };
         let has_judge_subs = state
             .matcher
@@ -519,10 +532,13 @@ impl State {
         write_json_atomic(&self.paths.subs(), &serde_json::to_value(list)?)
     }
 
-    fn persist_timers(&self) -> anyhow::Result<()> {
+    fn persist_timers(&mut self) -> anyhow::Result<()> {
         #[cfg(test)]
-        if self.fail_persist_timers {
-            anyhow::bail!("injected persist_timers failure");
+        {
+            self.persist_call_n = self.persist_call_n.saturating_add(1);
+            if self.fail_persist_timers || self.fail_persist_on_nth == Some(self.persist_call_n) {
+                anyhow::bail!("injected persist_timers failure");
+            }
         }
         write_json_atomic(&self.paths.timers(), &serde_json::to_value(&self.timers)?)
     }
@@ -833,7 +849,7 @@ impl State {
                 ids.push(id);
             }
         }
-        let mut proceed = Vec::new();
+        let mut deliveries = 0u64;
         for sub_id in ids {
             if !matches!(
                 self.hold_listen_catchup(&sub_id, seq, event),
@@ -841,17 +857,14 @@ impl State {
             ) {
                 continue;
             }
-            proceed.push(sub_id);
-        }
-        // Fallible timer persist for every matching listener before any
-        // irreversible delivery, limit, or shaping. Otherwise a later persist
-        // failure retries the seq and re-delivers listeners that already ran.
-        for sub_id in &proceed {
-            self.apply_timer_phase(sub_id, seq, event)?;
-        }
-        let mut deliveries = 0u64;
-        for sub_id in &proceed {
-            deliveries += self.apply_delivery_phase(sub_id, seq, event);
+            if self
+                .applied_seqs
+                .get(&sub_id)
+                .is_some_and(|&applied| applied >= seq)
+            {
+                continue;
+            }
+            deliveries += self.apply_to_listener(&sub_id, seq, event)?;
         }
 
         // Tiers 3-4: subscriptions whose tiers 1-2 passed but carry `meaning`
@@ -1650,15 +1663,26 @@ impl State {
     /// Per-listener cascade: disarm expect timers, then arm or
     /// shape/limit-deliver. Catch-up, hold release, and the follower share
     /// this path so listen+expect keeps arm/disarm order across handoff.
-    /// Persist failures propagate so catch-up can fail closed.
+    /// Persist failures propagate so catch-up can fail closed. A listener
+    /// that fully applied this seq is recorded so a later retry cannot
+    /// repeat delivery, limit, shaping, or timer arm.
     fn apply_to_listener(
         &mut self,
         sub_id: &str,
         seq: u64,
         event: &Envelope,
     ) -> Result<u64, String> {
+        if self
+            .applied_seqs
+            .get(sub_id)
+            .is_some_and(|&applied| applied >= seq)
+        {
+            return Ok(0);
+        }
         self.apply_timer_phase(sub_id, seq, event)?;
-        Ok(self.apply_delivery_phase(sub_id, seq, event))
+        let n = self.apply_delivery_phase(sub_id, seq, event);
+        self.applied_seqs.insert(sub_id.to_string(), seq);
+        Ok(n)
     }
 
     fn apply_timer_phase(
@@ -1783,6 +1807,13 @@ impl State {
         seq: u64,
         event: &Envelope,
     ) -> ListenCatchupHold {
+        if self
+            .applied_seqs
+            .get(sub_id)
+            .is_some_and(|&applied| applied >= seq)
+        {
+            return ListenCatchupHold::Skip;
+        }
         {
             let Some(handle) = self.listeners.get_mut(sub_id) else {
                 return ListenCatchupHold::Proceed;
@@ -1793,6 +1824,9 @@ impl State {
             let Some(held) = handle.held_live.as_mut() else {
                 return ListenCatchupHold::Proceed;
             };
+            if held.iter().any(|(held_seq, _)| *held_seq == seq) {
+                return ListenCatchupHold::Held;
+            }
             if held.len() < LIVE_QUEUE {
                 held.push_back((seq, event.clone()));
                 return ListenCatchupHold::Held;
@@ -1821,6 +1855,7 @@ impl State {
 
     fn remove_sub(&mut self, id: &str, reason: &str) -> bool {
         let removed = self.matcher.remove(id);
+        self.applied_seqs.remove(id);
         if removed {
             self.metas.remove(id);
             self.timers.retain(|t| t.sub_id != id);
@@ -4563,23 +4598,145 @@ mod follower_tests {
         s.fail_persist_timers = true;
         s.follow_step(256);
         assert_eq!(s.matched_through, before);
-        assert!(
-            drain_rx(&plain.rx).is_empty(),
-            "timer persist must fail before irreversible delivery"
-        );
+        assert_eq!(drain_rx(&plain.rx), vec![origin.id.clone()]);
         s.fail_persist_timers = false;
         s.follow_step(256);
         assert_eq!(timer_origin_ids(&s, &expect.id).len(), 1);
-        assert_eq!(drain_rx(&plain.rx), vec![origin.id.clone()]);
-        assert!(
-            s.matcher.get(&plain.id).is_some(),
-            "limit must not be consumed twice on retry"
-        );
-        s.follow_step(256);
         assert!(
             drain_rx(&plain.rx).is_empty(),
-            "retry must not repeat delivery to an already successful listener"
+            "retry repeated delivery to an already successful listener"
         );
+        assert!(
+            s.matcher.get(&plain.id).is_some(),
+            "retry consumed the listener limit twice"
+        );
+    }
+
+    #[test]
+    fn review_timer_retry_does_not_repeat_successful_expect_arm() {
+        let paths = fresh_home("review-partial-expect");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let first = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let second = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        let before = s.matched_through;
+        ingest_job(&mut s, "job.started", "review-two-expect");
+        let head = s.log.head_seq().unwrap();
+        let origin = s.log.read(Pos::local(head), 1).unwrap().pop().unwrap().1;
+        let order = s.matcher.match_ids(&origin);
+        assert_eq!(
+            order,
+            vec![first.id.as_str(), second.id.as_str()],
+            "fixture must arm the first expect before the later persist failure"
+        );
+        s.fail_persist_on_nth = Some(2);
+        s.follow_step(256);
+        assert_eq!(s.matched_through, before);
+        assert_eq!(timer_origin_ids(&s, &first.id).len(), 1);
+        assert!(
+            timer_origin_ids(&s, &second.id).is_empty(),
+            "later expect persist must fail after the first arm"
+        );
+        assert_eq!(persisted_timer_origin_ids(&s, &first.id).len(), 1);
+        s.fail_persist_on_nth = None;
+        s.follow_step(256);
+        assert_eq!(
+            timer_origin_ids(&s, &first.id).len(),
+            1,
+            "retry duplicated a timer that already armed"
+        );
+        assert_eq!(timer_origin_ids(&s, &second.id).len(), 1);
+        assert_eq!(s.matched_through, head);
+    }
+
+    #[test]
+    fn review_timer_retry_does_not_duplicate_held_live() {
+        let paths = fresh_home("review-held-retry");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let held = attach_listener(
+            &state,
+            "on job.started then stream limit 2",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        let expect = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        let before = s.matched_through;
+        let origin = ingest_job(&mut s, "job.started", "review-held");
+        s.fail_persist_timers = true;
+        s.follow_step(256);
+        assert_eq!(s.matched_through, before);
+        s.fail_persist_timers = false;
+        s.follow_step(256);
+        assert_eq!(timer_origin_ids(&s, &expect.id).len(), 1);
+        s.release_listen_catchup(&held.id).unwrap();
+        assert_eq!(
+            drain_rx(&held.rx),
+            vec![origin],
+            "retry queued duplicate live events during catch-up"
+        );
+        assert!(
+            s.matcher.get(&held.id).is_some(),
+            "duplicate held event consumed limit twice"
+        );
+    }
+
+    #[test]
+    fn review_timer_retry_does_not_repeat_released_held_live() {
+        let paths = fresh_home("review-held-release-retry");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let held = attach_listener(
+            &state,
+            "on job.started then stream limit 2",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        let expect = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let origin = {
+            let mut s = state.lock().unwrap();
+            s.matched_through = s.log.head_seq().unwrap();
+            let before = s.matched_through;
+            let origin = ingest_job(&mut s, "job.started", "review-held-rel");
+            s.fail_persist_timers = true;
+            s.follow_step(256);
+            assert_eq!(s.matched_through, before);
+            origin
+        };
+        replay_listen_catchup(
+            &state,
+            &held.id,
+            &held.log,
+            held.catchup_from.unwrap(),
+            held.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(drain_rx(&held.rx), vec![origin.clone()]);
+        {
+            let mut s = state.lock().unwrap();
+            s.fail_persist_timers = false;
+            s.follow_step(256);
+            assert_eq!(timer_origin_ids(&s, &expect.id).len(), 1);
+            assert!(
+                drain_rx(&held.rx).is_empty(),
+                "retry re-delivered after catch-up already released the hold"
+            );
+            assert!(
+                s.matcher.get(&held.id).is_some(),
+                "retry consumed the released listener limit twice"
+            );
+        }
     }
 
     #[test]

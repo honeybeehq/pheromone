@@ -74,9 +74,17 @@ a catch-up-style disconnect. Parent regressions
 `review_failed_timer_arm_does_not_advance_follower` and
 `review_failed_disarm_retry_clears_durable_timer` cover unconsumed
 cursor after injected arm failure, and a successful disarm retry that
-clears the durable timer file. For one event, every matching listener's
-timer persist runs before any delivery, limit, or shaping, so a failed
-expect persist cannot leave a sibling stream already delivered. `last_sent` is output dedup
+clears the durable timer file. Matching listeners still apply in
+registration order. A listener that fully applies (delivery/limit/
+shaping or a durable expect arm) is recorded for that seq; a later
+listener's persist failure leaves the cursor unconsumed, and retry
+skips already-applied listeners so a sibling stream is not delivered
+twice and a successful arm is not duplicated. A live seq already in a
+catch-up hold is not queued again on retry; if catch-up releases
+between the failed attempt and the retry, `applied_seqs` keeps the
+released delivery from repeating. Meaning/judge for that seq run only
+after every matching listener's per-listener cascade succeeds, so they
+are not independently retried. `last_sent` is output dedup
 only; it is not the limit/shaping/expect boundary. Hold overflow is the
 same lag disconnect as the live queue.
 
