@@ -1665,7 +1665,8 @@ impl State {
     /// this path so listen+expect keeps arm/disarm order across handoff.
     /// Persist failures propagate so catch-up can fail closed. A listener
     /// that fully applied this seq is recorded so a later retry cannot
-    /// repeat delivery, limit, shaping, or timer arm.
+    /// repeat delivery, limit, shaping, or timer arm. Delivery that
+    /// retires the subscription must not reinsert that progress.
     fn apply_to_listener(
         &mut self,
         sub_id: &str,
@@ -1681,7 +1682,9 @@ impl State {
         }
         self.apply_timer_phase(sub_id, seq, event)?;
         let n = self.apply_delivery_phase(sub_id, seq, event);
-        self.applied_seqs.insert(sub_id.to_string(), seq);
+        if self.matcher.get(sub_id).is_some() {
+            self.applied_seqs.insert(sub_id.to_string(), seq);
+        }
         Ok(n)
     }
 
@@ -4598,6 +4601,32 @@ mod follower_tests {
             "successful retry left the cancelled timer on disk"
         );
         assert!(timer_origin_ids(&s, &att.id).is_empty());
+    }
+
+    #[test]
+    fn review_retired_listener_drops_applied_progress() {
+        let paths = fresh_home("review-retired-progress");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let att = attach_listener(
+            &state,
+            "on job.started then stream limit 1",
+            &[],
+            "test",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        ingest_job(&mut s, "job.started", "review-retired");
+        s.follow_step(256);
+        assert_eq!(drain_rx(&att.rx).len(), 1);
+        assert!(s.matcher.get(&att.id).is_none());
+        assert!(
+            !s.applied_seqs.contains_key(&att.id),
+            "retired listener leaked its applied progress entry"
+        );
     }
 
     #[test]

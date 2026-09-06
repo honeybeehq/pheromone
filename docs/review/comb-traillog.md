@@ -76,9 +76,11 @@ a catch-up-style disconnect. Parent regressions
 cursor after injected arm failure, and a successful disarm retry that
 clears the durable timer file. Matching listeners still apply in
 registration order. A listener that fully applies (delivery/limit/
-shaping or a durable expect arm) is recorded for that seq; a later
-listener's persist failure leaves the cursor unconsumed, and retry
-skips already-applied listeners so a sibling stream is not delivered
+shaping or a durable expect arm) is recorded for that seq if it is
+still registered; a delivery that retires the listener (limit reached)
+must not reinsert progress after `remove_sub`. A later listener's
+persist failure leaves the cursor unconsumed, and retry skips
+already-applied listeners so a sibling stream is not delivered
 twice and a successful arm is not duplicated. A live seq already in a
 catch-up hold is not queued again on retry; if catch-up releases
 between the failed attempt and the retry, `applied_seqs` keeps the
