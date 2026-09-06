@@ -20,10 +20,13 @@ Two rusqlite connections to `pher.db`. SqliteLog is the only writer of
 `events` and `log_state`. Seed is one `BEGIN IMMEDIATE` (`INSERT OR IGNORE`
 head/floor). Concurrent first opens cannot lower a persisted head. Leftover
 pre-A1 rows are adopted only when head is still 0 in that transaction.
-`busy_timeout` is installed before `journal_mode=WAL` and schema init.
-First-open WAL/schema/seed retries SQLITE_BUSY and SQLITE_LOCKED with a
-bounded backoff (32 attempts, 1–50ms). Tested with 24 isolated pairs of
-adopt-head concurrent opens and 24 isolated 4-way fresh-path opens.
+First-open is serialized with an atomic `pher.db.initlock` directory
+(create_dir). `Connection::open` is retried on SQLITE_BUSY before any
+pragma: that call can fail with code 5 while the busy handler is still
+unset. Then `busy_timeout` is installed, and WAL/schema/seed retry
+SQLITE_BUSY and SQLITE_LOCKED (code + "database is locked" display,
+32 attempts, 1–50ms). Tested with 24 isolated adopt-head pairs and
+24 isolated 4-way fresh-path opens.
 
 ## Retention vs since
 
@@ -52,7 +55,9 @@ and expect follow-ups above the captured head wait in a `LIVE_QUEUE`-capped
 hold until catch-up finishes, so a later live event cannot consume `limit`,
 arm shaping, or skip expect arm/disarm before history. A held origin arms
 its absence timer; a completion that arrives while the origin is held
-stays in the hold and disarms in seq order. `last_sent` is output dedup
+stays in the hold and disarms in seq order. Timer persist failures
+propagate through that cascade: catch-up returns an error and the
+listener disconnects rather than advancing past an undurable arm. `last_sent` is output dedup
 only; it is not the limit/shaping/expect boundary. Hold overflow is the
 same lag disconnect as the live queue.
 

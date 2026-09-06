@@ -163,6 +163,9 @@ pub(crate) struct State {
     outbox: Vec<OutboxEntry>,
     /// Nudges the outbox worker after an enqueue (fallback: 1s tick).
     outbox_tx: Option<mpsc::Sender<()>>,
+    /// Test seam: persist_timers returns Err so catch-up/follower fail closed.
+    #[cfg(test)]
+    fail_persist_timers: bool,
 }
 
 /// Evaporation bound for the forwarded-delivery dedup window.
@@ -479,6 +482,8 @@ impl State {
             outbox,
             outbox_tx: None,
             catchup_lines: None,
+            #[cfg(test)]
+            fail_persist_timers: false,
         };
         let has_judge_subs = state
             .matcher
@@ -515,6 +520,10 @@ impl State {
     }
 
     fn persist_timers(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.fail_persist_timers {
+            anyhow::bail!("injected persist_timers failure");
+        }
         write_json_atomic(&self.paths.timers(), &serde_json::to_value(&self.timers)?)
     }
 
@@ -831,7 +840,7 @@ impl State {
             ) {
                 continue;
             }
-            deliveries += self.apply_to_listener(&sub_id, seq, event);
+            deliveries += self.apply_to_listener(&sub_id, seq, event)?;
         }
 
         // Tiers 3-4: subscriptions whose tiers 1-2 passed but carry `meaning`
@@ -877,7 +886,7 @@ impl State {
                     meaning_record = Some(record);
                 }
                 if sub.expect.is_some() {
-                    self.arm_expect_timer(&sub_id, &sub, event, seq);
+                    self.arm_expect_timer(&sub_id, &sub, event, seq)?;
                     continue;
                 }
                 if sub.judge.is_some() {
@@ -1630,52 +1639,69 @@ impl State {
     /// Per-listener cascade: disarm expect timers, then arm or
     /// shape/limit-deliver. Catch-up, hold release, and the follower share
     /// this path so listen+expect keeps arm/disarm order across handoff.
-    fn apply_to_listener(&mut self, sub_id: &str, seq: u64, event: &Envelope) -> u64 {
+    /// Persist failures propagate so catch-up can fail closed.
+    fn apply_to_listener(
+        &mut self,
+        sub_id: &str,
+        seq: u64,
+        event: &Envelope,
+    ) -> Result<u64, String> {
         self.current_seq = Some(seq);
-        self.disarm_listener_timers(sub_id, event);
+        self.disarm_listener_timers(sub_id, event)?;
         let Some(sub) = self.matcher.get(sub_id).cloned() else {
-            return 0;
+            return Ok(0);
         };
         match check(&sub, event, None) {
             Check::Matched => {
                 if sub.expect.is_some() {
-                    self.arm_expect_timer(sub_id, &sub, event, seq);
-                    0
+                    self.arm_expect_timer(sub_id, &sub, event, seq)?;
+                    Ok(0)
                 } else {
-                    self.try_deliver(sub_id, event).unwrap_or(0)
+                    Ok(self.try_deliver(sub_id, event).unwrap_or(0))
                 }
             }
-            _ => 0,
+            _ => Ok(0),
         }
     }
 
-    fn arm_expect_timer(&mut self, sub_id: &str, sub: &Subscription, event: &Envelope, seq: u64) {
+    fn arm_expect_timer(
+        &mut self,
+        sub_id: &str,
+        sub: &Subscription,
+        event: &Envelope,
+        seq: u64,
+    ) -> Result<(), String> {
         let Some(expect) = &sub.expect else {
-            return;
+            return Ok(());
         };
+        let n = self.timers.len();
         self.timers.push(Timer {
             sub_id: sub_id.to_string(),
             origin: event.clone(),
             deadline: now_unix() + expect.within.secs(),
             seq: Some(seq),
         });
-        let _ = self.persist_timers();
+        if let Err(e) = self.persist_timers() {
+            self.timers.truncate(n);
+            return Err(e.to_string());
+        }
+        Ok(())
     }
 
-    fn disarm_listener_timers(&mut self, sub_id: &str, event: &Envelope) {
+    fn disarm_listener_timers(&mut self, sub_id: &str, event: &Envelope) -> Result<(), String> {
         let Some(sub) = self.matcher.get(sub_id) else {
             let before = self.timers.len();
             self.timers.retain(|t| t.sub_id != sub_id);
             if self.timers.len() != before {
-                let _ = self.persist_timers();
+                self.persist_timers().map_err(|e| e.to_string())?;
             }
-            return;
+            return Ok(());
         };
         let Some(expect) = &sub.expect else {
-            return;
+            return Ok(());
         };
         if !expect.subject.matches(&event.subject) {
-            return;
+            return Ok(());
         }
         let where_expr = expect.where_expr.clone();
         let mut disarmed = false;
@@ -1699,8 +1725,9 @@ impl State {
             }
         });
         if disarmed {
-            let _ = self.persist_timers();
+            self.persist_timers().map_err(|e| e.to_string())?;
         }
+        Ok(())
     }
 
     /// Catch-up owns seqs <= captured through. Live matches and expect
@@ -1732,20 +1759,21 @@ impl State {
         ListenCatchupHold::Held
     }
 
-    fn release_listen_catchup(&mut self, sub_id: &str) {
+    fn release_listen_catchup(&mut self, sub_id: &str) -> Result<(), String> {
         let Some(held) = self
             .listeners
             .get_mut(sub_id)
             .and_then(|h| h.held_live.take())
         else {
-            return;
+            return Ok(());
         };
         for (seq, event) in held {
             if self.matcher.get(sub_id).is_none() {
                 break;
             }
-            let _ = self.apply_to_listener(sub_id, seq, &event);
+            self.apply_to_listener(sub_id, seq, &event)?;
         }
+        Ok(())
     }
 
     fn remove_sub(&mut self, id: &str, reason: &str) -> bool {
@@ -1898,7 +1926,9 @@ impl State {
                         continue;
                     }
                 }
-                replayed += self.apply_to_listener(sub_id, pos.seq, &event);
+                replayed += self
+                    .apply_to_listener(sub_id, pos.seq, &event)
+                    .map_err(|e| TrailError::Storage(anyhow::anyhow!(e)))?;
                 from = pos
                     .seq
                     .checked_add(1)
@@ -3035,7 +3065,10 @@ pub(crate) fn replay_listen_catchup(
                     continue;
                 }
             }
-            let _ = s.apply_to_listener(sub_id, pos.seq, &event);
+            if let Err(e) = s.apply_to_listener(sub_id, pos.seq, &event) {
+                s.catchup_lines = None;
+                return Err(CatchupError::Failed(e));
+            }
             from = match pos.seq.checked_add(1) {
                 Some(n) => n,
                 None => {
@@ -3057,7 +3090,9 @@ pub(crate) fn replay_listen_catchup(
         }
     }
     let mut s = state.lock().unwrap();
-    s.release_listen_catchup(sub_id);
+    if let Err(e) = s.release_listen_catchup(sub_id) {
+        return Err(CatchupError::Failed(e));
+    }
     Ok(replayed)
 }
 
@@ -4198,6 +4233,40 @@ mod follower_tests {
             vec!["PH.start".to_string()]
         );
         assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+    }
+
+    #[test]
+    fn listen_catchup_fails_closed_when_expect_timer_persist_fails() {
+        let paths = fresh_home("expect-persist");
+        let mut s = State::load(paths).unwrap();
+        plant_job(&s, "PH.start", "job.started", "batch-11");
+        s.matched_through = s.log.head_seq().unwrap();
+        s.fail_persist_timers = true;
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        let err = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, CatchupError::Failed(e) if e.contains("injected persist_timers")),
+            "{err}"
+        );
+        assert!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty(),
+            "failed persist must not leave an undurable timer"
+        );
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+        assert!(
+            state.lock().unwrap().matcher.get(&att.id).is_some(),
+            "replay error is fail-closed; caller detaches"
+        );
     }
 
     #[test]
