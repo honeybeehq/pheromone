@@ -1573,7 +1573,7 @@ impl State {
                     _ => json!({ "sink": "stream", "error": "listener gone" }),
                 };
                 if result.get("error").and_then(|e| e.as_str()) == Some("lag") {
-                    self.listeners.remove(&block.subscription);
+                    self.remove_sub(&block.subscription, "listener lagged");
                 }
                 result
             }
@@ -2632,7 +2632,13 @@ pub(crate) fn page_tail_backlog(
     through: u64,
     mut emit: impl FnMut(u64, Envelope) -> bool,
 ) {
-    let from = after.unwrap_or(0).saturating_add(1);
+    let from = match after {
+        None => 1,
+        Some(a) => match next_after(a) {
+            Some(f) => f,
+            None => return,
+        },
+    };
     if last == Some(0) {
         return;
     }
@@ -2644,7 +2650,7 @@ pub(crate) fn page_tail_backlog(
         } else {
             from
         };
-        let _ = for_each_page(log, start, Some(through), |seq, event| {
+        if for_each_page(log, start, Some(through), |seq, event| {
             if let Some(p) = pattern {
                 if !p.matches(&event.subject) {
                     return true;
@@ -2655,7 +2661,11 @@ pub(crate) fn page_tail_backlog(
             }
             ring.push_back((seq, event));
             true
-        });
+        })
+        .is_err()
+        {
+            return;
+        }
         for (seq, event) in ring {
             if !emit(seq, event) {
                 break;
@@ -2774,25 +2784,35 @@ pub(crate) fn attach_listener(
     let mut ts_cutoff = None;
     let mut gap_expired = 0u64;
     if let Some(after) = resume_after {
-        let from = after.saturating_add(1);
-        catchup_from = Some(from);
-        match s.log.read(Pos::local(from.max(1)), 1) {
-            Ok(page) => {
-                if let Some((pos, _)) = page.first() {
-                    gap_expired = pos.seq.saturating_sub(after + 1);
+        match next_after(after) {
+            None => {}
+            Some(from) => {
+                catchup_from = Some(from);
+                match s.log.read(Pos::local(from.max(1)), 1) {
+                    Ok(page) => {
+                        if let Some((pos, _)) = page.first() {
+                            gap_expired = pos.seq.saturating_sub(from);
+                        }
+                    }
+                    Err(TrailError::Trimmed { resume_at }) => {
+                        gap_expired = resume_at.seq.saturating_sub(from);
+                        catchup_from = Some(resume_at.seq);
+                    }
+                    Err(e) => {
+                        s.remove_sub(&id, "catch-up read failed");
+                        return Err(err(e));
+                    }
                 }
             }
-            Err(TrailError::Trimmed { resume_at }) => {
-                gap_expired = resume_at.seq.saturating_sub(after + 1);
-                catchup_from = Some(resume_at.seq);
-            }
-            Err(_) => {}
         }
     } else if let Some(replay) = sub.as_ref().and_then(|sub| sub.replay.clone()) {
         let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
         match s.log.seek_ts(0, &cutoff) {
             Ok(p) => catchup_from = Some(p.seq),
-            Err(e) => eprintln!("pherd: seek_ts failed: {e}"),
+            Err(e) => {
+                s.remove_sub(&id, "catch-up seek failed");
+                return Err(err(e));
+            }
         }
         ts_cutoff = Some(cutoff);
     }
@@ -2810,24 +2830,7 @@ pub(crate) fn attach_listener(
     let semantic_sub = sub
         .as_ref()
         .is_some_and(|sub| sub.meaning.is_some() || sub.judge.is_some());
-    drop(s);
-
-    let mut replayed = 0u64;
-    if let (Some(from), Some(sub)) = (catchup_from, sub.as_ref()) {
-        let _ = for_each_page(log.as_ref(), from, Some(through), |_, event| {
-            if let Some(min) = ts_cutoff.as_deref() {
-                if event.ts.as_str() < min {
-                    return true;
-                }
-            }
-            if matches!(evaluate(&id, sub, &event, None).outcome, Outcome::Matched) {
-                replayed += 1;
-            }
-            true
-        });
-    }
-    ack["replayed"] = json!(replayed);
-    if semantic_sub && (resume_after.is_some() || replayed > 0) {
+    if semantic_sub && (resume_after.is_some() || catchup_from.is_some()) {
         if let Some(w) = ack.get_mut("warnings").and_then(|w| w.as_array_mut()) {
             w.push(json!(
                 "catch-up replay evaluates tiers 1-2 only; meaning/judge verdicts \
@@ -2835,6 +2838,7 @@ pub(crate) fn attach_listener(
             ));
         }
     }
+    drop(s);
     Ok(ListenAttachment {
         id,
         ack,
@@ -2846,8 +2850,13 @@ pub(crate) fn attach_listener(
     })
 }
 
+fn next_after(seq: u64) -> Option<u64> {
+    seq.checked_add(1)
+}
+
 /// Page catch-up matches to `emit` without filling the live channel.
-/// Short State lock per page. Returns how many lines were emitted.
+/// Short State lock per page. Trim or corruption after ack is an error so
+/// the client disconnects and resumes; omitted records are not success.
 pub(crate) fn replay_listen_catchup(
     state: &Arc<Mutex<State>>,
     sub_id: &str,
@@ -2856,7 +2865,7 @@ pub(crate) fn replay_listen_catchup(
     through: u64,
     ts_cutoff: Option<&str>,
     mut emit: impl FnMut(&str) -> bool,
-) -> u64 {
+) -> Result<u64, CatchupError> {
     let mut replayed = 0u64;
     let mut from = from;
     loop {
@@ -2866,10 +2875,11 @@ pub(crate) fn replay_listen_catchup(
         let page = match log.read(Pos::local(from.max(1)), LOG_PAGE) {
             Ok(p) => p,
             Err(TrailError::Trimmed { resume_at }) => {
-                from = resume_at.seq;
-                continue;
+                return Err(CatchupError::Trimmed {
+                    resume_at: resume_at.seq,
+                });
             }
-            Err(_) => break,
+            Err(e) => return Err(CatchupError::Failed(e.to_string())),
         };
         if page.is_empty() {
             break;
@@ -2882,27 +2892,56 @@ pub(crate) fn replay_listen_catchup(
             }
             if let Some(min) = ts_cutoff {
                 if event.ts.as_str() < min {
-                    from = pos.seq.saturating_add(1);
+                    from = match pos.seq.checked_add(1) {
+                        Some(n) => n,
+                        None => {
+                            s.catchup_lines = None;
+                            return Err(CatchupError::Failed("sequence overflow".into()));
+                        }
+                    };
                     continue;
                 }
             }
             s.current_seq = Some(pos.seq);
             let _ = s.try_deliver(sub_id, &event);
-            from = pos.seq.saturating_add(1);
+            from = match pos.seq.checked_add(1) {
+                Some(n) => n,
+                None => {
+                    s.catchup_lines = None;
+                    return Err(CatchupError::Failed("sequence overflow".into()));
+                }
+            };
         }
         let lines = s.catchup_lines.take().unwrap_or_default();
         drop(s);
         for line in &lines {
             replayed += 1;
             if !emit(line) {
-                return replayed;
+                return Ok(replayed);
             }
         }
         if from > through {
             break;
         }
     }
-    replayed
+    Ok(replayed)
+}
+
+#[derive(Debug)]
+pub(crate) enum CatchupError {
+    Trimmed { resume_at: u64 },
+    Failed(String),
+}
+
+impl std::fmt::Display for CatchupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CatchupError::Trimmed { resume_at } => {
+                write!(f, "catch-up trimmed; resume at seq {resume_at}")
+            }
+            CatchupError::Failed(e) => write!(f, "catch-up failed: {e}"),
+        }
+    }
 }
 
 /// Tear a listener's subscription down. Guarded: only the party that still
@@ -2951,7 +2990,7 @@ fn handle_listen(
     let mut last_sent = 0u64;
     if let Some(from) = attached.catchup_from {
         let mut write_ok = true;
-        replay_listen_catchup(
+        match replay_listen_catchup(
             state,
             &sub_id,
             &attached.log,
@@ -2970,7 +3009,14 @@ fn handle_listen(
                 last_sent = last_sent.max(seq);
                 true
             },
-        );
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                let _ = writeln!(writer, "{}", err(&e));
+                detach_listener(state, &sub_id, &e.to_string());
+                return Ok(());
+            }
+        }
         if !write_ok {
             detach_listener(state, &sub_id, "listener disconnected");
             return Ok(());
@@ -3367,6 +3413,238 @@ mod follower_tests {
             att.rx.try_recv().is_err(),
             "live queue must be empty until the consumer pages catch-up"
         );
-        assert!(att.ack["replayed"].as_u64().unwrap() >= 1);
+        assert!(
+            att.ack.get("replayed").is_none(),
+            "ack must not claim an evaluate() estimate as delivered"
+        );
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 40);
+    }
+
+    #[test]
+    fn after_u64_max_does_not_overflow() {
+        let paths = fresh_home("after-max");
+        let s = State::load(paths).unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(u64::MAX),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(att.catchup_from.is_none());
+        assert_eq!(att.ack.get("gapExpired"), None);
+    }
+
+    #[test]
+    fn catchup_fails_on_trim_not_omits_records() {
+        let paths = fresh_home("catchup-trim");
+        let s = State::load(paths).unwrap();
+        for i in 0..5 {
+            s.log
+                .append(&[Envelope {
+                    id: format!("PH.{i}"),
+                    ts: "2020-01-01T00:00:00Z".into(),
+                    node: "n".into(),
+                    source: "test".into(),
+                    event_type: "t.x".into(),
+                    subject: "t.x".into(),
+                    correlation: None,
+                    payload: json!({}),
+                    ttl_class: None,
+                    hops: None,
+                }])
+                .unwrap();
+        }
+        let through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        state
+            .lock()
+            .unwrap()
+            .log
+            .trim_before("2026-01-01T00:00:00Z")
+            .unwrap();
+        let err = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            through,
+            None,
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CatchupError::Trimmed { .. }), "{err}");
+    }
+
+    #[test]
+    fn catchup_fails_on_corrupt_row() {
+        let paths = fresh_home("catchup-corrupt");
+        let s = State::load(paths.clone()).unwrap();
+        s.log
+            .append(&[Envelope {
+                id: "PH.1".into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: "t.x".into(),
+                subject: "t.x".into(),
+                correlation: None,
+                payload: json!({}),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+        rusqlite::Connection::open(paths.home.join("pher.db"))
+            .unwrap()
+            .execute("UPDATE events SET envelope = 'nope' WHERE seq = 1", [])
+            .unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        );
+        match att {
+            Err(e) => assert!(e["error"].as_str().unwrap_or("").contains("corrupt")),
+            Ok(att) => {
+                let err = replay_listen_catchup(
+                    &state,
+                    &att.id,
+                    &att.log,
+                    att.catchup_from.unwrap_or(1),
+                    att.catchup_through.max(1),
+                    None,
+                    |_| true,
+                )
+                .unwrap_err();
+                assert!(matches!(err, CatchupError::Failed(_)), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn live_queue_overflow_removes_matcher_subscription() {
+        let paths = fresh_home("lag-sub");
+        let s = State::load(paths).unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att =
+            attach_listener(&state, "on t.** then stream", &[], "test", None, None, None).unwrap();
+        let id = att.id.clone();
+        for i in 0..(LIVE_QUEUE as u64 + 5) {
+            let mut s = state.lock().unwrap();
+            s.ingest(
+                PartialEvent {
+                    subject: "t.x".into(),
+                    payload: Some(json!({ "i": i })),
+                    event_type: None,
+                    source: Some("test".into()),
+                    correlation: None,
+                },
+                0,
+            )
+            .unwrap();
+            s.drain();
+        }
+        assert!(
+            state.lock().unwrap().matcher.get(&id).is_none(),
+            "lag must remove the matcher subscription, not only the channel"
+        );
+    }
+
+    #[test]
+    fn catchup_spans_pages_and_live_arrivals_use_the_bounded_queue() {
+        let paths = fresh_home("pages-live");
+        let mut s = State::load(paths).unwrap();
+        for i in 0..(LOG_PAGE as u64 + 20) {
+            s.log
+                .append(&[Envelope {
+                    id: format!("PH.{i}"),
+                    ts: now_ts(),
+                    node: "n".into(),
+                    source: "test".into(),
+                    event_type: "t.x".into(),
+                    subject: "t.x".into(),
+                    correlation: None,
+                    payload: json!({ "i": i }),
+                    ttl_class: None,
+                    hops: None,
+                }])
+                .unwrap();
+        }
+        let historical = s.log.head_seq().unwrap();
+        s.matched_through = historical;
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut n = 0u64;
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| {
+                n += 1;
+                if n == 1 {
+                    let mut s = state.lock().unwrap();
+                    s.ingest(
+                        PartialEvent {
+                            subject: "t.x".into(),
+                            payload: Some(json!({ "live": true })),
+                            event_type: None,
+                            source: Some("test".into()),
+                            correlation: None,
+                        },
+                        0,
+                    )
+                    .unwrap();
+                    s.drain();
+                }
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(n, historical);
+        assert!(
+            att.rx.try_recv().is_ok(),
+            "live arrival during catch-up goes on the bounded queue, not the catch-up page"
+        );
     }
 }

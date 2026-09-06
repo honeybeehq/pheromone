@@ -33,8 +33,11 @@ Tested with old/new/old/new.
 `read` pages at most `LOG_PAGE` (256). `trim_before` uses `LIMIT 1` for the
 first retained seq. Listen catch-up does not enqueue history on the live
 channel. The consumer pages after attach; live tails/listeners use
-`sync_channel(256)` and `try_send`. Full drops that consumer (lag
-disconnect). No bounded send waits under `Mutex<State>`.
+`sync_channel(256)` and `try_send`. Full drops that consumer and removes
+the matcher subscription. Catch-up trim/corruption after ack is an error
+(disconnect/resume), not silent omission. Ack does not include an
+`evaluate()` estimate as `replayed`. `after = u64::MAX` does not overflow.
+No bounded send waits under `Mutex<State>`.
 
 `read` and `seek_ts` each run floor + query in one SQLite transaction so a
 peer trim cannot turn a prefix into a silent empty page.

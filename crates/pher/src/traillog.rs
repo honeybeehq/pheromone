@@ -435,9 +435,6 @@ pub fn for_each_page(
                     from_seq = next;
                 }
             }
-            Err(TrailError::Trimmed { resume_at }) => {
-                from_seq = resume_at.seq;
-            }
             Err(e) => return Err(e),
         }
     }

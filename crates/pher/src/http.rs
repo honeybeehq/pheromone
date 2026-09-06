@@ -322,7 +322,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                 let mut last_sent = 0u64;
                 if let Some(from) = attached.catchup_from {
                     let mut write_ok = true;
-                    crate::daemon::replay_listen_catchup(
+                    match crate::daemon::replay_listen_catchup(
                         &state,
                         &sub_id,
                         &attached.log,
@@ -341,7 +341,16 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                             last_sent = last_sent.max(seq);
                             true
                         },
-                    );
+                    ) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = write_chunk(
+                                &mut writer,
+                                &format!("{}\n", crate::protocol::err(&e)),
+                            );
+                            return "catch-up failed";
+                        }
+                    }
                     if !write_ok {
                         return "listener disconnected";
                     }
