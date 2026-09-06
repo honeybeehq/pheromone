@@ -29,9 +29,11 @@ false. First-open still sets an explicit short init timeout (200ms)
 and retries typed `ErrorCode::DatabaseBusy` / `DatabaseLocked` (32
 attempts, 1–50ms), because WAL conversion can return SQLITE_BUSY
 without invoking the installed handler. Independently verified at
-de71087 (40 processes / 960 fresh paths). No mkdir init lock; no
-string-error classification. Tests: 24 isolated adopt-head pairs and
-24 isolated 4-way fresh-path opens.
+de71087: immutable test binary SHA256
+`6fd3d1e7e653bd791e9244455b22bb94e311b1446f1edce990c3e61f36aeab8f`,
+20 processes × 2 startup tests = 40 runs / 960 fresh paths, 197.641s.
+No mkdir init lock; no string-error classification. Tests: 24 isolated
+adopt-head pairs and 24 isolated 4-way fresh-path opens.
 
 ## Retention vs since
 
