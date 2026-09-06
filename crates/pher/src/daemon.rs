@@ -3514,6 +3514,38 @@ mod follower_tests {
     }
 
     #[test]
+    fn persisted_timer_origin_ids_fails_on_corrupt_json_and_unexpected_io() {
+        let paths = fresh_home("timers-helper");
+        let s = State::load(paths).unwrap();
+        let path = s.paths.timers();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            persisted_timer_origin_ids(&s, "missing").is_empty(),
+            "missing timers file is empty, not an error"
+        );
+
+        std::fs::write(&path, "not-json").unwrap();
+        let corrupt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persisted_timer_origin_ids(&s, "missing")
+        }));
+        assert!(
+            corrupt.is_err(),
+            "malformed timers JSON must not look like no timers"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let io_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persisted_timer_origin_ids(&s, "missing")
+        }));
+        assert!(
+            io_err.is_err(),
+            "unexpected timers read error must not look like no timers"
+        );
+        let _ = std::fs::remove_dir(&path);
+    }
+
+    #[test]
     fn ingest_appends_only_and_follower_runs_the_cascade() {
         let paths = fresh_home("split");
         let mut s = State::load(paths).unwrap();
