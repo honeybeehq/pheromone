@@ -19,6 +19,8 @@ pub const LOCAL_PARTITION: u32 = 0;
 pub const MAX_READ: usize = 4096;
 /// Daemon catch-up / tail page size. Must be in 1..=MAX_READ.
 pub const LOG_PAGE: usize = 256;
+/// SQLite INTEGER is signed. Seq values above this cannot be stored.
+pub const SEQ_MAX: u64 = i64::MAX as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pos {
@@ -41,6 +43,8 @@ pub enum TrailError {
     InvalidLimit { max: usize },
     UnsupportedPartition { partition: u32 },
     Trimmed { resume_at: Pos },
+    Corrupt { detail: String },
+    SeqOutOfRange { seq: u64 },
     Storage(anyhow::Error),
 }
 
@@ -59,6 +63,13 @@ impl std::fmt::Display for TrailError {
             }
             TrailError::Trimmed { resume_at } => {
                 write!(f, "trimmed: resume at seq {}", resume_at.seq)
+            }
+            TrailError::Corrupt { detail } => write!(f, "corrupt log row: {detail}"),
+            TrailError::SeqOutOfRange { seq } => {
+                write!(
+                    f,
+                    "sequence {seq} exceeds SQLite INTEGER ceiling ({SEQ_MAX})"
+                )
             }
             TrailError::Storage(e) => write!(f, "{e:#}"),
         }
@@ -95,7 +106,7 @@ impl SqliteLog {
         let conn =
             Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
@@ -128,35 +139,35 @@ impl SqliteLog {
 
     /// Head is append-time metadata. Reopen never recomputes it from
     /// `MAX(events.seq)` (that is NULL after a full trim). A missing head row
-    /// is a new log (0) or, once only, leftover pre-A1 event rows.
+    /// is a new log (0) or, once only, leftover pre-A1 event rows. One
+    /// IMMEDIATE transaction so concurrent first opens cannot clobber a
+    /// persisted head.
     fn seed_state(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().expect("sqlite log mutex");
-        let head: Option<i64> = conn
-            .query_row("SELECT value FROM log_state WHERE key = 'head'", [], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if head.is_none() {
-            conn.execute("INSERT INTO log_state (key, value) VALUES ('head', 0)", [])?;
-            let max: Option<i64> =
-                conn.query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))?;
+        let mut conn = self.conn.lock().expect("sqlite log mutex");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO log_state (key, value) VALUES ('head', 0)",
+            [],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO log_state (key, value) VALUES ('floor', 0)",
+            [],
+        )?;
+        let head = Self::get_state(&tx, "head")?;
+        if head == 0 {
+            let max: Option<i64> = tx.query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))?;
             if let Some(m) = max {
                 if m > 0 {
-                    conn.execute(
-                        "UPDATE log_state SET value = ?1 WHERE key = 'head'",
+                    let adopted = decode_seq(m)?;
+                    tx.execute(
+                        "UPDATE log_state SET value = ?1 WHERE key = 'head' AND value = 0",
                         params![m],
                     )?;
+                    let _ = adopted;
                 }
             }
         }
-        let floor: Option<i64> = conn
-            .query_row("SELECT value FROM log_state WHERE key = 'floor'", [], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if floor.is_none() {
-            conn.execute("INSERT INTO log_state (key, value) VALUES ('floor', 0)", [])?;
-        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -188,17 +199,20 @@ impl SqliteLog {
                 let subject = event.get("subject").and_then(|t| t.as_str()).unwrap_or("");
                 tx.execute(
                     "INSERT OR IGNORE INTO events (seq, id, ts, subject, envelope) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![seq, id, ts, subject, event.to_string()],
+                    params![encode_seq(seq)?, id, ts, subject, event.to_string()],
                 )?;
                 if seq > imported_head {
                     imported_head = seq;
                 }
             }
             if imported_head > head {
+                if imported_head > SEQ_MAX {
+                    return Err(TrailError::SeqOutOfRange { seq: imported_head }.into());
+                }
                 head = imported_head;
                 tx.execute(
-                    "UPDATE log_state SET value = ?1 WHERE key = 'head'",
-                    params![head as i64],
+                    "UPDATE log_state SET value = ?1 WHERE key = 'head' AND value < ?1",
+                    params![encode_seq(head)?],
                 )?;
             }
             tx.commit()?;
@@ -226,7 +240,7 @@ impl SqliteLog {
             params![key],
             |r| r.get(0),
         )?;
-        Ok(v as u64)
+        decode_seq(v)
     }
 
     pub fn floor(&self) -> Result<u64, TrailError> {
@@ -238,6 +252,12 @@ impl SqliteLog {
         let conn = self.conn.lock().expect("sqlite log mutex");
         Self::get_state(&conn, "head")
     }
+
+    /// 2 = FULL. Used to verify writer durability config.
+    pub fn synchronous_pragma(&self) -> Result<i64, TrailError> {
+        let conn = self.conn.lock().expect("sqlite log mutex");
+        Ok(conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?)
+    }
 }
 
 impl TrailLog for SqliteLog {
@@ -248,8 +268,13 @@ impl TrailLog for SqliteLog {
         let mut conn = self.conn.lock().expect("sqlite log mutex");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let head = Self::get_state(&tx, "head")?;
+        let n = batch.len() as u64;
+        let last = match head.checked_add(n) {
+            Some(v) if v <= SEQ_MAX => v,
+            Some(v) => return Err(TrailError::SeqOutOfRange { seq: v }),
+            None => return Err(TrailError::SeqOutOfRange { seq: u64::MAX }),
+        };
         let first = head + 1;
-        let last = head + batch.len() as u64;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO events (seq, id, ts, subject, envelope) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -258,12 +283,18 @@ impl TrailLog for SqliteLog {
                 let seq = first + i as u64;
                 let envelope = serde_json::to_string(event)
                     .map_err(|e| TrailError::Storage(anyhow::Error::new(e)))?;
-                stmt.execute(params![seq, event.id, event.ts, event.subject, envelope])?;
+                stmt.execute(params![
+                    encode_seq(seq)?,
+                    event.id,
+                    event.ts,
+                    event.subject,
+                    envelope
+                ])?;
             }
         }
         tx.execute(
             "UPDATE log_state SET value = ?1 WHERE key = 'head'",
-            params![last as i64],
+            params![encode_seq(last)?],
         )?;
         tx.commit()?;
         Ok(Pos::local(last))
@@ -278,45 +309,68 @@ impl TrailLog for SqliteLog {
         if max == 0 || max > MAX_READ {
             return Err(TrailError::InvalidLimit { max });
         }
-        let conn = self.conn.lock().expect("sqlite log mutex");
-        let floor = Self::get_state(&conn, "floor")?;
+        if from.seq > SEQ_MAX {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock().expect("sqlite log mutex");
+        let tx = conn.transaction()?;
+        let floor = Self::get_state(&tx, "floor")?;
         let from_seq = from.seq.max(1);
         if floor > 0 && from_seq <= floor {
-            return Err(TrailError::Trimmed {
-                resume_at: Pos::local(floor + 1),
-            });
+            let err = TrailError::Trimmed {
+                resume_at: Pos::local(floor.saturating_add(1).min(SEQ_MAX)),
+            };
+            tx.commit()?;
+            return Err(err);
         }
-        let mut stmt = conn.prepare(
+        let mut stmt = tx.prepare(
             "SELECT seq, envelope FROM events WHERE seq >= ?1 ORDER BY seq ASC LIMIT ?2",
         )?;
-        let rows: Result<Vec<_>, TrailError> = stmt
-            .query_map(params![from_seq, max as u64], row_to_event)?
-            .map(|r| {
-                r.map(|(seq, event)| (Pos::local(seq), event))
-                    .map_err(TrailError::from)
-            })
-            .collect();
-        let mut rows = rows?;
-        rows.retain(|(_, e)| !e.id.is_empty());
+        let mapped = stmt.query_map(params![encode_seq(from_seq)?, max as i64], |r| {
+            let seq_i: i64 = r.get(0)?;
+            let text: String = r.get(1)?;
+            Ok((seq_i, text))
+        })?;
+        let mut rows = Vec::new();
+        for item in mapped {
+            let (seq_i, text) = item?;
+            let seq = decode_seq(seq_i)?;
+            let event =
+                serde_json::from_str::<Envelope>(&text).map_err(|e| TrailError::Corrupt {
+                    detail: format!("seq {seq}: {e}"),
+                })?;
+            rows.push((Pos::local(seq), event));
+        }
+        drop(stmt);
+        tx.commit()?;
         Ok(rows)
     }
 
     fn seek_ts(&self, partition: u32, ts: &str) -> Result<Pos, TrailError> {
         Self::require_p0(partition)?;
-        let conn = self.conn.lock().expect("sqlite log mutex");
-        let floor = Self::get_state(&conn, "floor")?;
-        let head = Self::get_state(&conn, "head")?;
-        // Seq order, envelope.ts (events.ts). Not Comb Frame.at, not ORDER BY ts.
-        let found: Option<i64> = conn
+        let mut conn = self.conn.lock().expect("sqlite log mutex");
+        let tx = conn.transaction()?;
+        let floor = Self::get_state(&tx, "floor")?;
+        let head = Self::get_state(&tx, "head")?;
+        let found: Option<i64> = tx
             .query_row(
                 "SELECT seq FROM events WHERE seq > ?1 AND ts >= ?2 ORDER BY seq ASC LIMIT 1",
-                params![floor as i64, ts],
+                params![encode_seq(floor)?, ts],
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(Pos::local(
-            found.map(|s| s as u64).unwrap_or(head.saturating_add(1)),
-        ))
+        tx.commit()?;
+        match found {
+            Some(s) => Ok(Pos::local(decode_seq(s)?)),
+            None => {
+                let next = head.saturating_add(1);
+                if next > SEQ_MAX {
+                    Ok(Pos::local(SEQ_MAX))
+                } else {
+                    Ok(Pos::local(next))
+                }
+            }
+        }
     }
 
     fn trim_before(&self, ts: &str) -> Result<Pos, TrailError> {
@@ -324,27 +378,24 @@ impl TrailLog for SqliteLog {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let floor = Self::get_state(&tx, "floor")?;
         let head = Self::get_state(&tx, "head")?;
-        let rows: Vec<(u64, String)> = {
-            let mut stmt =
-                tx.prepare("SELECT seq, ts FROM events WHERE seq > ?1 ORDER BY seq ASC")?;
-            let rows = stmt
-                .query_map(params![floor as i64], |r| {
-                    Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
-        let new_floor = match rows.iter().find(|(_, event_ts)| event_ts.as_str() >= ts) {
-            Some((seq, _)) => seq.saturating_sub(1).max(floor),
+        let first_kept: Option<i64> = tx
+            .query_row(
+                "SELECT seq FROM events WHERE seq > ?1 AND ts >= ?2 ORDER BY seq ASC LIMIT 1",
+                params![encode_seq(floor)?, ts],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let new_floor = match first_kept {
+            Some(s) => decode_seq(s)?.saturating_sub(1).max(floor),
             None => head,
         };
         tx.execute(
             "DELETE FROM events WHERE seq > ?1 AND seq <= ?2",
-            params![floor as i64, new_floor as i64],
+            params![encode_seq(floor)?, encode_seq(new_floor)?],
         )?;
         tx.execute(
             "UPDATE log_state SET value = ?1 WHERE key = 'floor'",
-            params![new_floor as i64],
+            params![encode_seq(new_floor)?],
         )?;
         tx.commit()?;
         Ok(Pos::local(new_floor))
@@ -392,22 +443,20 @@ pub fn for_each_page(
     }
 }
 
-fn row_to_event(r: &rusqlite::Row) -> rusqlite::Result<(u64, Envelope)> {
-    let seq: u64 = r.get(0)?;
-    let text: String = r.get(1)?;
-    let event = serde_json::from_str::<Envelope>(&text).unwrap_or_else(|_| Envelope {
-        id: String::new(),
-        ts: String::new(),
-        node: String::new(),
-        source: String::new(),
-        event_type: String::new(),
-        subject: String::new(),
-        correlation: None,
-        payload: Value::Null,
-        ttl_class: None,
-        hops: None,
-    });
-    Ok((seq, event))
+fn decode_seq(v: i64) -> Result<u64, TrailError> {
+    if v < 0 {
+        return Err(TrailError::Corrupt {
+            detail: format!("negative sequence {v}"),
+        });
+    }
+    Ok(v as u64)
+}
+
+fn encode_seq(v: u64) -> Result<i64, TrailError> {
+    if v > SEQ_MAX {
+        return Err(TrailError::SeqOutOfRange { seq: v });
+    }
+    Ok(v as i64)
 }
 
 #[cfg(test)]
@@ -686,6 +735,126 @@ mod tests {
             log.seek_ts(2, "2026-01-01T00:00:00Z"),
             Err(TrailError::UnsupportedPartition { partition: 2 })
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn writer_uses_synchronous_full() {
+        let (log, dir) = tmp("sync");
+        assert_eq!(log.synchronous_pragma().unwrap(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn corrupt_json_is_an_error_not_eof() {
+        let (log, dir) = tmp("corrupt");
+        log.append(&[ev("PH.1", "2026-08-01T00:00:00Z", "a")])
+            .unwrap();
+        log.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE events SET envelope = 'not-json' WHERE seq = 1", [])
+            .unwrap();
+        match log.read(Pos::local(1), 10) {
+            Err(TrailError::Corrupt { detail }) => {
+                assert!(detail.contains("seq 1"), "{detail}");
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn negative_head_is_corrupt() {
+        let (log, dir) = tmp("neg");
+        log.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE log_state SET value = -1 WHERE key = 'head'", [])
+            .unwrap();
+        assert!(matches!(log.head_seq(), Err(TrailError::Corrupt { .. })));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cursor_above_sqlite_ceiling_reads_empty() {
+        let (log, dir) = tmp("ceil");
+        log.append(&[ev("PH.1", "2026-08-01T00:00:00Z", "a")])
+            .unwrap();
+        assert!(log.read(Pos::local(SEQ_MAX + 1), 8).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_first_opens_do_not_lower_head() {
+        let dir = std::env::temp_dir().join(format!(
+            "pher-traillog-firstopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pher.db");
+        {
+            let bootstrap = Connection::open(&path).unwrap();
+            bootstrap
+                .execute_batch(
+                    "CREATE TABLE events (
+                        seq INTEGER PRIMARY KEY,
+                        id TEXT NOT NULL,
+                        ts TEXT NOT NULL,
+                        subject TEXT NOT NULL,
+                        envelope TEXT NOT NULL
+                    );",
+                )
+                .unwrap();
+            bootstrap
+                .execute(
+                    "INSERT INTO events (seq, id, ts, subject, envelope) VALUES (7, 'PH.7', '2026-01-01T00:00:00Z', 'x', '{}')",
+                    [],
+                )
+                .unwrap();
+        }
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let a = std::thread::spawn(move || SqliteLog::open_path(&path_a).unwrap().head_seq());
+        let b = std::thread::spawn(move || SqliteLog::open_path(&path_b).unwrap().head_seq());
+        let ha = a.join().unwrap().unwrap();
+        let hb = b.join().unwrap().unwrap();
+        assert_eq!(ha, 7);
+        assert_eq!(hb, 7);
+        let log = SqliteLog::open_path(&path).unwrap();
+        assert_eq!(log.head_seq().unwrap(), 7);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trim_on_other_connection_does_not_turn_prefix_into_empty_page() {
+        let dir = std::env::temp_dir().join(format!(
+            "pher-traillog-snap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pher.db");
+        let writer = SqliteLog::open_path(&path).unwrap();
+        for i in 1..=5 {
+            writer
+                .append(&[ev(&format!("PH.{i}"), "2020-01-01T00:00:00Z", "old")])
+                .unwrap();
+        }
+        let reader = SqliteLog::open_path(&path).unwrap();
+        writer.trim_before("2026-01-01T00:00:00Z").unwrap();
+        match reader.read(Pos::local(1), 10) {
+            Err(TrailError::Trimmed { resume_at }) => assert_eq!(resume_at.seq, 6),
+            Ok(page) => panic!("expected Trimmed after peer trim, got {page:?}"),
+            Err(e) => panic!("unexpected {e}"),
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -73,7 +73,7 @@ pub struct CursorEntry {
 }
 
 struct TailClient {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
     subject: Option<SubjectPattern>,
 }
 
@@ -100,6 +100,8 @@ const MAX_BATCH_QUEUE: usize = 1000;
 /// Log entries the follower processes per lock acquisition. Small enough
 /// that an emitter never waits behind more than a few ms of cascade.
 const FOLLOWER_BATCH: usize = 32;
+/// Live tail/listen queue. try_send only; Full drops the slow consumer.
+const LIVE_QUEUE: usize = 256;
 
 pub(crate) struct State {
     paths: Paths,
@@ -125,6 +127,8 @@ pub(crate) struct State {
     /// ends the listener's delivery loop; a vanished listener removes the
     /// subscription — the enforced form of `while <client> alive`.
     listeners: HashMap<String, ListenerHandle>,
+    /// When set, stream deliveries append here instead of the live channel.
+    catchup_lines: Option<Vec<String>>,
     /// Named consumer cursors (client-committed positions in this log).
     cursors: HashMap<String, CursorEntry>,
     /// Named token grants (authorization = the subscription language).
@@ -275,7 +279,7 @@ pub(crate) fn filter_matches(filter: &Subscription, event: &Envelope) -> bool {
 /// A live stream listener: its delivery channel, plus the grant filter it
 /// is bounded by (None = local/admin, unfiltered).
 pub(crate) struct ListenerHandle {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
     filter: Option<Subscription>,
 }
 
@@ -457,6 +461,7 @@ impl State {
             forwarded_seen,
             outbox,
             outbox_tx: None,
+            catchup_lines: None,
         };
         let has_judge_subs = state
             .matcher
@@ -1541,9 +1546,7 @@ impl State {
                 // Delivery goes down the socket of whoever registered this
                 // subscription. No listener means the sub is mid-teardown.
                 delivery_json["deliveryId"] = json!(delivery_id);
-                match self.listeners.get(&block.subscription) {
-                    // Grant enforcement: the delivery must also match the
-                    // listener's allow filter — intersection, not trust.
+                let result = match self.listeners.get(&block.subscription) {
                     Some(handle)
                         if handle
                             .filter
@@ -1552,11 +1555,27 @@ impl State {
                     {
                         json!({ "sink": "stream", "filtered": "grant allow" })
                     }
-                    Some(handle) if handle.tx.send(delivery_json.to_string()).is_ok() => {
-                        json!({ "sink": "stream", "delivered": true })
+                    Some(_) if self.catchup_lines.is_some() => {
+                        if let Some(buf) = &mut self.catchup_lines {
+                            buf.push(delivery_json.to_string());
+                        }
+                        json!({ "sink": "stream", "delivered": true, "catchup": true })
                     }
+                    Some(handle) => match handle.tx.try_send(delivery_json.to_string()) {
+                        Ok(()) => json!({ "sink": "stream", "delivered": true }),
+                        Err(TrySendError::Disconnected(_)) => {
+                            json!({ "sink": "stream", "error": "listener gone" })
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            json!({ "sink": "stream", "error": "lag" })
+                        }
+                    },
                     _ => json!({ "sink": "stream", "error": "listener gone" }),
+                };
+                if result.get("error").and_then(|e| e.as_str()) == Some("lag") {
+                    self.listeners.remove(&block.subscription);
                 }
+                result
             }
         }
     }
@@ -1719,7 +1738,8 @@ impl State {
             .unwrap_or(0)
     }
 
-    /// Page `since` catch-up: seek by envelope.ts, then inclusive seq reads.
+    /// Page `since` catch-up: seek_ts finds the first candidate; every later
+    /// event must still have envelope.ts >= cutoff (timestamps are not monotonic).
     fn replay_from_ts(&mut self, sub_id: &str, ts: &str) -> u64 {
         let from = match self.log.seek_ts(0, ts) {
             Ok(p) => p.seq,
@@ -1728,11 +1748,16 @@ impl State {
                 return 0;
             }
         };
-        self.replay_from_seq(sub_id, from).1
+        self.replay_from_seq(sub_id, from, Some(ts)).1
     }
 
     /// Page deliveries from `from_seq` inclusive. Returns (first seq seen, count).
-    fn replay_from_seq(&mut self, sub_id: &str, from_seq: u64) -> (Option<u64>, u64) {
+    fn replay_from_seq(
+        &mut self,
+        sub_id: &str,
+        from_seq: u64,
+        ts_min: Option<&str>,
+    ) -> (Option<u64>, u64) {
         let mut first = None;
         let mut replayed = 0u64;
         let mut from = from_seq;
@@ -1755,6 +1780,12 @@ impl State {
                 if first.is_none() {
                     first = Some(pos.seq);
                 }
+                if let Some(min) = ts_min {
+                    if event.ts.as_str() < min {
+                        from = pos.seq.saturating_add(1);
+                        continue;
+                    }
+                }
                 self.current_seq = Some(pos.seq);
                 if let Some(n) = self.try_deliver(sub_id, &event) {
                     replayed += n;
@@ -1773,7 +1804,11 @@ impl State {
                     return true; // filtered out, but keep the client
                 }
             }
-            client.tx.send(line.clone()).is_ok()
+            match client.tx.try_send(line.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Disconnected(_)) => false,
+                Err(TrySendError::Full(_)) => false,
+            }
         });
     }
 
@@ -2570,7 +2605,7 @@ pub(crate) fn attach_tail(
         Ok(p) => p,
         Err(e) => return Err(err(e)),
     };
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::sync_channel::<String>(LIVE_QUEUE);
     let mut s = state.lock().unwrap();
     s.tails.push(TailClient {
         tx,
@@ -2695,10 +2730,18 @@ fn handle_tail(
 /// the ack to send first, and the delivery channel. Err carries the protocol
 /// error Value to send back.
 ///
-/// Resume order of precedence: explicit `after` beats the named cursor's
-/// stored position. Replay runs AFTER the listener channel is attached and
-/// under the same lock as registration, so there is no window where a live
-/// event can slip between backlog and stream: no gap, no duplicate.
+/// Resume: explicit `after` beats the named cursor. Catch-up is NOT queued
+/// into the live channel; the caller pages it after releasing State.
+pub(crate) struct ListenAttachment {
+    pub id: String,
+    pub ack: Value,
+    pub rx: mpsc::Receiver<String>,
+    pub log: Arc<SqliteLog>,
+    pub catchup_from: Option<u64>,
+    pub catchup_through: u64,
+    pub ts_cutoff: Option<String>,
+}
+
 pub(crate) fn attach_listener(
     state: &Arc<Mutex<State>>,
     string: &str,
@@ -2707,8 +2750,8 @@ pub(crate) fn attach_listener(
     after: Option<u64>,
     cursor: Option<&str>,
     filter: Option<Subscription>,
-) -> Result<(String, Value, mpsc::Receiver<String>), Value> {
-    let (tx, rx) = mpsc::channel::<String>();
+) -> Result<ListenAttachment, Value> {
+    let (tx, rx) = mpsc::sync_channel::<String>(LIVE_QUEUE);
     let mut s = state.lock().unwrap();
     let stored_cursor = cursor.and_then(|c| s.cursors.get(c)).map(|e| e.seq);
     let resume_after = after.or(stored_cursor);
@@ -2724,26 +2767,37 @@ pub(crate) fn attach_listener(
     s.listeners
         .insert(id.clone(), ListenerHandle { tx, filter });
 
-    // Catch-up replay into the now-attached channel. Cursor resume (exact,
-    // by seq) wins over the subscription's own `since` (fuzzy, by time).
     let sub = s.matcher.get(&id).cloned();
-    let mut replayed = 0u64;
+    let through = s.log_head();
+    let log = Arc::clone(&s.log);
+    let mut catchup_from = None;
+    let mut ts_cutoff = None;
     let mut gap_expired = 0u64;
     if let Some(after) = resume_after {
-        let (first, n) = s.replay_from_seq(&id, after.saturating_add(1));
-        replayed = n;
-        if let Some(first_seq) = first {
-            gap_expired = first_seq.saturating_sub(after + 1);
+        let from = after.saturating_add(1);
+        catchup_from = Some(from);
+        match s.log.read(Pos::local(from.max(1)), 1) {
+            Ok(page) => {
+                if let Some((pos, _)) = page.first() {
+                    gap_expired = pos.seq.saturating_sub(after + 1);
+                }
+            }
+            Err(TrailError::Trimmed { resume_at }) => {
+                gap_expired = resume_at.seq.saturating_sub(after + 1);
+                catchup_from = Some(resume_at.seq);
+            }
+            Err(_) => {}
         }
     } else if let Some(replay) = sub.as_ref().and_then(|sub| sub.replay.clone()) {
         let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
-        replayed = s.replay_from_ts(&id, &cutoff);
+        match s.log.seek_ts(0, &cutoff) {
+            Ok(p) => catchup_from = Some(p.seq),
+            Err(e) => eprintln!("pherd: seek_ts failed: {e}"),
+        }
+        ts_cutoff = Some(cutoff);
     }
 
-    // Ack tells the consumer exactly where it stands: the log head (start a
-    // cursor even with no traffic), what was replayed, and what is gone.
-    ack["seq"] = json!(s.log_head());
-    ack["replayed"] = json!(replayed);
+    ack["seq"] = json!(through);
     if let Some(after) = resume_after {
         ack["resumedFrom"] = json!(after);
     }
@@ -2756,6 +2810,23 @@ pub(crate) fn attach_listener(
     let semantic_sub = sub
         .as_ref()
         .is_some_and(|sub| sub.meaning.is_some() || sub.judge.is_some());
+    drop(s);
+
+    let mut replayed = 0u64;
+    if let (Some(from), Some(sub)) = (catchup_from, sub.as_ref()) {
+        let _ = for_each_page(log.as_ref(), from, Some(through), |_, event| {
+            if let Some(min) = ts_cutoff.as_deref() {
+                if event.ts.as_str() < min {
+                    return true;
+                }
+            }
+            if matches!(evaluate(&id, sub, &event, None).outcome, Outcome::Matched) {
+                replayed += 1;
+            }
+            true
+        });
+    }
+    ack["replayed"] = json!(replayed);
     if semantic_sub && (resume_after.is_some() || replayed > 0) {
         if let Some(w) = ack.get_mut("warnings").and_then(|w| w.as_array_mut()) {
             w.push(json!(
@@ -2764,7 +2835,74 @@ pub(crate) fn attach_listener(
             ));
         }
     }
-    Ok((id, ack, rx))
+    Ok(ListenAttachment {
+        id,
+        ack,
+        rx,
+        log,
+        catchup_from,
+        catchup_through: through,
+        ts_cutoff,
+    })
+}
+
+/// Page catch-up matches to `emit` without filling the live channel.
+/// Short State lock per page. Returns how many lines were emitted.
+pub(crate) fn replay_listen_catchup(
+    state: &Arc<Mutex<State>>,
+    sub_id: &str,
+    log: &SqliteLog,
+    from: u64,
+    through: u64,
+    ts_cutoff: Option<&str>,
+    mut emit: impl FnMut(&str) -> bool,
+) -> u64 {
+    let mut replayed = 0u64;
+    let mut from = from;
+    loop {
+        if from > through {
+            break;
+        }
+        let page = match log.read(Pos::local(from.max(1)), LOG_PAGE) {
+            Ok(p) => p,
+            Err(TrailError::Trimmed { resume_at }) => {
+                from = resume_at.seq;
+                continue;
+            }
+            Err(_) => break,
+        };
+        if page.is_empty() {
+            break;
+        }
+        let mut s = state.lock().unwrap();
+        s.catchup_lines = Some(Vec::new());
+        for (pos, event) in page {
+            if pos.seq > through {
+                break;
+            }
+            if let Some(min) = ts_cutoff {
+                if event.ts.as_str() < min {
+                    from = pos.seq.saturating_add(1);
+                    continue;
+                }
+            }
+            s.current_seq = Some(pos.seq);
+            let _ = s.try_deliver(sub_id, &event);
+            from = pos.seq.saturating_add(1);
+        }
+        let lines = s.catchup_lines.take().unwrap_or_default();
+        drop(s);
+        for line in &lines {
+            replayed += 1;
+            if !emit(line) {
+                return replayed;
+            }
+        }
+        if from > through {
+            break;
+        }
+    }
+    replayed
 }
 
 /// Tear a listener's subscription down. Guarded: only the party that still
@@ -2792,7 +2930,7 @@ fn handle_listen(
 ) -> anyhow::Result<()> {
     let client = client.unwrap_or_else(|| "listener".to_string());
     // Unix socket = local operator = unfiltered.
-    let (sub_id, ack, rx) = match attach_listener(
+    let attached = match attach_listener(
         state,
         string,
         options,
@@ -2807,7 +2945,38 @@ fn handle_listen(
             return Ok(());
         }
     };
-    respond(stream, &ack)?;
+    let sub_id = attached.id.clone();
+    respond(stream, &attached.ack)?;
+    let mut writer = stream.try_clone()?;
+    let mut last_sent = 0u64;
+    if let Some(from) = attached.catchup_from {
+        let mut write_ok = true;
+        replay_listen_catchup(
+            state,
+            &sub_id,
+            &attached.log,
+            from,
+            attached.catchup_through,
+            attached.ts_cutoff.as_deref(),
+            |line| {
+                let seq = serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
+                    .unwrap_or(0);
+                if writeln!(writer, "{line}").is_err() {
+                    write_ok = false;
+                    return false;
+                }
+                last_sent = last_sent.max(seq);
+                true
+            },
+        );
+        if !write_ok {
+            detach_listener(state, &sub_id, "listener disconnected");
+            return Ok(());
+        }
+        let _ = writer.flush();
+    }
 
     let teardown = |reason: &str| detach_listener(state, &sub_id, reason);
 
@@ -2831,12 +3000,19 @@ fn handle_listen(
         });
     }
 
-    let mut writer = stream.try_clone()?;
-    for line in rx {
+    for line in attached.rx {
+        let seq = serde_json::from_str::<Value>(&line)
+            .ok()
+            .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
+            .unwrap_or(u64::MAX);
+        if seq <= last_sent {
+            continue;
+        }
         if writeln!(writer, "{line}").is_err() || writer.flush().is_err() {
             teardown("listener disconnected");
             break;
         }
+        last_sent = seq;
     }
     // Channel closed: the subscription was removed daemon-side (limit hit,
     // rm, ttl), the client hung up, or teardown already ran. The watchdog's
@@ -3104,5 +3280,93 @@ mod follower_tests {
         assert_eq!(s.drain(), 80);
         assert_eq!(s.matched_through, 80);
         assert_eq!(s.follow_step(32), 0);
+    }
+
+    #[test]
+    fn since_skips_later_old_ts_after_seek() {
+        let paths = fresh_home("since-ooo");
+        let mut s = State::load(paths).unwrap();
+        let old = "2020-01-01T00:00:00.000Z";
+        let new = now_ts();
+        for (id, ts) in [
+            ("PH.o1", old),
+            ("PH.n1", new.as_str()),
+            ("PH.o2", old),
+            ("PH.n2", new.as_str()),
+        ] {
+            s.log
+                .append(&[Envelope {
+                    id: id.into(),
+                    ts: ts.into(),
+                    node: "n".into(),
+                    source: "test".into(),
+                    event_type: "t.x".into(),
+                    subject: "t.x".into(),
+                    correlation: None,
+                    payload: json!({}),
+                    ttl_class: None,
+                    hops: None,
+                }])
+                .unwrap();
+        }
+        s.matched_through = s.log.head_seq().unwrap();
+        s.register("on t.** then emit seen.hit since 24h", &[], None)
+            .unwrap();
+        s.drain();
+        let hits: Vec<_> = s
+            .log
+            .read(Pos::local(1), LOG_PAGE)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| e.subject == "seen.hit")
+            .collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "since must drop later old-ts events (got {})",
+            hits.len()
+        );
+    }
+
+    #[test]
+    fn listen_catchup_does_not_fill_live_queue() {
+        let paths = fresh_home("listen-bound");
+        let s = State::load(paths).unwrap();
+        for i in 0..40 {
+            s.log
+                .append(&[Envelope {
+                    id: format!("PH.{i}"),
+                    ts: now_ts(),
+                    node: "n".into(),
+                    source: "test".into(),
+                    event_type: "t.x".into(),
+                    subject: "t.x".into(),
+                    correlation: None,
+                    payload: json!({ "i": i }),
+                    ttl_class: None,
+                    hops: None,
+                }])
+                .unwrap();
+        }
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            att.catchup_from.is_some(),
+            "history is a catch-up cursor, not a queued dump"
+        );
+        assert!(
+            att.rx.try_recv().is_err(),
+            "live queue must be empty until the consumer pages catch-up"
+        );
+        assert!(att.ack["replayed"].as_u64().unwrap() >= 1);
     }
 }
