@@ -21,14 +21,17 @@ Two rusqlite connections to `pher.db`. SqliteLog is the only writer of
 head/floor). Concurrent first opens cannot lower a persisted head. Leftover
 pre-A1 rows are adopted only when head is still 0 in that transaction.
 
-Pinned rusqlite 0.32.1 installs `sqlite3_busy_timeout(5000)` inside
-`Connection::open`. First-open still wraps WAL/schema/seed in a bounded
-retry on typed `ErrorCode::DatabaseBusy` and `DatabaseLocked` (32
-attempts, 1–50ms), because `PRAGMA journal_mode=WAL` does not always
-invoke the busy handler. Independently verified at de71087 (40
-processes / 960 fresh paths). No mkdir init lock; no string-error
-classification. Tests: 24 isolated adopt-head pairs and 24 isolated
-4-way fresh-path opens.
+Pinned rusqlite 0.32.1 (`Cargo.lock`) installs a 5000ms busy timeout
+during `Connection::open`: `inner_connection.rs:119` calls
+`sqlite3_busy_timeout(db, 5000)`; `busy.rs:25` and `busy.rs:55`
+document that default. The de71087 “default 0ms handler” claim was
+false. First-open still sets an explicit short init timeout (200ms)
+and retries typed `ErrorCode::DatabaseBusy` / `DatabaseLocked` (32
+attempts, 1–50ms), because WAL conversion can return SQLITE_BUSY
+without invoking the installed handler. Independently verified at
+de71087 (40 processes / 960 fresh paths). No mkdir init lock; no
+string-error classification. Tests: 24 isolated adopt-head pairs and
+24 isolated 4-way fresh-path opens.
 
 ## Retention vs since
 

@@ -21,8 +21,11 @@ pub const MAX_READ: usize = 4096;
 pub const LOG_PAGE: usize = 256;
 /// SQLite INTEGER is signed. Seq values above this cannot be stored.
 pub const SEQ_MAX: u64 = i64::MAX as u64;
-/// Inner first-open attempt. rusqlite 0.32.1 already sets 5000ms on
-/// Connection::open; WAL/schema still retry via `retry_busy`.
+/// Explicit short timeout for each first-open attempt. rusqlite 0.32.1
+/// already installs 5000ms in Connection::open
+/// (`inner_connection.rs:119`, `busy.rs:25/55`). WAL conversion can still
+/// return SQLITE_BUSY without invoking that handler, so `retry_busy` wraps
+/// the attempt.
 pub(crate) const INIT_BUSY_TIMEOUT: Duration = Duration::from_millis(200);
 /// Writer operations after init (append, seed retry leftover).
 pub(crate) const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,8 +47,9 @@ pub(crate) fn is_busy_or_locked_anyhow(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Bounded retry for first-open WAL conversion and schema init. SQLite's
-/// busy handler is not always invoked for `PRAGMA journal_mode=WAL`.
+/// Bounded typed retry for first-open WAL/schema. The installed busy
+/// handler (rusqlite 0.32.1 default 5000ms, plus INIT_BUSY_TIMEOUT) is
+/// not always invoked when WAL conversion returns SQLITE_BUSY.
 pub(crate) fn retry_busy<T>(mut once: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
     let mut backoff = Duration::from_millis(1);
     let mut last = None;
@@ -150,10 +154,10 @@ impl SqliteLog {
     fn open_path_once(path: &Path) -> anyhow::Result<SqliteLog> {
         let conn =
             Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-        // rusqlite 0.32.1 already calls sqlite3_busy_timeout(5000) in
-        // Connection::open. PRAGMA journal_mode=WAL still sometimes returns
-        // SQLITE_BUSY without invoking that handler; retry_busy wraps this
-        // whole first-open. The explicit timeout here is the inner attempt.
+        // Keep an explicit short init timeout. Default is not 0ms:
+        // rusqlite 0.32.1 Connection::open calls sqlite3_busy_timeout(db, 5000)
+        // (inner_connection.rs:119). WAL conversion can still return BUSY
+        // without invoking that handler; retry_busy wraps this attempt.
         conn.busy_timeout(INIT_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;

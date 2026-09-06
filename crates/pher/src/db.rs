@@ -29,6 +29,9 @@ impl Db {
         let conn = retry_busy(|| {
             let conn = Connection::open(&path)
                 .with_context(|| format!("cannot open {}", path.display()))?;
+            // Explicit short init timeout. rusqlite 0.32.1 already sets
+            // 5000ms on open; WAL conversion can still return BUSY without
+            // invoking that handler (retry_busy wraps this closure).
             conn.busy_timeout(INIT_BUSY_TIMEOUT)?;
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
