@@ -322,7 +322,6 @@ impl State {
         }
 
         let db = crate::db::Db::open(&paths)?;
-        // After Db so jsonl event import is visible when we seed log_state.head.
         let log = Arc::new(SqliteLog::open(&paths)?);
         let head = log.head_seq()?;
         // A database from before the ingest/match split has no marker: every

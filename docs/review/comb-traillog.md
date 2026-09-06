@@ -7,7 +7,8 @@ No new long-lived actor.
 
 - `crates/pher/src/traillog.rs`: `Pos`, `TrailError`, `TrailLog`, `SqliteLog`.
 - Daemon ingest assigns no seq. `SqliteLog::append` owns allocation.
-- Head and floor live in `log_state` (`head`, `floor`), not `MAX(events.seq)`.
+- Head and floor live in `log_state` (`head`, `floor`). Head is written at
+  append (and jsonl `seq` import). `MAX(events.seq)` is not the durable head.
 - `Db` keeps deliveries/verdicts/vectors/forwarded/`matched_through` and
   `event_by_id`. It no longer inserts, ranges, or GC-deletes events.
 - Tail, listen, `since`, and the follower page with `read` / `for_each_page`
@@ -21,8 +22,10 @@ Two rusqlite connections to `pher.db`:
    `log_state`. `BEGIN IMMEDIATE` on append/trim. `busy_timeout` 5s.
 2. `Db` reads `events` for `event_by_id` and writes the other tables.
 
-WAL makes the side index visible after commit. Jsonl event import still runs
-in `Db::open`; `SqliteLog::open` then seeds `head` from `MAX(seq)` once.
+WAL makes the side index visible after commit. `SqliteLog` imports
+`events.jsonl` and writes `head` from each line's `seq` field. Reopen never
+sets `head` from `MAX(events.seq)`. Pre-A1 leftover event rows are adopted
+only when creating the head row for the first time.
 
 ## Retention change (contiguous log)
 
@@ -75,4 +78,5 @@ No shared daemon. No `~/.pheromone`. No Comb edits.
 - `read` max 0 / `MAX_READ+1` / partition 1
 - out-of-order ts: prefix trim keeps a later old-ts event
 - follower restart gap; pre-split catch-up; trimmed prefix jump; 80-event pages
-- `event_by_id` after SqliteLog append; jsonl import seeds `head`
+- `event_by_id` after SqliteLog append; jsonl `seq` becomes head; wipe rows
+  and reopen keeps head

@@ -91,11 +91,6 @@ pub struct SqliteLog {
 }
 
 impl SqliteLog {
-    pub fn open(paths: &Paths) -> anyhow::Result<SqliteLog> {
-        paths.ensure()?;
-        Self::open_path(&paths.home.join("pher.db"))
-    }
-
     pub fn open_path(path: &Path) -> anyhow::Result<SqliteLog> {
         let conn =
             Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
@@ -124,6 +119,16 @@ impl SqliteLog {
         Ok(log)
     }
 
+    pub fn open(paths: &Paths) -> anyhow::Result<SqliteLog> {
+        paths.ensure()?;
+        let log = Self::open_path(&paths.home.join("pher.db"))?;
+        log.migrate_events_jsonl(paths)?;
+        Ok(log)
+    }
+
+    /// Head is append-time metadata. Reopen never recomputes it from
+    /// `MAX(events.seq)` (that is NULL after a full trim). A missing head row
+    /// is a new log (0) or, once only, leftover pre-A1 event rows.
     fn seed_state(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("sqlite log mutex");
         let head: Option<i64> = conn
@@ -132,12 +137,17 @@ impl SqliteLog {
             })
             .optional()?;
         if head.is_none() {
+            conn.execute("INSERT INTO log_state (key, value) VALUES ('head', 0)", [])?;
             let max: Option<i64> =
                 conn.query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))?;
-            conn.execute(
-                "INSERT INTO log_state (key, value) VALUES ('head', ?1)",
-                params![max.unwrap_or(0)],
-            )?;
+            if let Some(m) = max {
+                if m > 0 {
+                    conn.execute(
+                        "UPDATE log_state SET value = ?1 WHERE key = 'head'",
+                        params![m],
+                    )?;
+                }
+            }
         }
         let floor: Option<i64> = conn
             .query_row("SELECT value FROM log_state WHERE key = 'floor'", [], |r| {
@@ -147,6 +157,59 @@ impl SqliteLog {
         if floor.is_none() {
             conn.execute("INSERT INTO log_state (key, value) VALUES ('floor', 0)", [])?;
         }
+        Ok(())
+    }
+
+    /// Import `events.jsonl`. Head becomes the max `seq` field in the file
+    /// (the historical assign), not `MAX(seq)` of whatever rows remain later.
+    fn migrate_events_jsonl(&self, paths: &Paths) -> anyhow::Result<()> {
+        let path = paths.events();
+        if !path.exists() {
+            return Ok(());
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let count = text.lines().count();
+        let mut imported_head: u64 = 0;
+        {
+            let mut conn = self.conn.lock().expect("sqlite log mutex");
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut head = Self::get_state(&tx, "head")?;
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let (Some(seq), Some(event)) =
+                    (v.get("seq").and_then(|s| s.as_u64()), v.get("event"))
+                else {
+                    continue;
+                };
+                let ts = event.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+                let id = event.get("id").and_then(|t| t.as_str()).unwrap_or("");
+                let subject = event.get("subject").and_then(|t| t.as_str()).unwrap_or("");
+                tx.execute(
+                    "INSERT OR IGNORE INTO events (seq, id, ts, subject, envelope) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![seq, id, ts, subject, event.to_string()],
+                )?;
+                if seq > imported_head {
+                    imported_head = seq;
+                }
+            }
+            if imported_head > head {
+                head = imported_head;
+                tx.execute(
+                    "UPDATE log_state SET value = ?1 WHERE key = 'head'",
+                    params![head as i64],
+                )?;
+            }
+            tx.commit()?;
+        }
+        let backup = path.with_extension("jsonl.migrated");
+        std::fs::rename(&path, &backup)?;
+        eprintln!(
+            "pherd: migrated {count} lines from {} into pher.db (original kept as {})",
+            path.display(),
+            backup.display()
+        );
         Ok(())
     }
 
@@ -478,6 +541,16 @@ mod tests {
             assert_eq!(floor.seq, 5);
             assert!(log.read(Pos::local(1), 10).is_err());
             assert_eq!(log.head_seq().unwrap(), 5);
+            let max: Option<i64> = log
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))
+                .unwrap();
+            assert!(
+                max.is_none(),
+                "MAX(seq) is gone after trim; head must not follow it"
+            );
         }
         {
             let log = SqliteLog::open_path(&path).unwrap();
@@ -490,6 +563,44 @@ mod tests {
             assert_eq!(page.len(), 1);
             assert_eq!(page[0].1.id, "PH.new");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wiped_event_rows_do_not_reset_persisted_head() {
+        let dir = std::env::temp_dir().join(format!(
+            "pher-traillog-wipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pher.db");
+        {
+            let log = SqliteLog::open_path(&path).unwrap();
+            log.append(&[ev("PH.1", "2026-08-01T00:00:00Z", "a")])
+                .unwrap();
+            log.append(&[ev("PH.2", "2026-08-01T00:00:01Z", "a")])
+                .unwrap();
+            assert_eq!(log.head_seq().unwrap(), 2);
+            log.conn
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM events", [])
+                .unwrap();
+        }
+        let log = SqliteLog::open_path(&path).unwrap();
+        assert_eq!(
+            log.head_seq().unwrap(),
+            2,
+            "reopen must not treat MAX(seq) NULL as head 0"
+        );
+        let pos = log
+            .append(&[ev("PH.3", "2026-08-01T00:00:02Z", "a")])
+            .unwrap();
+        assert_eq!(pos.seq, 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 

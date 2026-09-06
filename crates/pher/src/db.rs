@@ -72,20 +72,7 @@ impl Db {
     /// transaction per file. Renames each source to `<name>.migrated`.
     fn migrate_jsonl(&mut self, paths: &Paths) -> anyhow::Result<()> {
         type Import = fn(&Connection, &Value);
-        let migrations: [(std::path::PathBuf, Import); 5] = [
-            (paths.events(), |c, v| {
-                if let (Some(seq), Some(event)) =
-                    (v.get("seq").and_then(|s| s.as_u64()), v.get("event"))
-                {
-                    let ts = event.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-                    let id = event.get("id").and_then(|t| t.as_str()).unwrap_or("");
-                    let subject = event.get("subject").and_then(|t| t.as_str()).unwrap_or("");
-                    let _ = c.execute(
-                        "INSERT OR IGNORE INTO events (seq, id, ts, subject, envelope) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![seq, id, ts, subject, event.to_string()],
-                    );
-                }
-            }),
+        let migrations: [(std::path::PathBuf, Import); 4] = [
             (paths.deliveries(), |c, v| {
                 if let Some(id) = v.get("deliveryId").and_then(|d| d.as_str()) {
                     let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
@@ -420,20 +407,35 @@ not json — torn line survives migration
         .unwrap();
         std::fs::write(paths.forwarded(), "{\"id\":\"D1\"}\n{\"id\":\"D1\"}\n").unwrap();
         let db = Db::open(&paths).unwrap();
+        assert!(
+            paths.events().exists(),
+            "event jsonl is SqliteLog's import, not Db"
+        );
+        let log = crate::traillog::SqliteLog::open(&paths).unwrap();
         assert_eq!(db.event_by_id("PH.a").unwrap().unwrap().subject, "a.b");
         assert_eq!(db.event_by_id("PH.b").unwrap().unwrap().subject, "a.c");
         assert_eq!(db.load_forwarded(10).unwrap(), vec!["D1"]);
         assert!(!paths.events().exists());
         assert!(paths.home.join("events.jsonl.migrated").exists());
+        assert_eq!(
+            log.head_seq().unwrap(),
+            2,
+            "jsonl seq fields become append-time head"
+        );
+        drop(log);
+        {
+            let wipe = Connection::open(paths.home.join("pher.db")).unwrap();
+            wipe.execute("DELETE FROM events", []).unwrap();
+        }
         let log = crate::traillog::SqliteLog::open(&paths).unwrap();
         assert_eq!(
             log.head_seq().unwrap(),
             2,
-            "jsonl import seeds log_state.head from MAX(seq)"
+            "empty events table must not zero a persisted head"
         );
         drop(db);
         let db = Db::open(&paths).unwrap();
-        assert_eq!(db.event_by_id("PH.a").unwrap().unwrap().id, "PH.a");
+        assert!(db.event_by_id("PH.a").unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
