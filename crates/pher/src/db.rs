@@ -16,6 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::store::Paths;
+use crate::traillog::{retry_busy, INIT_BUSY_TIMEOUT, WRITER_BUSY_TIMEOUT};
 
 pub struct Db {
     conn: Connection,
@@ -25,44 +26,49 @@ impl Db {
     pub fn open(paths: &Paths) -> anyhow::Result<Db> {
         paths.ensure()?;
         let path = paths.home.join("pher.db");
-        let conn =
-            Connection::open(&path).with_context(|| format!("cannot open {}", path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS events (
-                seq      INTEGER PRIMARY KEY,
-                id       TEXT NOT NULL,
-                ts       TEXT NOT NULL,
-                subject  TEXT NOT NULL,
-                envelope TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS events_id ON events(id);
-            CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
-            CREATE TABLE IF NOT EXISTS deliveries (
-                delivery_id TEXT PRIMARY KEY,
-                ts          TEXT NOT NULL,
-                record      TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS deliveries_ts ON deliveries(ts);
-            CREATE TABLE IF NOT EXISTS verdicts (
-                key    TEXT PRIMARY KEY,
-                ts     INTEGER NOT NULL,
-                record TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS vectors (
-                ts       INTEGER NOT NULL,
-                event_id TEXT NOT NULL,
-                vec      BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS forwarded (
-                id TEXT PRIMARY KEY
-            );
-            CREATE TABLE IF NOT EXISTS meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );",
-        )?;
+        let conn = retry_busy(|| {
+            let conn = Connection::open(&path)
+                .with_context(|| format!("cannot open {}", path.display()))?;
+            conn.busy_timeout(INIT_BUSY_TIMEOUT)?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS events (
+                    seq      INTEGER PRIMARY KEY,
+                    id       TEXT NOT NULL,
+                    ts       TEXT NOT NULL,
+                    subject  TEXT NOT NULL,
+                    envelope TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS events_id ON events(id);
+                CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+                CREATE TABLE IF NOT EXISTS deliveries (
+                    delivery_id TEXT PRIMARY KEY,
+                    ts          TEXT NOT NULL,
+                    record      TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS deliveries_ts ON deliveries(ts);
+                CREATE TABLE IF NOT EXISTS verdicts (
+                    key    TEXT PRIMARY KEY,
+                    ts     INTEGER NOT NULL,
+                    record TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS vectors (
+                    ts       INTEGER NOT NULL,
+                    event_id TEXT NOT NULL,
+                    vec      BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS forwarded (
+                    id TEXT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS meta (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );",
+            )?;
+            Ok(conn)
+        })?;
+        conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
         let mut db = Db { conn };
         db.migrate_jsonl(paths)?;
         Ok(db)

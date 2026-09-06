@@ -21,6 +21,47 @@ pub const MAX_READ: usize = 4096;
 pub const LOG_PAGE: usize = 256;
 /// SQLite INTEGER is signed. Seq values above this cannot be stored.
 pub const SEQ_MAX: u64 = i64::MAX as u64;
+/// Short wait so WAL/schema init returns BUSY quickly when the handler
+/// is not invoked; the retry loop below is the real bound.
+pub(crate) const INIT_BUSY_TIMEOUT: Duration = Duration::from_millis(200);
+/// Writer operations after init (append, seed retry leftover).
+pub(crate) const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const INIT_ATTEMPTS: u32 = 32;
+const INIT_BACKOFF_CAP: Duration = Duration::from_millis(50);
+
+pub(crate) fn sqlite_busy_or_locked(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+pub(crate) fn is_busy_or_locked_anyhow(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(sqlite_busy_or_locked)
+    })
+}
+
+/// Bounded retry for first-open WAL conversion and schema init. SQLite's
+/// busy handler is not always invoked for `PRAGMA journal_mode=WAL`.
+pub(crate) fn retry_busy<T>(mut once: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let mut backoff = Duration::from_millis(1);
+    let mut last = None;
+    for attempt in 1..=INIT_ATTEMPTS {
+        match once() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_busy_or_locked_anyhow(&e) && attempt < INIT_ATTEMPTS => {
+                last = Some(e);
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(INIT_BACKOFF_CAP);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("busy retry exhausted"))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pos {
@@ -103,11 +144,17 @@ pub struct SqliteLog {
 
 impl SqliteLog {
     pub fn open_path(path: &Path) -> anyhow::Result<SqliteLog> {
+        retry_busy(|| Self::open_path_once(path))
+    }
+
+    fn open_path_once(path: &Path) -> anyhow::Result<SqliteLog> {
         let conn =
             Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        // Busy timeout before WAL conversion. Concurrent first opens otherwise
+        // hit SQLITE_BUSY on journal_mode/schema with the default 0ms handler.
+        conn.busy_timeout(INIT_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
                 seq      INTEGER PRIMARY KEY,
@@ -123,6 +170,7 @@ impl SqliteLog {
                 value INTEGER NOT NULL
             );",
         )?;
+        conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
         let log = SqliteLog {
             conn: Mutex::new(conn),
         };
@@ -782,10 +830,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn concurrent_first_opens_do_not_lower_head() {
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "pher-traillog-firstopen-{}-{}",
+            "pher-traillog-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -793,38 +840,79 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pher.db");
-        {
-            let bootstrap = Connection::open(&path).unwrap();
-            bootstrap
-                .execute_batch(
-                    "CREATE TABLE events (
-                        seq INTEGER PRIMARY KEY,
-                        id TEXT NOT NULL,
-                        ts TEXT NOT NULL,
-                        subject TEXT NOT NULL,
-                        envelope TEXT NOT NULL
-                    );",
-                )
-                .unwrap();
-            bootstrap
-                .execute(
-                    "INSERT INTO events (seq, id, ts, subject, envelope) VALUES (7, 'PH.7', '2026-01-01T00:00:00Z', 'x', '{}')",
-                    [],
-                )
-                .unwrap();
+        dir
+    }
+
+    fn concurrent_open_heads(path: &std::path::Path, n: usize) -> Vec<u64> {
+        let hs: Vec<_> = (0..n)
+            .map(|_| {
+                let p = path.to_path_buf();
+                std::thread::spawn(move || {
+                    SqliteLog::open_path(&p).and_then(|l| l.head_seq().map_err(Into::into))
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("open thread").expect("open_path"))
+            .collect()
+    }
+
+    fn plant_pre_a1_head(path: &std::path::Path, seq: i64) {
+        let bootstrap = Connection::open(path).unwrap();
+        bootstrap
+            .execute_batch(
+                "CREATE TABLE events (
+                    seq INTEGER PRIMARY KEY,
+                    id TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    envelope TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        bootstrap
+            .execute(
+                "INSERT INTO events (seq, id, ts, subject, envelope) VALUES (?1, 'PH.7', '2026-01-01T00:00:00Z', 'x', '{}')",
+                params![seq],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_opens_do_not_lower_head() {
+        for i in 0..24 {
+            let dir = unique_dir(&format!("firstopen-{i}"));
+            let path = dir.join("pher.db");
+            plant_pre_a1_head(&path, 7);
+            let heads = concurrent_open_heads(&path, 2);
+            assert!(
+                heads.iter().all(|&h| h == 7),
+                "iter {i}: concurrent first opens must adopt head 7, got {heads:?}"
+            );
+            let log = SqliteLog::open_path(&path).unwrap();
+            assert_eq!(log.head_seq().unwrap(), 7);
+            let _ = std::fs::remove_dir_all(dir);
         }
-        let path_a = path.clone();
-        let path_b = path.clone();
-        let a = std::thread::spawn(move || SqliteLog::open_path(&path_a).unwrap().head_seq());
-        let b = std::thread::spawn(move || SqliteLog::open_path(&path_b).unwrap().head_seq());
-        let ha = a.join().unwrap().unwrap();
-        let hb = b.join().unwrap().unwrap();
-        assert_eq!(ha, 7);
-        assert_eq!(hb, 7);
-        let log = SqliteLog::open_path(&path).unwrap();
-        assert_eq!(log.head_seq().unwrap(), 7);
-        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repeated_fresh_path_concurrent_opens_initialize() {
+        for i in 0..24 {
+            let dir = unique_dir(&format!("freshopen-{i}"));
+            let path = dir.join("pher.db");
+            let heads = concurrent_open_heads(&path, 4);
+            assert!(
+                heads.iter().all(|&h| h == 0),
+                "iter {i}: fresh concurrent opens must seed head 0, got {heads:?}"
+            );
+            let log = SqliteLog::open_path(&path).unwrap();
+            assert_eq!(log.head_seq().unwrap(), 0);
+            let pos = log
+                .append(&[ev("PH.1", "2026-08-01T00:00:00Z", "a")])
+                .unwrap();
+            assert_eq!(pos.seq, 1);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

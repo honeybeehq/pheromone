@@ -20,6 +20,10 @@ Two rusqlite connections to `pher.db`. SqliteLog is the only writer of
 `events` and `log_state`. Seed is one `BEGIN IMMEDIATE` (`INSERT OR IGNORE`
 head/floor). Concurrent first opens cannot lower a persisted head. Leftover
 pre-A1 rows are adopted only when head is still 0 in that transaction.
+`busy_timeout` is installed before `journal_mode=WAL` and schema init.
+First-open WAL/schema/seed retries SQLITE_BUSY and SQLITE_LOCKED with a
+bounded backoff (32 attempts, 1–50ms). Tested with 24 isolated pairs of
+adopt-head concurrent opens and 24 isolated 4-way fresh-path opens.
 
 ## Retention vs since
 
