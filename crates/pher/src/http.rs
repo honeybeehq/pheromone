@@ -146,7 +146,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             }
             let mut last_sent = after.unwrap_or(0);
             let mut write_ok = true;
-            crate::daemon::page_tail_backlog(
+            if let Err(e) = crate::daemon::page_tail_backlog(
                 &attached.log,
                 attached.after,
                 attached.last,
@@ -165,7 +165,10 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                     last_sent = seq;
                     true
                 },
-            );
+            ) {
+                let _ = write_chunk(&mut writer, &format!("{}\n", crate::protocol::err(&e)));
+                return;
+            }
             if !write_ok {
                 return;
             }

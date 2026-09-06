@@ -403,8 +403,8 @@ impl TrailLog for SqliteLog {
 }
 
 /// Walk the log from `from_seq` (inclusive) through `through` (inclusive, if
-/// set), one `LOG_PAGE` at a time. `Trimmed` skips to `resume_at`. `visit`
-/// returning false stops the walk.
+/// set), one `LOG_PAGE` at a time. `Trimmed` and other read errors propagate.
+/// `visit` returning false stops the walk.
 pub fn for_each_page(
     log: &SqliteLog,
     mut from_seq: u64,

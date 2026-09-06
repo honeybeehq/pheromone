@@ -670,7 +670,13 @@ impl State {
         if sub.then.sink != Sink::Stream {
             if let Some(replay) = sub.replay.clone() {
                 let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
-                replayed += self.replay_from_ts(&id, &cutoff);
+                match self.replay_from_ts(&id, &cutoff) {
+                    Ok(n) => replayed += n,
+                    Err(e) => {
+                        self.remove_sub(&id, "since replay failed");
+                        return Err(e.to_string());
+                    }
+                }
             }
         }
 
@@ -1740,15 +1746,9 @@ impl State {
 
     /// Page `since` catch-up: seek_ts finds the first candidate; every later
     /// event must still have envelope.ts >= cutoff (timestamps are not monotonic).
-    fn replay_from_ts(&mut self, sub_id: &str, ts: &str) -> u64 {
-        let from = match self.log.seek_ts(0, ts) {
-            Ok(p) => p.seq,
-            Err(e) => {
-                eprintln!("pherd: seek_ts failed: {e}");
-                return 0;
-            }
-        };
-        self.replay_from_seq(sub_id, from, Some(ts)).1
+    fn replay_from_ts(&mut self, sub_id: &str, ts: &str) -> Result<u64, TrailError> {
+        let from = self.log.seek_ts(0, ts)?.seq;
+        Ok(self.replay_from_seq(sub_id, from, Some(ts))?.1)
     }
 
     /// Page deliveries from `from_seq` inclusive. Returns (first seq seen, count).
@@ -1757,7 +1757,7 @@ impl State {
         sub_id: &str,
         from_seq: u64,
         ts_min: Option<&str>,
-    ) -> (Option<u64>, u64) {
+    ) -> Result<(Option<u64>, u64), TrailError> {
         let mut first = None;
         let mut replayed = 0u64;
         let mut from = from_seq;
@@ -1765,13 +1765,9 @@ impl State {
             let page = match self.log.read(Pos::local(from.max(1)), LOG_PAGE) {
                 Ok(p) => p,
                 Err(TrailError::Trimmed { resume_at }) => {
-                    from = resume_at.seq;
-                    continue;
+                    return Err(TrailError::Trimmed { resume_at });
                 }
-                Err(e) => {
-                    eprintln!("pherd: log read failed: {e}");
-                    break;
-                }
+                Err(e) => return Err(e),
             };
             if page.is_empty() {
                 break;
@@ -1782,7 +1778,10 @@ impl State {
                 }
                 if let Some(min) = ts_min {
                     if event.ts.as_str() < min {
-                        from = pos.seq.saturating_add(1);
+                        from = pos
+                            .seq
+                            .checked_add(1)
+                            .ok_or(TrailError::SeqOutOfRange { seq: pos.seq })?;
                         continue;
                     }
                 }
@@ -1790,10 +1789,13 @@ impl State {
                 if let Some(n) = self.try_deliver(sub_id, &event) {
                     replayed += n;
                 }
-                from = pos.seq.saturating_add(1);
+                from = pos
+                    .seq
+                    .checked_add(1)
+                    .ok_or(TrailError::SeqOutOfRange { seq: pos.seq })?;
             }
         }
-        (first, replayed)
+        Ok((first, replayed))
     }
 
     fn notify_tails(&mut self, seq: u64, event: &Envelope) {
@@ -2607,11 +2609,14 @@ pub(crate) fn attach_tail(
     };
     let (tx, rx) = mpsc::sync_channel::<String>(LIVE_QUEUE);
     let mut s = state.lock().unwrap();
+    let through = match s.log.head_seq() {
+        Ok(h) => h,
+        Err(e) => return Err(err(e)),
+    };
     s.tails.push(TailClient {
         tx,
         subject: pattern.clone(),
     });
-    let through = s.log_head();
     Ok(TailAttachment {
         rx,
         pattern,
@@ -2631,16 +2636,16 @@ pub(crate) fn page_tail_backlog(
     pattern: Option<&SubjectPattern>,
     through: u64,
     mut emit: impl FnMut(u64, Envelope) -> bool,
-) {
+) -> Result<(), TrailError> {
     let from = match after {
         None => 1,
         Some(a) => match next_after(a) {
             Some(f) => f,
-            None => return,
+            None => return Ok(()),
         },
     };
     if last == Some(0) {
-        return;
+        return Ok(());
     }
     if let Some(n) = last {
         let mut ring: VecDeque<(u64, Envelope)> = VecDeque::new();
@@ -2650,7 +2655,7 @@ pub(crate) fn page_tail_backlog(
         } else {
             from
         };
-        if for_each_page(log, start, Some(through), |seq, event| {
+        for_each_page(log, start, Some(through), |seq, event| {
             if let Some(p) = pattern {
                 if !p.matches(&event.subject) {
                     return true;
@@ -2661,26 +2666,22 @@ pub(crate) fn page_tail_backlog(
             }
             ring.push_back((seq, event));
             true
-        })
-        .is_err()
-        {
-            return;
-        }
+        })?;
         for (seq, event) in ring {
             if !emit(seq, event) {
                 break;
             }
         }
-        return;
+        return Ok(());
     }
-    let _ = for_each_page(log, from, Some(through), |seq, event| {
+    for_each_page(log, from, Some(through), |seq, event| {
         if let Some(p) = pattern {
             if !p.matches(&event.subject) {
                 return true;
             }
         }
         emit(seq, event)
-    });
+    })
 }
 
 fn handle_tail(
@@ -2699,7 +2700,7 @@ fn handle_tail(
     let mut writer = stream.try_clone()?;
     let mut last_sent = after.unwrap_or(0);
     let mut write_ok = true;
-    page_tail_backlog(
+    if let Err(e) = page_tail_backlog(
         &attached.log,
         attached.after,
         attached.last,
@@ -2714,7 +2715,10 @@ fn handle_tail(
             last_sent = seq;
             true
         },
-    );
+    ) {
+        let _ = writeln!(writer, "{}", err(&e));
+        return Ok(());
+    }
     if !write_ok {
         return Ok(());
     }
@@ -2778,7 +2782,13 @@ pub(crate) fn attach_listener(
         .insert(id.clone(), ListenerHandle { tx, filter });
 
     let sub = s.matcher.get(&id).cloned();
-    let through = s.log_head();
+    let through = match s.log.head_seq() {
+        Ok(h) => h,
+        Err(e) => {
+            s.remove_sub(&id, "log head unreadable");
+            return Err(err(e));
+        }
+    };
     let log = Arc::clone(&s.log);
     let mut catchup_from = None;
     let mut ts_cutoff = None;
@@ -3646,5 +3656,64 @@ mod follower_tests {
             att.rx.try_recv().is_ok(),
             "live arrival during catch-up goes on the bounded queue, not the catch-up page"
         );
+    }
+
+    #[test]
+    fn since_replay_fails_closed_on_corrupt_and_drops_sub() {
+        let paths = fresh_home("since-corrupt");
+        let mut s = State::load(paths.clone()).unwrap();
+        s.log
+            .append(&[Envelope {
+                id: "PH.1".into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: "t.x".into(),
+                subject: "t.x".into(),
+                correlation: None,
+                payload: json!({}),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+        rusqlite::Connection::open(paths.home.join("pher.db"))
+            .unwrap()
+            .execute("UPDATE events SET envelope = 'nope' WHERE seq = 1", [])
+            .unwrap();
+        s.matched_through = s.log.head_seq().unwrap_or(1);
+        let err = s
+            .register("on t.** then emit seen.hit since 24h", &[], None)
+            .unwrap_err();
+        assert!(err.contains("corrupt"), "{err}");
+        assert!(
+            s.matcher.ids().is_empty(),
+            "failed since replay must not leave the subscription"
+        );
+    }
+
+    #[test]
+    fn tail_backlog_fails_closed_on_corrupt() {
+        let paths = fresh_home("tail-corrupt");
+        let s = State::load(paths.clone()).unwrap();
+        s.log
+            .append(&[Envelope {
+                id: "PH.1".into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: "t.x".into(),
+                subject: "t.x".into(),
+                correlation: None,
+                payload: json!({}),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+        rusqlite::Connection::open(paths.home.join("pher.db"))
+            .unwrap()
+            .execute("UPDATE events SET envelope = 'nope' WHERE seq = 1", [])
+            .unwrap();
+        let err = page_tail_backlog(&s.log, None, None, None, 1, |_, _| true).unwrap_err();
+        assert!(matches!(err, TrailError::Corrupt { .. }), "{err}");
     }
 }
