@@ -544,6 +544,7 @@ mod tests {
             payload: serde_json::json!({ "id": id }),
             ttl_class: None,
             hops: None,
+            source_ts: None,
         }
     }
 

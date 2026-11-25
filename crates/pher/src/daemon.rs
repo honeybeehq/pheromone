@@ -808,6 +808,10 @@ impl State {
             payload: partial.payload.unwrap_or(Value::Null),
             ttl_class: None,
             hops: (hops > 0).then_some(hops),
+            source_ts: partial
+                .source_ts
+                .as_ref()
+                .and_then(crate::connector::normalize_source_ts),
         };
         let seq = self.ingest_envelope(event.clone())?;
         Ok(ok(json!({ "id": event.id, "seq": seq })))
@@ -1314,6 +1318,7 @@ impl State {
                     event_type: None,
                     source: Some("tap.metrics".to_string()),
                     correlation: None,
+                    source_ts: None,
                 },
                 0,
             );
@@ -1495,6 +1500,7 @@ impl State {
             payload: event.payload.clone().unwrap_or(Value::Null),
             ttl_class: None,
             hops: None,
+            source_ts: None,
         };
         if filter_matches(filter, &probe) {
             Ok(())
@@ -1807,6 +1813,7 @@ impl State {
                     event_type: Some(subject.clone()),
                     source: Some(format!("pher.emit/{}", block.subscription)),
                     correlation: event.correlation.clone(),
+                    source_ts: None,
                 };
                 match self.ingest(re, hops) {
                     Ok(v) => json!({ "sink": "emit", "subject": subject, "result": v }),
@@ -1925,6 +1932,7 @@ impl State {
                 event_type: None,
                 source: Some("pherd".to_string()),
                 correlation: None,
+                source_ts: None,
             },
             0,
         );
@@ -3919,6 +3927,7 @@ mod grant_tests {
             payload,
             ttl_class: None,
             hops: None,
+            source_ts: None,
         }
     }
 
@@ -3992,6 +4001,7 @@ mod follower_tests {
             event_type: None,
             source: Some("test".to_string()),
             correlation: None,
+            source_ts: None,
         }
     }
 
@@ -4008,6 +4018,7 @@ mod follower_tests {
                 payload: json!({ "id": id }),
                 ttl_class: None,
                 hops: None,
+                source_ts: None,
             }])
             .unwrap();
     }
@@ -4047,6 +4058,7 @@ mod follower_tests {
                 payload: json!({}),
                 ttl_class: None,
                 hops: None,
+                source_ts: None,
             }])
             .unwrap();
     }
@@ -4059,6 +4071,7 @@ mod follower_tests {
                 event_type: None,
                 source: Some("test".into()),
                 correlation: Some(corr.into()),
+                source_ts: None,
             },
             0,
         )
@@ -4290,6 +4303,7 @@ mod follower_tests {
                     payload: Value::Null,
                     ttl_class: None,
                     hops: None,
+                    source_ts: None,
                 };
                 log.append(&[ev]).unwrap();
             }
@@ -4318,6 +4332,7 @@ mod follower_tests {
             payload: json!({}),
             ttl_class: None,
             hops: None,
+            source_ts: None,
         };
         s.log.append(&[old.clone(), old]).unwrap();
         assert_eq!(s.log.head_seq().unwrap(), 2);
@@ -4348,6 +4363,7 @@ mod follower_tests {
                     event_type: None,
                     source: Some("test".into()),
                     correlation: None,
+                    source_ts: None,
                 },
                 0,
             )
@@ -4384,6 +4400,7 @@ mod follower_tests {
                     payload: json!({}),
                     ttl_class: None,
                     hops: None,
+                    source_ts: None,
                 }])
                 .unwrap();
         }
@@ -4423,6 +4440,7 @@ mod follower_tests {
                     payload: json!({ "i": i }),
                     ttl_class: None,
                     hops: None,
+                    source_ts: None,
                 }])
                 .unwrap();
         }
@@ -4498,6 +4516,7 @@ mod follower_tests {
                     payload: json!({}),
                     ttl_class: None,
                     hops: None,
+                    source_ts: None,
                 }])
                 .unwrap();
         }
@@ -4548,6 +4567,7 @@ mod follower_tests {
                 payload: json!({}),
                 ttl_class: None,
                 hops: None,
+                source_ts: None,
             }])
             .unwrap();
         rusqlite::Connection::open(paths.home.join("pher.db"))
@@ -4599,6 +4619,7 @@ mod follower_tests {
                     event_type: None,
                     source: Some("test".into()),
                     correlation: None,
+                    source_ts: None,
                 },
                 0,
             )
@@ -4628,6 +4649,7 @@ mod follower_tests {
                     payload: json!({ "i": i }),
                     ttl_class: None,
                     hops: None,
+                    source_ts: None,
                 }])
                 .unwrap();
         }
@@ -4663,6 +4685,7 @@ mod follower_tests {
                             event_type: None,
                             source: Some("test".into()),
                             correlation: None,
+                            source_ts: None,
                         },
                         0,
                     )
@@ -4707,6 +4730,7 @@ mod follower_tests {
                     event_type: None,
                     source: Some("test".into()),
                     correlation: None,
+                    source_ts: None,
                 },
                 0,
             )
@@ -4770,6 +4794,7 @@ mod follower_tests {
                         event_type: None,
                         source: Some("test".into()),
                         correlation: None,
+                        source_ts: None,
                     },
                     0,
                 )
@@ -4868,6 +4893,7 @@ mod follower_tests {
                         event_type: None,
                         source: Some("test".into()),
                         correlation: None,
+                        source_ts: None,
                     },
                     0,
                 )
@@ -5468,6 +5494,7 @@ mod follower_tests {
                 payload: json!({}),
                 ttl_class: None,
                 hops: None,
+                source_ts: None,
             }])
             .unwrap();
         rusqlite::Connection::open(paths.home.join("pher.db"))
@@ -5566,6 +5593,7 @@ mod follower_tests {
                 payload: json!({}),
                 ttl_class: None,
                 hops: None,
+                source_ts: None,
             }])
             .unwrap();
         rusqlite::Connection::open(paths.home.join("pher.db"))

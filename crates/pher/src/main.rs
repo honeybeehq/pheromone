@@ -479,6 +479,7 @@ fn run() -> anyhow::Result<()> {
                         event_type,
                         source,
                         correlation,
+                        source_ts: None,
                     },
                 },
             )?;

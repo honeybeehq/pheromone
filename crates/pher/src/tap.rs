@@ -43,6 +43,7 @@ fn tap_event(subject: &str, payload: Value) -> PartialEvent {
         event_type: None,
         source: Some(TAP_SOURCE.to_string()),
         correlation: None,
+        source_ts: None,
     }
 }
 
@@ -428,6 +429,7 @@ fn map_row(row: Value) -> PartialEvent {
         payload: Some(row),
         source: Some(TAP_SOURCE.to_string()),
         correlation,
+        source_ts: None,
     }
 }
 

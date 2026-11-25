@@ -75,9 +75,9 @@ pub struct PollSpec {
     pub subject: String,
     /// Record field holding the vendor id (dedup key). Dotted path.
     pub id: String,
-    /// Record field holding the event timestamp (envelope ts hint). Dotted.
+    /// Record field holding the vendor's event timestamp, carried as the
+    /// envelope's `sourceTs` (ingest `ts` stays authoritative). Dotted.
     #[serde(default)]
-    #[allow(dead_code)]
     pub ts: Option<String>,
     /// Record field to watermark on (only records with field > stored
     /// watermark are emitted). Usually a timestamp; compared as strings for
@@ -468,12 +468,22 @@ fn poll_once(
             continue;
         }
         let version = record_version(record, spec);
+        let source_ts = vendor_ts(record, spec);
+        if let VendorTs::Unreadable(raw) = &source_ts {
+            eprintln!(
+                "pherd connector '{}' poll '{}': record {vendor_id} admitted without sourceTs: unreadable '{}' value {raw}",
+                def.name,
+                spec.name,
+                spec.ts.as_deref().unwrap_or_default()
+            );
+        }
         let event = PartialEvent {
             event_type: Some(subject.clone()),
             subject,
             payload: Some(record.clone()),
             source: Some(format!("connector:{}", def.name)),
             correlation: Some(vendor_id.clone()),
+            source_ts: source_ts.into_option().map(Value::String),
         };
         s.ingest_once(once_key(&def.name, &spec.name, &vendor_id, &version), event)
             .map_err(|e| format!("emit failed, cursor held for retry: {e}"))?;
@@ -503,6 +513,102 @@ fn advance(stored: &PollState, filtered: PollState, fetched: &Fetched) -> PollSt
             draining_watermark: highest,
             baselined: true,
         }
+    }
+}
+
+enum VendorTs {
+    Unset,
+    Read(String),
+    Unreadable(String),
+}
+
+impl VendorTs {
+    fn into_option(self) -> Option<String> {
+        match self {
+            VendorTs::Read(ts) => Some(ts),
+            VendorTs::Unset | VendorTs::Unreadable(_) => None,
+        }
+    }
+}
+
+fn vendor_ts(record: &Value, spec: &PollSpec) -> VendorTs {
+    let Some(path) = spec.ts.as_deref() else {
+        return VendorTs::Unset;
+    };
+    match field(record, path) {
+        None => VendorTs::Unreadable("(missing)".to_string()),
+        Some(value) => match normalize_source_ts(value) {
+            Some(ts) => VendorTs::Read(ts),
+            None => VendorTs::Unreadable(truncate_for_log(&value.to_string())),
+        },
+    }
+}
+
+fn truncate_for_log(text: &str) -> String {
+    const MAX: usize = 64;
+    match text.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
+pub(crate) fn normalize_source_ts(value: &Value) -> Option<String> {
+    let instant = match value {
+        Value::Number(n) => epoch_instant(&n.to_string())?,
+        Value::String(s) => {
+            let s = s.trim();
+            epoch_instant(s).or_else(|| rfc3339_instant(s))?
+        }
+        _ => return None,
+    };
+    Some(humantime::format_rfc3339_millis(instant).to_string())
+}
+
+fn epoch_instant(text: &str) -> Option<std::time::SystemTime> {
+    const MS_THRESHOLD: u64 = 100_000_000_000;
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole: u64 = whole.parse().ok()?;
+    let fraction_nanos = |digits: &str, scale: u32| -> u64 {
+        let digits = &digits[..digits.len().min(scale as usize)];
+        digits.parse::<u64>().unwrap_or(0) * 10u64.pow(scale - digits.len() as u32)
+    };
+    let duration = if whole >= MS_THRESHOLD {
+        Duration::from_millis(whole) + Duration::from_nanos(fraction_nanos(fraction, 6))
+    } else {
+        Duration::from_secs(whole) + Duration::from_nanos(fraction_nanos(fraction, 9))
+    };
+    std::time::UNIX_EPOCH.checked_add(duration)
+}
+
+fn rfc3339_instant(s: &str) -> Option<std::time::SystemTime> {
+    if !s.is_ascii() || s.len() < 20 || !matches!(s.as_bytes()[10], b'T' | b't') {
+        return None;
+    }
+    if let Some(utc) = s.strip_suffix(['Z', 'z']) {
+        return humantime::parse_rfc3339(&format!("{utc}Z")).ok();
+    }
+    let (local, offset) = s.split_at(s.len() - 6);
+    let o = offset.as_bytes();
+    if !matches!(o[0], b'+' | b'-') || o[3] != b':' {
+        return None;
+    }
+    let hours: u64 = offset[1..3].parse().ok()?;
+    let minutes: u64 = offset[4..6].parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let shift = Duration::from_secs(hours * 3600 + minutes * 60);
+    let as_if_utc = humantime::parse_rfc3339(&format!("{local}Z")).ok()?;
+    if o[0] == b'+' {
+        as_if_utc.checked_sub(shift)
+    } else {
+        as_if_utc.checked_add(shift)
     }
 }
 

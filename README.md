@@ -182,6 +182,10 @@ What works today:
   engine. `pher connect add sentry --token env:SENTRY_TOKEN --param
   org=acme` and `sentry.issue.*` events flow; built-in catalog (sentry,
   github, stripe) plus drop-in manifests in `~/.pheromone/connectors/`.
+  The manifest's `ts` field becomes the event's `sourceTs` (vendor time);
+  `ts` stays ingest time and governs order, `since` and retention (see
+  docs/LANGUAGE.md, "Two timestamps"). An unreadable vendor timestamp
+  admits the event without `sourceTs`, never drops it.
   First poll baselines (live-from-now); watermark + id-window dedup persist
   across restarts and vendor outages (verified: outage catch-up emits
   exactly once). The `[exec]` escape hatch supervises any process emitting

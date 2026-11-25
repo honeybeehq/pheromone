@@ -127,6 +127,8 @@ pub struct PartialEvent {
     pub source: Option<String>,
     #[serde(default)]
     pub correlation: Option<String>,
+    #[serde(rename = "sourceTs", default)]
+    pub source_ts: Option<Value>,
 }
 
 pub fn ok(mut extra: Value) -> Value {

@@ -402,6 +402,7 @@ mod tests {
             payload: serde_json::json!({"n": 5}),
             ttl_class: None,
             hops: None,
+            source_ts: None,
         }])
         .unwrap();
         assert_eq!(

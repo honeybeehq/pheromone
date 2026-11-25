@@ -23,6 +23,8 @@ pub struct Envelope {
     pub ttl_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hops: Option<u32>,
+    #[serde(rename = "sourceTs", skip_serializing_if = "Option::is_none", default)]
+    pub source_ts: Option<String>,
 }
 
 impl Envelope {
@@ -40,6 +42,7 @@ impl Envelope {
             payload,
             ttl_class: None,
             hops: None,
+            source_ts: None,
         }
     }
 }

@@ -499,6 +499,7 @@ fn handle(
                 event_type: None,
                 source: Some(format!("tap.webhook.{name}")),
                 correlation: None,
+                source_ts: None,
             };
             let result = state.lock().unwrap().ingest(event, 0);
             match result {

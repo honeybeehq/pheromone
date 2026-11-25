@@ -36,6 +36,7 @@ pub enum Field {
     Source,
     Node,
     Ts,
+    SourceTs,
     Correlation,
     Payload,
 }
@@ -48,6 +49,7 @@ impl Field {
             "source" => Field::Source,
             "node" => Field::Node,
             "ts" => Field::Ts,
+            "sourceTs" => Field::SourceTs,
             "correlation" => Field::Correlation,
             "payload" => Field::Payload,
             _ => return None,
@@ -61,6 +63,7 @@ impl Field {
             Field::Source => "source",
             Field::Node => "node",
             Field::Ts => "ts",
+            Field::SourceTs => "sourceTs",
             Field::Correlation => "correlation",
             Field::Payload => "payload",
         }
@@ -555,6 +558,10 @@ fn resolve<'a>(path: &BoundPath, ctx: &EvalCtx<'a>) -> Result<Option<Cow<'a, Val
         Field::Source => &env.source,
         Field::Node => &env.node,
         Field::Ts => &env.ts,
+        Field::SourceTs => match &env.source_ts {
+            Some(t) => t,
+            None => return Ok(None),
+        },
         Field::Correlation => match &env.correlation {
             Some(c) => c,
             None => return Ok(None),
@@ -780,6 +787,7 @@ mod tests {
             payload,
             ttl_class: None,
             hops: None,
+            source_ts: None,
         }
     }
 

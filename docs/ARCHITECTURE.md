@@ -69,7 +69,7 @@ velocity-to-v1 ever trumps differentiation, Go + embedded NATS is the coherent p
 |---|---|---|
 | Core + daemon + CLI | Rust | `pher-core` crate; `pherd`; `pher` (clap). Single static binary, cross-compiled |
 | Bindings | napi-rs (`@pheromone/core`) + WASM | Built from day one so the grammar is pressure-tested by consumers |
-| Envelope | CloudEvents-compatible JSON | `{id, ts, node, source, type, subject, correlation, payload, ttlClass}`; free interop with Knative/EventBridge producers |
+| Envelope | CloudEvents-compatible JSON | `{id, ts, node, source, type, subject, correlation, payload, ttlClass}` plus optional `sourceTs` (source-reported time; `ts` stays authoritative, see LANGUAGE.md); free interop with Knative/EventBridge producers |
 | State/index store | SQLite (WAL), one DB per node | `~/.pheromone/pher.db`: subscriptions, offsets, deliveries, timers (`expect`), FTS5, vectors |
 | Vectors | sqlite-vec, same DB | 384-dim; no second process. FTS5 gives a free lexical tier |
 | Event bodies | `TrailLog` trait: SQLite locally; **Comb Log** (object storage, S3/MinIO) for hub/cloud | Local: SQLite, µs acks. Cloud: Comb Log (honeybee/comb spec §8) — stateless pherds, object store the only durable state, epoch-fenced leader, compaction, opt-in partitions. Pheromone's side of the boundary: [SCALE.md](SCALE.md) |
