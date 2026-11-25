@@ -159,6 +159,7 @@ pub(crate) struct State {
     judge_scopes: HashMap<String, String>,
     judge_order: HashMap<String, BTreeMap<u64, Option<ReadyJudgment>>>,
     verdict_cache: HashMap<String, crate::judge::Verdict>,
+    verdict_ts: HashMap<String, u64>,
     conditions: crate::conditions::Conditions,
     /// Admission dedup for cross-node deliveries (Connected-store pattern):
     /// at-least-once shipping, effectively-once ingestion. Persisted to
@@ -402,11 +403,15 @@ impl State {
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default();
         let mut verdict_cache: HashMap<String, crate::judge::Verdict> = HashMap::new();
+        let mut verdict_ts: HashMap<String, u64> = HashMap::new();
         for v in db.load_verdicts()? {
             if let (Some(key), Some(verdict)) = (
                 v.get("key").and_then(|k| k.as_str()),
                 v.get("verdict").and_then(|b| b.as_bool()),
             ) {
+                if let Some(ts) = v.get("ts").and_then(|t| t.as_u64()) {
+                    verdict_ts.insert(key.to_string(), ts);
+                }
                 verdict_cache.insert(
                     key.to_string(),
                     crate::judge::Verdict {
@@ -509,6 +514,7 @@ impl State {
             judge_scopes: HashMap::new(),
             judge_order: HashMap::new(),
             verdict_cache,
+            verdict_ts,
             conditions,
             forwarded_seen,
             outbox,
@@ -1093,6 +1099,7 @@ impl State {
                     "sampledOut": true,
                 });
                 let _ = self.db.append_verdict(&sample_key, now_unix(), &record);
+                self.verdict_ts.insert(sample_key.clone(), now_unix());
                 self.verdict_cache.insert(sample_key, verdict);
                 return TierStep::Done(0);
             }
@@ -1135,6 +1142,7 @@ impl State {
         };
         self.verdict_cache
             .insert(job.cache_key.clone(), verdict.clone());
+        self.verdict_ts.insert(job.cache_key.clone(), now_unix());
         let record = json!({
             "ts": now_unix(),
             "key": job.cache_key,
@@ -2456,6 +2464,13 @@ impl State {
         });
     }
 
+    fn evaporate_verdicts(&mut self, cutoff_unix: u64) {
+        let verdict_ts = &mut self.verdict_ts;
+        self.verdict_cache
+            .retain(|key, _| verdict_ts.get(key).is_none_or(|&ts| ts >= cutoff_unix));
+        verdict_ts.retain(|_, ts| *ts >= cutoff_unix);
+    }
+
     fn gc(&mut self) -> anyhow::Result<()> {
         let cutoff = unix_to_ts(now_unix().saturating_sub(self.retention_secs));
         let cutoff_unix = now_unix().saturating_sub(self.retention_secs);
@@ -2464,6 +2479,7 @@ impl State {
         }
         self.db.gc(&cutoff, cutoff_unix, MAX_FORWARDED_SEEN)?;
         self.semantic.gc(cutoff_unix);
+        self.evaporate_verdicts(cutoff_unix);
         // Cursors evaporate with the events they point into: one not
         // committed for a full retention window points at nothing.
         let before = self.cursors.len();
@@ -5467,6 +5483,40 @@ mod follower_tests {
             s.matcher.ids().is_empty(),
             "failed since replay must not leave the subscription"
         );
+    }
+
+    #[test]
+    fn sampled_out_verdicts_evaporate_after_retention() {
+        let paths = fresh_home("sampled-evaporate");
+        let mut s = State::load(paths).unwrap();
+        let now = now_unix();
+        let expired = now - s.retention_secs - 60;
+        for (key, ts) in [
+            ("listener:x:sampled:OLD", expired),
+            ("listener:x:sampled:NEW", now),
+        ] {
+            let record = json!({ "ts": ts, "key": key, "verdict": false, "sampledOut": true });
+            s.db.append_verdict(key, ts, &record).unwrap();
+            s.verdict_cache.insert(
+                key.to_string(),
+                crate::judge::Verdict {
+                    verdict: false,
+                    rationale: "sampled out".into(),
+                },
+            );
+            s.verdict_ts.insert(key.to_string(), ts);
+        }
+        s.gc().unwrap();
+        let mut kept: Vec<&String> = s.verdict_cache.keys().collect();
+        kept.sort();
+        assert_eq!(kept, vec!["listener:x:sampled:NEW"]);
+        let stored: Vec<String> =
+            s.db.load_verdicts()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v["key"].as_str().map(String::from))
+                .collect();
+        assert_eq!(stored, vec!["listener:x:sampled:NEW".to_string()]);
     }
 
     #[test]
