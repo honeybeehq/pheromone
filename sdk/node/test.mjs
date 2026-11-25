@@ -396,6 +396,23 @@ try {
   r3.close();
   console.log("ok  live judge deliveries stay in seq order");
 
+  const sampled = [];
+  const sm = await pher.on('on smp.* judge "is it bad?" budget 1000/day sample 0.5', (d) =>
+    sampled.push(d.event.payload.kind),
+  );
+  const contents = Array.from({ length: 12 }, (_, i) => `bad same ${i}`);
+  for (const kind of contents) {
+    for (let i = 0; i < 6; i++) await pher.emit("smp.x", { kind });
+  }
+  await sleep(1500);
+  sm.close();
+  const silenced = contents.filter((kind) => !sampled.includes(kind));
+  assert.ok(
+    silenced.length <= 2,
+    `a lost coin flip must not silence identical content: ${silenced.length}/12 silenced`,
+  );
+  console.log("ok  sample rolls per event, not once per content");
+
   // Reconnect: a server-side hangup (rm) triggers re-attach with backoff.
   const got3 = [];
   const r1 = await pher.on("on rec.*", (d) => got3.push(d), { reconnect: true });

@@ -1042,6 +1042,10 @@ impl State {
         };
         let summary = crate::judge::event_summary(event);
         let scope = self.judge_scope(sub_id);
+        let sample_key = format!("{scope}:sampled:{}", event.id);
+        if self.verdict_cache.contains_key(&sample_key) {
+            return TierStep::Done(0);
+        }
         let cache_key = format!("{scope}:{}", crate::judge::content_fingerprint(event));
         if let Some(verdict) = self.verdict_cache.get(&cache_key).cloned() {
             if !verdict.verdict {
@@ -1081,15 +1085,15 @@ impl State {
                 };
                 let record = json!({
                     "ts": now_unix(),
-                    "key": cache_key,
+                    "key": sample_key,
                     "subscription": sub_id,
                     "event": event.id,
                     "verdict": false,
                     "rationale": verdict.rationale,
                     "sampledOut": true,
                 });
-                let _ = self.db.append_verdict(&cache_key, now_unix(), &record);
-                self.verdict_cache.insert(cache_key, verdict);
+                let _ = self.db.append_verdict(&sample_key, now_unix(), &record);
+                self.verdict_cache.insert(sample_key, verdict);
                 return TierStep::Done(0);
             }
         }
