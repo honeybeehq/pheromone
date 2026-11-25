@@ -1103,11 +1103,12 @@ impl State {
         if event.id.is_empty() {
             return Err("remote event has no id".to_string());
         }
-        if self.forwarded_seen.contains(&event.id) {
+        let key = ids::admission_key(&event);
+        if self.forwarded_seen.contains(&key) {
             return Ok(json!({ "ok": true, "deduped": true }));
         }
-        let _ = self.db.forwarded_insert(&event.id);
-        self.forwarded_seen.push_back(event.id.clone());
+        let _ = self.db.forwarded_insert(&key);
+        self.forwarded_seen.push_back(key);
         while self.forwarded_seen.len() > MAX_FORWARDED_SEEN {
             self.forwarded_seen.pop_front();
         }

@@ -212,7 +212,7 @@ commitment and it is load-bearing for trusting tiers 3–4:
 
 ```json
 {
-  "event": { "id": "PH.9x1", "ts": "...", "node": "trmd-mbp", "source": "tap.github",
+  "event": { "id": "PH.01jdq3v8k2x9m4n7p0r5s6t8wz", "ts": "...", "node": "trmd-mbp", "source": "tap.github",
              "type": "ci.github.run.completed", "subject": "ci.github.run.completed",
              "correlation": "HE.a3f", "payload": { "...": "..." } },
   "match": {
@@ -221,7 +221,7 @@ commitment and it is load-bearing for trusting tiers 3–4:
     "where": { "expr": "payload.conclusion == \"failure\"", "result": true },
     "meaning": { "descriptor": "infra flake...", "score": 0.86, "threshold": 0.8 },
     "judge": null,
-    "deliveryId": "PH.4k2:PH.9x1:1"
+    "deliveryId": "PH.4k2:PH.01jdq3v8k2x9m4n7p0r5s6t8wz:1"
   }
 }
 ```
