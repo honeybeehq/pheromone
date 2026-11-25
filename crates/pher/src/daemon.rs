@@ -540,7 +540,7 @@ impl State {
         #[cfg(test)]
         let forced = &mut self.forced_sub_ids;
         #[cfg(test)]
-        let mut mint = || forced.pop_front().unwrap_or_else(|| ids::short_id("PH"));
+        let mint = || forced.pop_front().unwrap_or_else(|| ids::short_id("PH"));
         #[cfg(not(test))]
         let mint = || ids::short_id("PH");
         let held_in_memory = |id: &str| {

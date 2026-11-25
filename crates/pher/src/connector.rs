@@ -37,6 +37,7 @@ pub struct Manifest {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub docs: String,
     #[serde(default)]
     pub auth: Option<AuthSpec>,
@@ -76,6 +77,7 @@ pub struct PollSpec {
     pub id: String,
     /// Record field holding the event timestamp (envelope ts hint). Dotted.
     #[serde(default)]
+    #[allow(dead_code)]
     pub ts: Option<String>,
     /// Record field to watermark on (only records with field > stored
     /// watermark are emitted). Usually a timestamp; compared as strings for
