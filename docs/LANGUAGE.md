@@ -31,7 +31,7 @@ when
   [judge "<yes/no question>" budget <n>/<period>]     # tier 4 — LLM verdict
   [expect <subject-pattern> [where <expr>] within <dur> else]   # absence (see below)
 then <action>
-[for <ttl> | while <client> alive]                    # lifetime (while: then stream only)
+[for <ttl> | while <client> alive]                    # lifetime (while: the host enforces it)
 [every <window> | batch <window>]                     # delivery shaping
 [since <lookback>]                                    # replay backlog first, then go live
 [limit <n>]                                           # max deliveries, then retire
@@ -155,12 +155,22 @@ else then buz operator --tier queue
 ## Lifecycle, delivery shaping, replay
 
 - `for <ttl>` — evaporates after the duration (generalizes Pollinate's temporary hooks).
-- `while <client> alive` — leased to a listener connection; the connection closes, the
-  receptor evaporates. Only `then stream` subscriptions carry it (`pher listen`, SDK
-  `.on()`). `pher when` and `pher apply` refuse it: pherd has no liveness signal for the
-  holder of a stored subscription, so it would deliver forever after the holder died.
-  Bound a stored subscription with `for <ttl>` instead. Leaf-node subscriptions (future,
-  ephemeral containers) will be leased to the leaf's connection to its parent.
+- `while <client> alive` — a lease: the receptor lives only as long as `<client>`. The
+  language accepts it on any action and `pher-core` parses it into `lifetime: lease`, but
+  the matcher ignores lifetimes: `evaluate` and `whyNot` give the same verdict with or
+  without the lease. Enforcing it is the host's job:
+  - **pherd** enforces it through a listener connection. Only `then stream` subscriptions
+    carry it there (`pher listen`, SDK `.on()`); the connection closes, the receptor
+    evaporates. `pher when` and `pher apply` refuse it on stored subscriptions: pherd has
+    no liveness signal for the holder of a stored subscription, so it would deliver
+    forever after the holder died. Bound a stored subscription with `for <ttl>` instead.
+  - **Apiary**, which embeds `pher-core` without pherd, composes rules as
+    `when … then stream while <bee id> alive` and retires them through Honeybee's bee
+    lifecycle.
+  - Leaf-node subscriptions (future, ephemeral containers) will be leased to the leaf's
+    connection to its parent.
+
+  `for` and `while` are mutually exclusive.
 - `every <window>` / `batch <window>` — debounce/batch, **delegated to Pollinate's
   DeliveryManager semantics** (immediate/throttled/batched/debounced with persisted state).
 - `since <lookback>` — replay: run the backlog through the matcher first, then continue
@@ -203,8 +213,8 @@ then stream                                                 # deliver to the con
 `then stream` is the code-based subscriber path: it can only be registered over a live
 listener connection (`pher listen`, or an SDK client's `.on()`), deliveries are pushed
 down that connection, and the subscription is removed the moment the listener
-disconnects. It is the only place the lease lifetime (`while <client> alive`) is
-accepted, because connection liveness is what enforces it. `pher when '… then stream'`
+disconnects. It is the only place pherd accepts the lease lifetime (`while <client>
+alive`), because connection liveness is how pherd enforces it. `pher when '… then stream'`
 is refused: a stored stream subscription with no listener would be a lie.
 
 `then emit` is how subscriptions compose into pipelines; the delivery's `match` block is
