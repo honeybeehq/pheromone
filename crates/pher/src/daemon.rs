@@ -102,6 +102,9 @@ const MAX_BATCH_QUEUE: usize = 1000;
 const FOLLOWER_BATCH: usize = 32;
 /// Live tail/listen queue. try_send only; Full drops the slow consumer.
 const LIVE_QUEUE: usize = 256;
+const CATCHUP_TIER_LIMIT: usize = 1000;
+const LISTENER_JUDGE_SCOPE: &str = "listener:";
+const HELD_TIER_CANDIDATES: usize = 4096;
 
 pub(crate) struct State {
     paths: Paths,
@@ -153,6 +156,7 @@ pub(crate) struct State {
     judge_cfg: Option<crate::judge::JudgeConfig>,
     judge_tx: Option<mpsc::Sender<JudgeJob>>,
     judge_budgets: HashMap<String, JudgeBudget>,
+    judge_scopes: HashMap<String, String>,
     verdict_cache: HashMap<String, crate::judge::Verdict>,
     conditions: crate::conditions::Conditions,
     /// Admission dedup for cross-node deliveries (Connected-store pattern):
@@ -311,6 +315,12 @@ enum ListenCatchupHold {
     Skip,
     /// seq > through, catch-up still in flight: held until release.
     Held,
+}
+
+enum TierStep {
+    Done(u64),
+    Ask(Box<JudgeJob>),
+    Stop(&'static str),
 }
 
 /// A pending tier-4 evaluation, processed off-lock by the judge worker.
@@ -486,6 +496,7 @@ impl State {
             judge_cfg: None,
             judge_tx: None,
             judge_budgets,
+            judge_scopes: HashMap::new(),
             verdict_cache,
             conditions,
             forwarded_seen,
@@ -919,32 +930,15 @@ impl State {
             }
             let now = now_unix();
             for sub_id in pending_subs {
-                if self.listener_catchup_owns(&sub_id, seq) {
+                if self.hold_live_tiers(&sub_id, seq, event) {
                     continue;
                 }
                 let Some(sub) = self.matcher.get(&sub_id).cloned() else {
                     continue;
                 };
-                // Tier 3 gates tier 4.
-                let mut meaning_record: Option<Value> = None;
-                if let Some(meaning) = &sub.meaning {
-                    let Some(vec) = &event_vec else { continue }; // embedder down: fail closed
-                    let (passed, record) =
-                        self.semantic.score(&sub_id, meaning, &event.id, vec, now);
-                    if !passed {
-                        continue;
-                    }
-                    meaning_record = Some(record);
-                }
-                if sub.expect.is_some() {
-                    self.arm_expect_timer(&sub_id, &sub, event, seq)?;
-                    continue;
-                }
-                if sub.judge.is_some() {
-                    deliveries += self.judge_gate(&sub_id, &sub, event, meaning_record);
-                } else if let Some(record) = meaning_record {
-                    deliveries += self.deliver_semantic(&sub_id, &sub, event, record);
-                }
+                let step =
+                    self.evaluate_tiers(&sub_id, &sub, event, seq, event_vec.as_deref(), now)?;
+                deliveries += self.dispatch_live(&sub_id, step);
             }
             if let Some(vec) = event_vec {
                 let _ = self.db.append_vector(now, &event.id, &vec);
@@ -954,57 +948,112 @@ impl State {
         Ok(deliveries)
     }
 
-    /// Tier 4 admission: cached verdicts apply instantly (replay never
-    /// re-rolls); otherwise budget (fail-closed) then sample gate, then the
-    /// job queues for the async judge worker.
-    fn judge_gate(
+    fn evaluate_tiers(
+        &mut self,
+        sub_id: &str,
+        sub: &Subscription,
+        event: &Envelope,
+        seq: u64,
+        event_vec: Option<&[f32]>,
+        at_unix: u64,
+    ) -> Result<TierStep, String> {
+        self.current_seq = Some(seq);
+        let mut meaning_record = None;
+        if let Some(meaning) = &sub.meaning {
+            let Some(vec) = event_vec else {
+                return Ok(TierStep::Stop("meaningUnavailable"));
+            };
+            let (passed, record) = self
+                .semantic
+                .score(sub_id, meaning, &event.id, vec, at_unix);
+            if !passed {
+                return Ok(TierStep::Done(0));
+            }
+            meaning_record = Some(record);
+        }
+        if sub.expect.is_some() {
+            self.arm_expect_timer(sub_id, sub, event, seq)?;
+            return Ok(TierStep::Done(0));
+        }
+        if sub.judge.is_some() {
+            return Ok(self.judge_admit(sub_id, sub, event, meaning_record));
+        }
+        Ok(TierStep::Done(meaning_record.map_or(0, |record| {
+            self.deliver_semantic(sub_id, sub, event, record)
+        })))
+    }
+
+    fn dispatch_live(&mut self, sub_id: &str, step: TierStep) -> u64 {
+        match step {
+            TierStep::Done(n) => n,
+            TierStep::Ask(job) => {
+                match &self.judge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(*job);
+                    }
+                    None => eprintln!("pherd: judge worker not running"),
+                }
+                0
+            }
+            TierStep::Stop("judgeUnavailable") => {
+                eprintln!("pherd: judge subscription {sub_id} has no provider config");
+                0
+            }
+            TierStep::Stop(_) => 0,
+        }
+    }
+
+    fn judge_scope(&self, sub_id: &str) -> String {
+        self.judge_scopes
+            .get(sub_id)
+            .cloned()
+            .unwrap_or_else(|| sub_id.to_string())
+    }
+
+    fn judge_admit(
         &mut self,
         sub_id: &str,
         sub: &Subscription,
         event: &Envelope,
         meaning_record: Option<Value>,
-    ) -> u64 {
+    ) -> TierStep {
         let Some(judge_clause) = sub.judge.clone() else {
-            return 0;
+            return TierStep::Done(0);
         };
         let summary = crate::judge::event_summary(event);
-        let cache_key = format!("{sub_id}:{}", crate::judge::content_fingerprint(event));
+        let scope = self.judge_scope(sub_id);
+        let cache_key = format!("{scope}:{}", crate::judge::content_fingerprint(event));
         if let Some(verdict) = self.verdict_cache.get(&cache_key).cloned() {
-            if verdict.verdict {
-                let model = self
-                    .judge_cfg
-                    .as_ref()
-                    .map(|c| c.model.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                return self.deliver_judged(
-                    sub_id,
-                    sub,
-                    event,
-                    meaning_record,
-                    &verdict,
-                    true,
-                    &model,
-                );
+            if !verdict.verdict {
+                return TierStep::Done(0);
             }
-            return 0;
+            let model = self
+                .judge_cfg
+                .as_ref()
+                .map(|c| c.model.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            return TierStep::Done(self.deliver_judged(
+                sub_id,
+                sub,
+                event,
+                meaning_record,
+                &verdict,
+                true,
+                &model,
+            ));
         }
-        if !self.reserve_judge_budget(sub_id, &judge_clause) {
-            return 0; // budget exhausted: fail closed
+        if !self.reserve_judge_budget(sub_id, &scope, &judge_clause) {
+            return TierStep::Stop("budgetExhausted");
         }
         if let Some(sample) = judge_clause.sample {
             if pseudo_random() > sample {
-                return 0;
+                return TierStep::Done(0);
             }
         }
         let Some(cfg) = self.judge_cfg.clone() else {
-            eprintln!("pherd: judge subscription {sub_id} has no provider config");
-            return 0;
+            return TierStep::Stop("judgeUnavailable");
         };
-        let Some(tx) = &self.judge_tx else {
-            eprintln!("pherd: judge worker not running");
-            return 0;
-        };
-        let _ = tx.send(JudgeJob {
+        TierStep::Ask(Box::new(JudgeJob {
             sub_id: sub_id.to_string(),
             event: event.clone(),
             seq: self.current_seq,
@@ -1013,19 +1062,69 @@ impl State {
             question: judge_clause.question.clone(),
             meaning_record,
             config: cfg,
+        }))
+    }
+
+    fn settle_judgment(
+        &mut self,
+        job: JudgeJob,
+        result: Result<crate::judge::Verdict, String>,
+    ) -> u64 {
+        let verdict = match result {
+            Ok(verdict) => verdict,
+            Err(e) => {
+                eprintln!("pherd: judge call failed for {}: {e}", job.sub_id);
+                self.emit_trail_event(
+                    "pher.judge.error",
+                    json!({ "subscription": job.sub_id, "event": job.event.id, "error": e }),
+                );
+                return 0;
+            }
+        };
+        self.verdict_cache
+            .insert(job.cache_key.clone(), verdict.clone());
+        let record = json!({
+            "ts": now_unix(),
+            "key": job.cache_key,
+            "subscription": job.sub_id,
+            "event": job.event.id,
+            "model": job.config.model,
+            "verdict": verdict.verdict,
+            "rationale": verdict.rationale,
         });
-        0 // delivery happens on verdict, asynchronously
+        let _ = self.db.append_verdict(&job.cache_key, now_unix(), &record);
+        if !verdict.verdict {
+            return 0;
+        }
+        let Some(sub) = self.matcher.get(&job.sub_id).cloned() else {
+            return 0;
+        };
+        self.current_seq = job.seq;
+        self.deliver_judged(
+            &job.sub_id,
+            &sub,
+            &job.event,
+            job.meaning_record,
+            &verdict,
+            false,
+            &job.config.model,
+        )
     }
 
     /// Budget window accounting. Returns whether one judge call may proceed.
     /// The transition into exhaustion emits pher.subscription.budget_exhausted.
-    fn reserve_judge_budget(&mut self, sub_id: &str, judge: &pher_core::Judge) -> bool {
+    fn reserve_judge_budget(
+        &mut self,
+        sub_id: &str,
+        scope: &str,
+        judge: &pher_core::Judge,
+    ) -> bool {
         let now = now_unix();
         let period = crate::judge::period_secs(&judge.budget_period);
         let (allowed, notify) = {
             let b = self
                 .judge_budgets
-                .entry(sub_id.to_string())
+                .entry(scope.to_string())
                 .or_insert(JudgeBudget {
                     period_start: now,
                     used: 0,
@@ -1701,13 +1800,6 @@ impl State {
         );
     }
 
-    fn listener_catchup_owns(&self, sub_id: &str, seq: u64) -> bool {
-        self.listeners
-            .get(sub_id)
-            .and_then(|h| h.catchup_through)
-            .is_some_and(|through| seq <= through)
-    }
-
     fn expect_followup_ids(&self, event: &Envelope) -> Vec<String> {
         self.matcher
             .ids()
@@ -1879,6 +1971,15 @@ impl State {
         {
             return ListenCatchupHold::Skip;
         }
+        let held_cap = if self
+            .matcher
+            .get(sub_id)
+            .is_some_and(|sub| sub.meaning.is_some() || sub.judge.is_some())
+        {
+            HELD_TIER_CANDIDATES
+        } else {
+            LIVE_QUEUE
+        };
         {
             let Some(handle) = self.listeners.get_mut(sub_id) else {
                 return ListenCatchupHold::Proceed;
@@ -1892,7 +1993,7 @@ impl State {
             if held.iter().any(|(held_seq, _)| *held_seq == seq) {
                 return ListenCatchupHold::Held;
             }
-            if held.len() < LIVE_QUEUE {
+            if held.len() < held_cap {
                 held.push_back((seq, event.clone()));
                 return ListenCatchupHold::Held;
             }
@@ -1901,21 +2002,127 @@ impl State {
         ListenCatchupHold::Held
     }
 
-    fn release_listen_catchup(&mut self, sub_id: &str) -> Result<(), String> {
-        let Some(held) = self
-            .listeners
-            .get_mut(sub_id)
-            .and_then(|h| h.held_live.take())
-        else {
-            return Ok(());
+    fn catchup_tiers(
+        &mut self,
+        sub_id: &str,
+        seq: u64,
+        event: &Envelope,
+        evaluated: &mut usize,
+    ) -> Result<TierStep, String> {
+        let Some(sub) = self.matcher.get(sub_id).cloned() else {
+            return Ok(TierStep::Done(0));
         };
-        for (seq, event) in held {
-            if self.matcher.get(sub_id).is_none() {
-                break;
-            }
-            self.apply_to_listener(sub_id, seq, &event)?;
+        if !matches!(check(&sub, event, None), Check::Pending) {
+            return Ok(TierStep::Done(0));
         }
+        if *evaluated >= CATCHUP_TIER_LIMIT {
+            return Ok(TierStep::Stop("backlogLimit"));
+        }
+        *evaluated += 1;
+        let at_unix = humantime::parse_rfc3339_weak(&event.ts)
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or_else(now_unix, |d| d.as_secs());
+        let event_vec = match &sub.meaning {
+            Some(meaning) if !self.semantic.has_history(meaning, at_unix) => {
+                return Ok(TierStep::Stop("noveltyHistoryEvicted"));
+            }
+            Some(_) => match self.event_vector(event) {
+                Ok(v) => Some(v),
+                Err(_) => return Ok(TierStep::Stop("meaningUnavailable")),
+            },
+            None => None,
+        };
+        self.evaluate_tiers(sub_id, &sub, event, seq, event_vec.as_deref(), at_unix)
+    }
+
+    fn live_tiers(&mut self, sub_id: &str, seq: u64, event: &Envelope) -> Result<u64, String> {
+        let Some(sub) = self.matcher.get(sub_id).cloned() else {
+            return Ok(0);
+        };
+        if !matches!(check(&sub, event, None), Check::Pending) {
+            return Ok(0);
+        }
+        let event_vec = match &sub.meaning {
+            Some(_) => match self.event_vector(event) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("pherd: semantic tier unavailable for {}: {e}", event.id);
+                    None
+                }
+            },
+            None => None,
+        };
+        let step =
+            self.evaluate_tiers(sub_id, &sub, event, seq, event_vec.as_deref(), now_unix())?;
+        Ok(self.dispatch_live(sub_id, step))
+    }
+
+    fn event_vector(&mut self, event: &Envelope) -> Result<Vec<f32>, String> {
+        match self.semantic.recorded_vector(&event.id) {
+            Some(v) => Ok(v),
+            None => self.semantic.embed_event(event),
+        }
+    }
+
+    fn hold_live_tiers(&mut self, sub_id: &str, seq: u64, event: &Envelope) -> bool {
+        {
+            let Some(handle) = self.listeners.get_mut(sub_id) else {
+                return false;
+            };
+            if handle.catchup_through.is_some_and(|through| seq <= through) {
+                return true;
+            }
+            let Some(held) = handle.held_live.as_mut() else {
+                return false;
+            };
+            if held.iter().any(|(held_seq, _)| *held_seq == seq) {
+                return true;
+            }
+            if held.len() < HELD_TIER_CANDIDATES {
+                held.push_back((seq, event.clone()));
+                return true;
+            }
+        }
+        self.remove_sub(sub_id, "listener lagged");
+        true
+    }
+
+    #[cfg(test)]
+    fn release_listen_catchup(&mut self, sub_id: &str) -> Result<(), String> {
+        while !self.release_listen_catchup_batch(sub_id, usize::MAX)? {}
         Ok(())
+    }
+
+    fn release_listen_catchup_batch(&mut self, sub_id: &str, max: usize) -> Result<bool, String> {
+        let batch: Vec<(u64, Envelope)> = {
+            let Some(handle) = self.listeners.get_mut(sub_id) else {
+                return Ok(true);
+            };
+            let Some(held) = handle.held_live.as_mut() else {
+                return Ok(true);
+            };
+            if held.is_empty() {
+                handle.held_live = None;
+                return Ok(true);
+            }
+            let n = held.len().min(max);
+            held.drain(..n).collect()
+        };
+        for (seq, event) in batch {
+            if self.matcher.get(sub_id).is_none() {
+                return Ok(true);
+            }
+            let fresh = self
+                .applied_seqs
+                .get(sub_id)
+                .is_none_or(|&applied| applied < seq);
+            self.apply_to_listener(sub_id, seq, &event)?;
+            if fresh {
+                self.live_tiers(sub_id, seq, &event)?;
+            }
+        }
+        Ok(false)
     }
 
     fn remove_sub(&mut self, id: &str, reason: &str) -> bool {
@@ -1929,7 +2136,13 @@ impl State {
             // closes its connection.
             self.listeners.remove(id);
             self.semantic.on_remove(id);
-            self.judge_budgets.remove(id);
+            if self.judge_scopes.remove(id).is_none() {
+                self.judge_budgets.remove(id);
+            }
+            let stale_before = now_unix().saturating_sub(crate::judge::period_secs("week"));
+            self.judge_budgets.retain(|key, budget| {
+                !key.starts_with(LISTENER_JUDGE_SCOPE) || budget.period_start >= stale_before
+            });
             let _ = self.persist_subs();
             let _ = self.persist_timers();
             let _ = self.persist_pending();
@@ -2206,44 +2419,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         std::thread::spawn(move || {
             for job in jrx {
                 let result = crate::judge::ask(&job.config, &job.question, &job.summary);
-                let mut s = state.lock().unwrap();
-                match result {
-                    Ok(verdict) => {
-                        s.verdict_cache
-                            .insert(job.cache_key.clone(), verdict.clone());
-                        let record = json!({
-                            "ts": now_unix(),
-                            "key": job.cache_key,
-                            "subscription": job.sub_id,
-                            "event": job.event.id,
-                            "model": job.config.model,
-                            "verdict": verdict.verdict,
-                            "rationale": verdict.rationale,
-                        });
-                        let _ = s.db.append_verdict(&job.cache_key, now_unix(), &record);
-                        if verdict.verdict {
-                            if let Some(sub) = s.matcher.get(&job.sub_id).cloned() {
-                                s.current_seq = job.seq;
-                                s.deliver_judged(
-                                    &job.sub_id,
-                                    &sub,
-                                    &job.event,
-                                    job.meaning_record,
-                                    &verdict,
-                                    false,
-                                    &job.config.model,
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("pherd: judge call failed for {}: {e}", job.sub_id);
-                        s.emit_trail_event(
-                            "pher.judge.error",
-                            json!({ "subscription": job.sub_id, "event": job.event.id, "error": e }),
-                        );
-                    }
-                }
+                state.lock().unwrap().settle_judgment(job, result);
             }
         });
     }
@@ -3081,6 +3257,14 @@ pub(crate) fn attach_listener(
     );
 
     let sub = s.matcher.get(&id).cloned();
+    if sub.as_ref().is_some_and(|sub| sub.judge.is_some()) {
+        let owner = cursor.map_or_else(|| format!("client={client}"), |c| format!("cursor={c}"));
+        let scope = format!(
+            "{LISTENER_JUDGE_SCOPE}{}",
+            crate::judge::fingerprint(&format!("{owner}\n{string}"))
+        );
+        s.judge_scopes.insert(id.clone(), scope);
+    }
     let through = match s.log.head_seq() {
         Ok(h) => h,
         Err(e) => {
@@ -3135,17 +3319,6 @@ pub(crate) fn attach_listener(
     }
     if let Some(name) = cursor {
         ack["cursor"] = json!(name);
-    }
-    let semantic_sub = sub
-        .as_ref()
-        .is_some_and(|sub| sub.meaning.is_some() || sub.judge.is_some());
-    if semantic_sub && (resume_after.is_some() || catchup_from.is_some()) {
-        if let Some(w) = ack.get_mut("warnings").and_then(|w| w.as_array_mut()) {
-            w.push(json!(
-                "catch-up delivers nothing for meaning/judge subscriptions; only \
-                 live events are evaluated"
-            ));
-        }
     }
     if catchup_from.is_some() {
         if let Some(handle) = s.listeners.get_mut(&id) {
@@ -3206,6 +3379,13 @@ pub(crate) fn replay_listen_catchup(
     ts_cutoff: Option<&str>,
     mut emit: impl FnMut(&str) -> bool,
 ) -> Result<u64, CatchupError> {
+    let mut tiers = state
+        .lock()
+        .unwrap()
+        .matcher
+        .get(sub_id)
+        .is_some_and(|sub| sub.meaning.is_some() || sub.judge.is_some())
+        .then(TierCatchup::default);
     let mut replayed = 0u64;
     let mut from = from;
     loop {
@@ -3230,29 +3410,65 @@ pub(crate) fn replay_listen_catchup(
             if pos.seq > through {
                 break;
             }
-            if let Some(min) = ts_cutoff {
-                if event.ts.as_str() < min {
-                    from = match pos.seq.checked_add(1) {
-                        Some(n) => n,
-                        None => {
-                            s.catchup_lines = None;
-                            return Err(CatchupError::Failed("sequence overflow".into()));
-                        }
-                    };
-                    continue;
-                }
-            }
-            if let Err(e) = s.apply_to_listener(sub_id, pos.seq, &event) {
-                s.catchup_lines = None;
-                return Err(CatchupError::Failed(e));
-            }
-            from = match pos.seq.checked_add(1) {
+            let next = match pos.seq.checked_add(1) {
                 Some(n) => n,
                 None => {
                     s.catchup_lines = None;
                     return Err(CatchupError::Failed("sequence overflow".into()));
                 }
             };
+            if let Some(min) = ts_cutoff {
+                if event.ts.as_str() < min {
+                    from = next;
+                    continue;
+                }
+            }
+            let fresh = s
+                .applied_seqs
+                .get(sub_id)
+                .is_none_or(|&applied| applied < pos.seq);
+            if let Err(e) = s.apply_to_listener(sub_id, pos.seq, &event) {
+                s.catchup_lines = None;
+                return Err(CatchupError::Failed(e));
+            }
+            if let Some(t) = tiers.as_mut().filter(|t| fresh && t.gap.is_none()) {
+                let evaluated_before = t.evaluated;
+                match s.catchup_tiers(sub_id, pos.seq, &event, &mut t.evaluated) {
+                    Ok(TierStep::Done(_)) => {}
+                    Ok(TierStep::Stop(reason)) => t.gap = Some((pos.seq, reason)),
+                    Ok(TierStep::Ask(job)) => {
+                        let ready = s.catchup_lines.take().unwrap_or_default();
+                        drop(s);
+                        for line in &ready {
+                            replayed += 1;
+                            if !emit(line) {
+                                return Ok(replayed);
+                            }
+                        }
+                        if !emit("") {
+                            return Ok(replayed);
+                        }
+                        let result = crate::judge::ask(&job.config, &job.question, &job.summary);
+                        s = state.lock().unwrap();
+                        s.catchup_lines = Some(Vec::new());
+                        if result.is_err() {
+                            t.gap = Some((pos.seq, "judgeFailed"));
+                        }
+                        s.settle_judgment(*job, result);
+                    }
+                    Err(e) => {
+                        s.catchup_lines = None;
+                        return Err(CatchupError::Failed(e));
+                    }
+                }
+                if t.evaluated != evaluated_before {
+                    let held = s.catchup_lines.take();
+                    drop(s);
+                    s = state.lock().unwrap();
+                    s.catchup_lines = held;
+                }
+            }
+            from = next;
         }
         let lines = s.catchup_lines.take().unwrap_or_default();
         drop(s);
@@ -3266,11 +3482,44 @@ pub(crate) fn replay_listen_catchup(
             break;
         }
     }
-    let mut s = state.lock().unwrap();
-    if let Err(e) = s.release_listen_catchup(sub_id) {
-        return Err(CatchupError::Failed(e));
+    let semantic = tiers.is_some();
+    if let Some((gap_from, reason)) = tiers.and_then(|t| t.gap) {
+        let gap = json!({
+            "gap": {
+                "subscription": sub_id,
+                "from": gap_from,
+                "through": through,
+                "reason": reason,
+            }
+        });
+        if !emit(&gap.to_string()) {
+            return Ok(replayed);
+        }
     }
-    Ok(replayed)
+    loop {
+        let mut s = state.lock().unwrap();
+        if semantic {
+            s.catchup_lines = Some(Vec::new());
+        }
+        let released = s.release_listen_catchup_batch(sub_id, FOLLOWER_BATCH);
+        let lines = s.catchup_lines.take().unwrap_or_default();
+        drop(s);
+        let done = released.map_err(CatchupError::Failed)?;
+        for line in &lines {
+            if !emit(line) {
+                return Ok(replayed);
+            }
+        }
+        if done {
+            return Ok(replayed);
+        }
+    }
+}
+
+#[derive(Default)]
+struct TierCatchup {
+    evaluated: usize,
+    gap: Option<(u64, &'static str)>,
 }
 
 #[derive(Debug)]
@@ -3334,6 +3583,26 @@ fn handle_listen(
     respond(stream, &attached.ack)?;
     let mut writer = stream.try_clone()?;
     let mut last_sent = 0u64;
+    // EOF watchdog: deliveries may be rare, so a broken pipe alone would
+    // detect disconnects too late. A blocked read notices immediately.
+    {
+        let state = Arc::clone(state);
+        let sub_id = sub_id.clone();
+        let reader = stream.try_clone()?;
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {} // the connection is delivery-only; ignore input
+                }
+            }
+            detach_listener(&state, &sub_id, "listener disconnected");
+        });
+    }
+
     if let Some(from) = attached.catchup_from {
         let mut write_ok = true;
         match replay_listen_catchup(
@@ -3360,37 +3629,19 @@ fn handle_listen(
             Err(e) => {
                 let _ = writeln!(writer, "{}", err(&e));
                 detach_listener(state, &sub_id, &e.to_string());
+                let _ = stream.shutdown(std::net::Shutdown::Both);
                 return Ok(());
             }
         }
         if !write_ok {
             detach_listener(state, &sub_id, "listener disconnected");
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return Ok(());
         }
         let _ = writer.flush();
     }
 
     let teardown = |reason: &str| detach_listener(state, &sub_id, reason);
-
-    // EOF watchdog: deliveries may be rare, so a broken pipe alone would
-    // detect disconnects too late. A blocked read notices immediately.
-    {
-        let state = Arc::clone(state);
-        let sub_id = sub_id.clone();
-        let reader = stream.try_clone()?;
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(reader);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {} // the connection is delivery-only; ignore input
-                }
-            }
-            detach_listener(&state, &sub_id, "listener disconnected");
-        });
-    }
 
     for line in attached.rx {
         let seq = serde_json::from_str::<Value>(&line)

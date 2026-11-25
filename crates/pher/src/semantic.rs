@@ -29,6 +29,7 @@ pub struct Semantic {
     /// Event-embedding window for novelty: (unix ts, event id, vector),
     /// oldest first.
     window: VecDeque<(u64, String, Vec<f32>)>,
+    history_from: u64,
 }
 
 impl Semantic {
@@ -37,13 +38,14 @@ impl Semantic {
     /// job too — this type only owns the in-memory scan.
     pub fn new(paths: Paths, preloaded: Vec<(u64, String, Vec<f32>)>) -> Semantic {
         let disabled = std::env::var("PHER_EMBED").is_ok_and(|v| v == "off" || v == "0");
-        let mut window = VecDeque::new();
+        let mut window: VecDeque<(u64, String, Vec<f32>)> = VecDeque::new();
         for entry in preloaded {
             window.push_back(entry);
             if window.len() > MAX_WINDOW_VECTORS {
                 window.pop_front();
             }
         }
+        let history_from = window.front().map_or(0, |(ts, _, _)| *ts);
         Semantic {
             paths,
             disabled,
@@ -51,6 +53,7 @@ impl Semantic {
             embedder: None,
             desc_vecs: HashMap::new(),
             window,
+            history_from,
         }
     }
 
@@ -138,7 +141,7 @@ impl Semantic {
         meaning: &Meaning,
         event_id: &str,
         event_vec: &[f32],
-        now_unix: u64,
+        at_unix: u64,
     ) -> (bool, Value) {
         match &meaning.kind {
             MeaningKind::Descriptors(descriptors) => {
@@ -169,10 +172,13 @@ impl Semantic {
                 )
             }
             MeaningKind::Novel { over } => {
-                let cutoff = now_unix.saturating_sub(over.secs());
+                let cutoff = at_unix.saturating_sub(over.secs());
                 let mut nearest = 0.0f32;
                 let mut considered = 0usize;
                 for (ts, id, vec) in self.window.iter().rev() {
+                    if *ts > at_unix {
+                        continue;
+                    }
                     if *ts < cutoff {
                         break; // window is ordered oldest-first
                     }
@@ -208,7 +214,28 @@ impl Semantic {
     pub fn record_event(&mut self, now_unix: u64, event_id: &str, vec: Vec<f32>) {
         self.window.push_back((now_unix, event_id.to_string(), vec));
         while self.window.len() > MAX_WINDOW_VECTORS {
-            self.window.pop_front();
+            self.evict_front();
+        }
+    }
+
+    fn evict_front(&mut self) {
+        if let Some((ts, _, _)) = self.window.pop_front() {
+            self.history_from = self.history_from.max(ts.saturating_add(1));
+        }
+    }
+
+    pub fn recorded_vector(&self, event_id: &str) -> Option<Vec<f32>> {
+        self.window
+            .iter()
+            .rev()
+            .find(|(_, id, _)| id == event_id)
+            .map(|(_, _, vec)| vec.clone())
+    }
+
+    pub fn has_history(&self, meaning: &Meaning, at_unix: u64) -> bool {
+        match &meaning.kind {
+            MeaningKind::Novel { over } => at_unix.saturating_sub(over.secs()) >= self.history_from,
+            MeaningKind::Descriptors(_) => true,
         }
     }
 
@@ -220,7 +247,7 @@ impl Semantic {
             .front()
             .is_some_and(|(ts, _, _)| *ts < cutoff_unix)
         {
-            self.window.pop_front();
+            self.evict_front();
         }
     }
 

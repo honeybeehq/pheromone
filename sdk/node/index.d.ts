@@ -52,6 +52,19 @@ export interface SubInfo {
   deliveries: number;
 }
 
+export interface CatchupGap {
+  subscription: string;
+  from: number;
+  through: number;
+  reason:
+    | "budgetExhausted"
+    | "backlogLimit"
+    | "judgeFailed"
+    | "judgeUnavailable"
+    | "meaningUnavailable"
+    | "noveltyHistoryEvicted";
+}
+
 export declare class Listener extends EventEmitter {
   /** Subscription id (PH.xxxx); changes after a reconnect. */
   readonly id: string;
@@ -66,9 +79,10 @@ export declare class Listener extends EventEmitter {
   on(event: "delivery", cb: (delivery: Delivery) => void): this;
   on(event: "close", cb: () => void): this;
   on(event: "reconnect", cb: (id: string) => void): this;
+  on(event: "gap", cb: (gap: CatchupGap) => void): this;
   on(
     event: "error",
-    cb: (err: Error & { delivery?: Delivery }) => void,
+    cb: (err: Error & { delivery?: Delivery; gap?: CatchupGap }) => void,
   ): this;
 }
 
@@ -113,6 +127,7 @@ export declare class PherClient {
       autoCommit?: boolean;
       /** Re-attach with backoff on connection loss (default false). */
       reconnect?: boolean;
+      onGap?: (gap: CatchupGap) => void | Promise<unknown>;
     },
   ): Promise<Listener>;
 

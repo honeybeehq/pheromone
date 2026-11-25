@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PherClient } from "./index.js";
@@ -16,6 +17,24 @@ if (!fs.existsSync(bin)) {
   process.exit(1);
 }
 
+const judgeCalls = [];
+const judgeServer = http.createServer((req, res) => {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    const summary = JSON.parse(body).messages[0].content;
+    judgeCalls.push(summary);
+    const verdict = summary.includes("bad");
+    res.setHeader("content-type", "application/json");
+    res.end(
+      JSON.stringify({
+        content: [{ type: "text", text: JSON.stringify({ verdict, rationale: "fake judge" }) }],
+      }),
+    );
+  });
+});
+await new Promise((r) => judgeServer.listen(0, "127.0.0.1", r));
+
 const HTTP = "127.0.0.1:14877";
 const TOKEN = "sdk-test-token";
 const daemon = spawn(bin, ["daemon", "run"], {
@@ -25,6 +44,9 @@ const daemon = spawn(bin, ["daemon", "run"], {
     PHER_EMBED: "off",
     PHER_HTTP: HTTP,
     PHER_HTTP_TOKEN: TOKEN,
+    ANTHROPIC_API_KEY: "fake-judge-key",
+    PHER_JUDGE_MODEL: "claude-haiku-4-5",
+    PHER_JUDGE_BASE_URL: `http://127.0.0.1:${judgeServer.address().port}`,
   },
   stdio: ["ignore", "ignore", "inherit"],
 });
@@ -241,6 +263,95 @@ try {
   assert.equal(after.seq, retried[1].seq, "cursor advances once handlers succeed");
   console.log("ok  rejected handler is redelivered on resume");
 
+  await pher.cursorCommit("t-judge", (await pher.cursors()).head);
+  const judgeSub = 'on jdg.* judge "is it bad?" budget 3/day';
+  const away = [];
+  for (const [subject, kind] of [
+    ["jdg.a", "bad-1"],
+    ["jdg.b", "fine"],
+    ["jdg.c", "bad-2"],
+    ["jdg.d", "bad-3"],
+  ]) {
+    away.push((await pher.emit(subject, { kind })).seq);
+  }
+  const judged = [];
+  const gaps = [];
+  const j1 = await pher.on(judgeSub, (d) => judged.push(d), {
+    cursor: "t-judge",
+    onGap: (gap) => gaps.push(gap),
+  });
+  await until(() => gaps.length >= 1, "catch-up gap after judge budget runs out", 10000);
+  await sleep(200);
+  assert.deepEqual(
+    judged.map((d) => d.event.payload.kind),
+    ["bad-1", "bad-2"],
+    "catch-up judges the missed events and delivers the yes verdicts",
+  );
+  assert.deepEqual(judged[0].match.tiers.slice(-1), ["judge"]);
+  assert.equal(judged[0].match.judge.rationale, "fake judge");
+  assert.deepEqual(
+    { from: gaps[0].from, reason: gaps[0].reason, subscription: gaps[0].subscription },
+    { from: away[3], reason: "budgetExhausted", subscription: j1.id },
+    "budget exhaustion is an explicit gap from the first unjudged seq",
+  );
+  assert.ok(gaps[0].through >= away[3]);
+  assert.equal(judgeCalls.length, 3, "judge calls stop at the budget");
+  await sleep(500);
+  j1.close();
+  await until(
+    async () => !(await pher.ls()).some((s) => s.id === j1.id),
+    "judge listener teardown",
+  );
+  const judgeCursor = (await pher.cursors()).cursors.find((c) => c.name === "t-judge");
+  assert.equal(judgeCursor.seq, gaps[0].through, "a handled gap commits the cursor");
+  console.log("ok  judge listener catch-up judges the gap, budget exhaustion is explicit");
+
+  await pher.cursorCommit("t-judge-unhandled", (await pher.cursors()).head);
+  const unhandledFrom = [];
+  for (const kind of ["bad-4", "bad-5", "bad-6", "bad-7"]) {
+    unhandledFrom.push((await pher.emit("jdg.e", { kind: `${kind}-${Date.now()}` })).seq);
+  }
+  const gapErrors = [];
+  const unhandled = [];
+  const j2 = await pher.on(judgeSub, (d) => unhandled.push(d), {
+    cursor: "t-judge-unhandled",
+  });
+  j2.on("error", (e) => gapErrors.push(e));
+  await until(() => gapErrors.length >= 1, "unhandled gap surfaces as an error", 10000);
+  assert.equal(gapErrors[0].gap.reason, "budgetExhausted");
+  assert.equal(gapErrors[0].gap.from, unhandledFrom[3]);
+  assert.equal(unhandled.length, 3);
+  await sleep(500);
+  j2.close();
+  await until(
+    async () => !(await pher.ls()).some((s) => s.id === j2.id),
+    "unhandled judge listener teardown",
+  );
+  const stuck = (await pher.cursors()).cursors.find((c) => c.name === "t-judge-unhandled");
+  assert.ok(stuck.seq < gapErrors[0].gap.from, "an unhandled gap holds the cursor before it");
+  console.log("ok  unhandled catch-up gap is an error and holds the cursor");
+
+  const callsBeforeRetry = judgeCalls.length;
+  const retriedGaps = [];
+  const rejudged = [];
+  const j3 = await pher.on(judgeSub, (d) => rejudged.push(d), {
+    cursor: "t-judge-unhandled",
+    onGap: (gap) => retriedGaps.push(gap),
+  });
+  await until(() => retriedGaps.length >= 1, "retried gap", 10000);
+  await sleep(200);
+  assert.equal(judgeCalls.length, callsBeforeRetry, "reattach reuses recorded verdicts");
+  assert.deepEqual(
+    rejudged.map((d) => [d.seq, d.match.judge.cached]),
+    unhandledFrom
+      .slice(0, 3)
+      .filter((seq) => seq > stuck.seq)
+      .map((seq) => [seq, true]),
+  );
+  assert.equal(retriedGaps[0].from, unhandledFrom[3], "budget is shared across reattaches");
+  j3.close();
+  console.log("ok  reattach reuses recorded verdicts and the same judge budget");
+
   // Reconnect: a server-side hangup (rm) triggers re-attach with backoff.
   const got3 = [];
   const r1 = await pher.on("on rec.*", (d) => got3.push(d), { reconnect: true });
@@ -269,6 +380,7 @@ try {
   console.error("FAIL:", e);
 } finally {
   daemon.kill();
+  judgeServer.close();
   fs.rmSync(home, { recursive: true, force: true });
 }
 process.exit(failed ? 1 : 0);

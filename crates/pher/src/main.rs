@@ -599,6 +599,7 @@ fn run() -> anyhow::Result<()> {
             // A delivery counts as processed once printed; commit it then.
             let commit_cursor = cursor.clone();
             let commit_target = &target;
+            let mut unhandled_gap = false;
             let print = move |line: Value| -> anyhow::Result<()> {
                 if let Some(canonical) = line.get("canonical").and_then(|c| c.as_str()) {
                     eprintln!(
@@ -618,8 +619,20 @@ fn run() -> anyhow::Result<()> {
                     for w in line["warnings"].as_array().into_iter().flatten() {
                         eprintln!("warning: {}", w.as_str().unwrap_or_default());
                     }
+                } else if let Some(gap) = line.get("gap") {
+                    println!("{line}");
+                    eprintln!(
+                        "gap: seqs {}-{} were not evaluated for meaning/judge ({}); the cursor stays before them",
+                        gap["from"],
+                        gap["through"],
+                        gap["reason"].as_str().unwrap_or("unknown")
+                    );
+                    unhandled_gap = true;
                 } else {
                     println!("{line}");
+                    if unhandled_gap {
+                        return Ok(());
+                    }
                     if let (Some(name), Some(seq)) = (
                         commit_cursor.as_deref(),
                         line.get("seq").and_then(|s| s.as_u64()),

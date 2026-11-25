@@ -178,6 +178,16 @@ else then buz operator --tier queue
   subscription has no recorded verdicts, so `since` is rejected on subscriptions with
   `meaning` or `judge`. `since ... reevaluate` (opt-in fresh evaluation under the judge
   budget) is designed but not implemented.
+- Listener resume (`pher listen --cursor`/`--after`, SDK `cursor`/`after`/`reconnect`) is
+  different: catch-up runs the missed events through `meaning` and `judge`, recording verdicts
+  and charging the judge budget like live matching. Verdicts and budget are keyed by the cursor
+  (or client name) plus the subscription text, so a reattach reuses recorded verdicts instead of
+  re-rolling and does not refill the budget. `meaning novel` is scored as of the event's own
+  timestamp. Catch-up evaluates at most 1000 tier-3/4 candidates per attach. If it stops
+  early (budget exhausted, that limit, judge failure, provider down, `novel` history evicted), the stream carries an
+  explicit `{"gap": {subscription, from, through, reason}}` line; the SDK surfaces it as a
+  `gap` (handled via `onGap`) or an error; neither the SDK nor `pher listen --cursor` commits
+  past an unhandled gap.
 - `limit <n>` — one-shot and n-shot subscriptions; `limit 1` + timeout is the primitive
   under `pher.wait()`.
 

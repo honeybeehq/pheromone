@@ -89,9 +89,20 @@ const sub = await hub.on(
   handler is called; it does not wait for an async handler.
 - `reconnect` re-attaches with backoff on connection loss and resumes from
   the cursor (or the last seen `seq`); the listener emits `'reconnect'`.
-- Catch-up replay is bounded by the hub's retention (default 7d) and
-  evaluates tiers 1–2 only — the ack carries a warning for meaning/judge
-  subscriptions.
+- Catch-up replay is bounded by the hub's retention (default 7d). For
+  `meaning`/`judge` subscriptions, catch-up runs the missed events through
+  tiers 3–4. Judge verdicts and the judge budget belong to the cursor (or,
+  without one, the client name) plus the subscription text, so a reattach
+  reuses recorded verdicts instead of re-asking, and reconnecting does not
+  refill the budget. It evaluates at most 1000 tier-3/4 candidates per attach. When
+  it has to stop early (judge budget exhausted, that limit, judge call
+  failed, embedder or judge provider unavailable, or `meaning novel`
+  history for the event already evicted), the hub sends a gap
+  `{ subscription, from, through, reason }` and the listener emits `'gap'`.
+  Pass `onGap` to handle it; the cursor moves past the range only after
+  `onGap` finishes. Without `onGap`, the gap is an `'error'` (with a `gap`
+  property) and the cursor stops before the range, so the next attach
+  retries it.
 
 Every delivery carries `seq` (the hub log position) if you'd rather track
 resume state yourself (`on(sub, h, { after: lastSeq })`).
