@@ -1,0 +1,8 @@
+{
+  "name": "@pheromone/wasm-build",
+  "private": true,
+  "description": "Build tools for crates/pher-wasm; the shipped package is generated into pkg/",
+  "devDependencies": {
+    "binaryen": "132.0.0"
+  }
+}

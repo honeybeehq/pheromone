@@ -55,12 +55,14 @@ function parseAndEvaluate(batch) {
 }
 
 const glueLoaded = settledRss();
-pher.initSync({ module: bytes });
+const wasm = pher.initSync({ module: bytes });
 const instantiated = settledRss();
 const warm = parseAndEvaluate(warmUp);
 const warmedUp = settledRss();
+const linearAfterWarmUp = wasm.memory.buffer.byteLength;
 const { parsed, matched } = parseAndEvaluate(rules);
 const done = settledRss();
+const linearGrowth = wasm.memory.buffer.byteLength - linearAfterWarmUp;
 
 assert.equal(new Set(parsed).size, RULE_COUNT, "parsed rules must be distinct");
 assert.ok(matched > 0 && matched < RULE_COUNT, `expected a mix of matches, got ${matched}`);
@@ -78,6 +80,9 @@ console.log(
 console.log(
   `marginal rss growth: ${marginal} bytes (${mb(marginal)}) for ${RULE_COUNT} rules after a ${WARM_UP_RULES}-rule warm-up, ` +
     `budget ${mb(MARGINAL_RSS_BUDGET_BYTES)}`,
+);
+console.log(
+  `wasm linear memory: ${mb(wasm.memory.buffer.byteLength)}, grew ${linearGrowth} bytes over the ${RULE_COUNT} rules`,
 );
 console.log(
   `rss by stage: instantiate +${mb(instantiated - glueLoaded)}, warm-up +${mb(warmedUp - instantiated)}, ` +

@@ -12,13 +12,12 @@ if [ "$installed" != "$bindgen_version" ]; then
   exit 1
 fi
 
-binaryen_version=132.0.0
-
 cargo build --locked --profile wasm-release -p pher-wasm --target wasm32-unknown-unknown
 rm -rf pkg
 wasm-bindgen --target web --omit-default-module-path --out-dir pkg \
   "$target_dir/wasm32-unknown-unknown/wasm-release/pher_wasm.wasm"
-npx --yes --package "binaryen@$binaryen_version" -- wasm-opt -Oz \
+npm ci --no-audit --no-fund --loglevel=error
+npx --no-install wasm-opt -Oz \
   --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
   --enable-mutable-globals --enable-reference-types --enable-multivalue \
   pkg/pher_wasm_bg.wasm -o pkg/pher_wasm_bg.wasm

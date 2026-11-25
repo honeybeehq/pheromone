@@ -155,6 +155,8 @@ What works today:
   target and `wasm-bindgen-cli` at the crate's pinned version), test with `node test.mjs`.
   The glue never reads files or fetches: hand it the `.wasm` bytes with
   `initSync({ module: bytes })`, so a bundler such as esbuild can inline both.
+  CI holds the module to 1.5 MB and its Node memory growth to the budgets in
+  `crates/pher-wasm/BUDGET.md` (`node --expose-gc budget.mjs`).
 - **Browser playground** (`playground/index.html`) — the language in the browser
   over the WASM matcher: live validate-as-you-type, canonical form, and match/
   reject/survivor verdicts against an event, with preset examples. Serve the
