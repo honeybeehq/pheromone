@@ -206,6 +206,7 @@ export class PherClient {
     const createCommitQueue = () => {
       const pending = [];
       let blocked = false;
+      let barred = false;
       const advance = () => {
         let committable = 0;
         while (pending.length && pending[0].state === "done") {
@@ -215,7 +216,7 @@ export class PherClient {
       };
       return {
         track(seq) {
-          if (blocked) return null;
+          if (blocked || barred) return null;
           const entry = { seq, state: "running" };
           let at = pending.length;
           while (at > 0 && pending[at - 1].seq > seq) at--;
@@ -231,6 +232,10 @@ export class PherClient {
           }
           entry.state = "done";
           advance();
+        },
+        bar(entry) {
+          barred = true;
+          if (entry) entry.state = "barrier";
         },
       };
     };
@@ -259,13 +264,16 @@ export class PherClient {
       const entry = cursor && autoCommit ? commitQueue.track(gap.through) : null;
       setImmediate(() => listener.emit("gap", gap));
       if (!onGap) {
-        commitQueue.settle(entry, false);
+        commitQueue.bar(entry);
         unhandledGapFrom = Math.min(unhandledGapFrom, gap.from);
         const err = new Error(
           `pherd could not evaluate seqs ${gap.from}-${gap.through} for meaning/judge (${gap.reason}); pass onGap to handle it`,
         );
         err.gap = gap;
-        setImmediate(() => listener.emit("error", err));
+        setImmediate(() => {
+          if (listener.listenerCount("error") > 0) listener.emit("error", err);
+          else process.emitWarning(err.message, "PherGapWarning");
+        });
         return;
       }
       let handled;
@@ -280,7 +288,7 @@ export class PherClient {
           commitQueue.settle(entry, true);
         },
         (e) => {
-          commitQueue.settle(entry, false);
+          commitQueue.bar(entry);
           unhandledGapFrom = Math.min(unhandledGapFrom, gap.from);
           const err = e instanceof Error ? e : new Error(String(e));
           err.gap = gap;
@@ -289,7 +297,14 @@ export class PherClient {
       );
     };
 
-    const attach = async (resumeAfter) => {
+    const checkpointHandlerFor = (commitQueue) => (checkpoint) => {
+      listener.lastSeq = Math.max(listener.lastSeq, checkpoint.seq);
+      if (cursor && autoCommit) {
+        commitQueue.settle(commitQueue.track(checkpoint.seq), true);
+      }
+    };
+
+    const attach = async (resumeAfter, resumeFromStart = false) => {
       const req = {
         op: "listen",
         string: text,
@@ -299,11 +314,12 @@ export class PherClient {
       // The named cursor is authoritative when present; `after` covers
       // client-tracked resumes and first attach.
       if (cursor) req.cursor = cursor;
-      if (!cursor && resumeAfter) req.after = resumeAfter;
+      if (!cursor && (resumeAfter || resumeFromStart)) req.after = resumeAfter;
       const sock = await this._t.stream(req);
       const commitQueue = createCommitQueue();
       const onDelivery = deliveryHandlerFor(commitQueue);
       const onGapLine = gapHandlerFor(commitQueue);
+      const onCheckpoint = checkpointHandlerFor(commitQueue);
 
       // The delivery handler must be wired BEFORE awaiting the ack: with
       // catch-up replay, deliveries can arrive in the same chunk as the ack
@@ -321,6 +337,7 @@ export class PherClient {
           return;
         }
         if (line.gap) onGapLine(line.gap);
+        else if (line.checkpoint) onCheckpoint(line.checkpoint);
         else onDelivery(line);
       });
       sock.on("error", (e) => {
@@ -365,9 +382,10 @@ export class PherClient {
           return;
         }
         const resumeAfter = resumePoint();
+        const retryingGap = Number.isFinite(unhandledGapFrom);
         unhandledGapFrom = Infinity;
         try {
-          await attach(resumeAfter);
+          await attach(resumeAfter, retryingGap);
           listener.emit("reconnect", listener.id);
           return;
         } catch {

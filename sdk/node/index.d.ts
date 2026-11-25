@@ -62,7 +62,7 @@ export interface CatchupGap {
     | "judgeFailed"
     | "judgeUnavailable"
     | "meaningUnavailable"
-    | "noveltyHistoryEvicted";
+    | "noveltyHistoryIncomplete";
 }
 
 export declare class Listener extends EventEmitter {

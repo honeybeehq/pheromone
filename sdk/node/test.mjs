@@ -26,11 +26,11 @@ const judgeServer = http.createServer((req, res) => {
     judgeCalls.push(summary);
     const verdict = summary.includes("bad");
     res.setHeader("content-type", "application/json");
-    res.end(
+    setTimeout(() => res.end(
       JSON.stringify({
         content: [{ type: "text", text: JSON.stringify({ verdict, rationale: "fake judge" }) }],
       }),
-    );
+    ), summary.includes("slow") ? 800 : 0);
   });
 });
 await new Promise((r) => judgeServer.listen(0, "127.0.0.1", r));
@@ -328,7 +328,11 @@ try {
     "unhandled judge listener teardown",
   );
   const stuck = (await pher.cursors()).cursors.find((c) => c.name === "t-judge-unhandled");
-  assert.ok(stuck.seq < gapErrors[0].gap.from, "an unhandled gap holds the cursor before it");
+  assert.equal(
+    stuck.seq,
+    gapErrors[0].gap.from - 1,
+    "an unhandled gap commits up to, never past, the gap",
+  );
   console.log("ok  unhandled catch-up gap is an error and holds the cursor");
 
   const callsBeforeRetry = judgeCalls.length;
@@ -351,6 +355,46 @@ try {
   assert.equal(retriedGaps[0].from, unhandledFrom[3], "budget is shared across reattaches");
   j3.close();
   console.log("ok  reattach reuses recorded verdicts and the same judge budget");
+
+  const raceSub = 'on race.* judge "is it bad?" budget 50/day';
+  await pher.cursorCommit("t-race", (await pher.cursors()).head);
+  const warm = [];
+  const w1 = await pher.on(raceSub, (d) => warm.push(d), { cursor: "t-race" });
+  await pher.emit("race.x", { kind: "bad dup" });
+  await until(() => warm.length >= 1, "warm verdict cache");
+  await sleep(500);
+  w1.close();
+  await until(async () => !(await pher.ls()).some((s) => s.id === w1.id), "warm teardown");
+  const backlog = (await pher.emit("race.x", { kind: "bad slow backlog" })).seq;
+  const raced = [];
+  const r2 = await pher.on(raceSub, (d) => raced.push(d), { cursor: "t-race" });
+  const slowLive = (await pher.emit("race.x", { kind: "bad slow live" })).seq;
+  const dup = (await pher.emit("race.x", { kind: "bad dup" })).seq;
+  await until(() => raced.length >= 3, "catch-up race deliveries", 10000);
+  await sleep(300);
+  assert.deepEqual(
+    raced.map((d) => d.seq),
+    [backlog, slowLive, dup],
+    "a cached verdict never overtakes an earlier pending judge during catch-up",
+  );
+  r2.close();
+  console.log("ok  catch-up release keeps judge deliveries in seq order");
+
+  const liveRaced = [];
+  const r3 = await pher.on(raceSub, (d) => liveRaced.push(d), { cursor: "t-race-live" });
+  await pher.emit("race.y", { kind: "bad dup live" });
+  await until(() => liveRaced.length >= 1, "warm live verdict");
+  const slow2 = (await pher.emit("race.y", { kind: "bad slow live 2" })).seq;
+  const dup2 = (await pher.emit("race.y", { kind: "bad dup live" })).seq;
+  await until(() => liveRaced.length >= 3, "live race deliveries", 10000);
+  await sleep(300);
+  assert.deepEqual(
+    liveRaced.slice(1).map((d) => d.seq),
+    [slow2, dup2],
+    "a cached live verdict waits for the earlier pending judge",
+  );
+  r3.close();
+  console.log("ok  live judge deliveries stay in seq order");
 
   // Reconnect: a server-side hangup (rm) triggers re-attach with backoff.
   const got3 = [];

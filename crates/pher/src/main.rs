@@ -138,6 +138,10 @@ enum Cmd {
         /// commit each delivery as it is printed
         #[arg(long)]
         cursor: Option<String>,
+        /// Commit the cursor past catch-up gaps (seq ranges pherd could not
+        /// evaluate for meaning/judge) instead of stopping at the first one
+        #[arg(long)]
+        accept_gaps: bool,
     },
     /// Inspect or remove named consumer cursors
     Cursor {
@@ -587,6 +591,7 @@ fn run() -> anyhow::Result<()> {
             subscription,
             after,
             cursor,
+            accept_gaps,
         } => {
             // Sugar: a bare `on ... where ...` gets `then stream` appended.
             let text = if Subscription::parse(&subscription).is_ok() {
@@ -619,15 +624,46 @@ fn run() -> anyhow::Result<()> {
                     for w in line["warnings"].as_array().into_iter().flatten() {
                         eprintln!("warning: {}", w.as_str().unwrap_or_default());
                     }
+                } else if let Some(checkpoint) = line.get("checkpoint") {
+                    if let (Some(name), Some(seq), false) = (
+                        commit_cursor.as_deref(),
+                        checkpoint.get("seq").and_then(|s| s.as_u64()),
+                        unhandled_gap,
+                    ) {
+                        let _ = client::call_target(
+                            commit_target,
+                            &Request::CursorCommit {
+                                name: name.to_string(),
+                                seq,
+                            },
+                        );
+                    }
                 } else if let Some(gap) = line.get("gap") {
-                    println!("{line}");
-                    eprintln!(
-                        "gap: seqs {}-{} were not evaluated for meaning/judge ({}); the cursor stays before them",
-                        gap["from"],
-                        gap["through"],
-                        gap["reason"].as_str().unwrap_or("unknown")
-                    );
-                    unhandled_gap = true;
+                    let (from, through) = (gap["from"].as_u64(), gap["through"].as_u64());
+                    let reason = gap["reason"].as_str().unwrap_or("unknown");
+                    if accept_gaps {
+                        eprintln!(
+                            "gap: seqs {}-{} were not evaluated for meaning/judge ({reason}); accepted, committing past them",
+                            gap["from"], gap["through"]
+                        );
+                        if let (Some(name), Some(_), Some(seq), false) =
+                            (commit_cursor.as_deref(), from, through, unhandled_gap)
+                        {
+                            let _ = client::call_target(
+                                commit_target,
+                                &Request::CursorCommit {
+                                    name: name.to_string(),
+                                    seq,
+                                },
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "gap: seqs {}-{} were not evaluated for meaning/judge ({reason}); the cursor stays before them (pass --accept-gaps to commit past)",
+                            gap["from"], gap["through"]
+                        );
+                        unhandled_gap = true;
+                    }
                 } else {
                     println!("{line}");
                     if unhandled_gap {

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{self, TrySendError};
@@ -157,6 +157,7 @@ pub(crate) struct State {
     judge_tx: Option<mpsc::Sender<JudgeJob>>,
     judge_budgets: HashMap<String, JudgeBudget>,
     judge_scopes: HashMap<String, String>,
+    judge_order: HashMap<String, BTreeMap<u64, Option<ReadyJudgment>>>,
     verdict_cache: HashMap<String, crate::judge::Verdict>,
     conditions: crate::conditions::Conditions,
     /// Admission dedup for cross-node deliveries (Connected-store pattern):
@@ -306,6 +307,7 @@ pub(crate) struct ListenerHandle {
     /// `catchup_through` wait here (cap `LIVE_QUEUE`). Applied after
     /// catch-up through the same per-listener path. None once released.
     held_live: Option<VecDeque<(u64, Envelope)>>,
+    release_lines: Option<Vec<String>>,
 }
 
 enum ListenCatchupHold {
@@ -315,6 +317,14 @@ enum ListenCatchupHold {
     Skip,
     /// seq > through, catch-up still in flight: held until release.
     Held,
+}
+
+struct ReadyJudgment {
+    event: Envelope,
+    meaning_record: Option<Value>,
+    verdict: crate::judge::Verdict,
+    cached: bool,
+    model: String,
 }
 
 enum TierStep {
@@ -497,6 +507,7 @@ impl State {
             judge_tx: None,
             judge_budgets,
             judge_scopes: HashMap::new(),
+            judge_order: HashMap::new(),
             verdict_cache,
             conditions,
             forwarded_seen,
@@ -987,11 +998,20 @@ impl State {
         match step {
             TierStep::Done(n) => n,
             TierStep::Ask(job) => {
-                match &self.judge_tx {
-                    Some(tx) => {
-                        let _ = tx.send(*job);
-                    }
-                    None => eprintln!("pherd: judge worker not running"),
+                let Some(tx) = &self.judge_tx else {
+                    eprintln!("pherd: judge worker not running");
+                    return 0;
+                };
+                let seq = job.seq;
+                if tx.send(*job).is_err() {
+                    eprintln!("pherd: judge worker not running");
+                    return 0;
+                }
+                if let Some(seq) = seq {
+                    self.judge_order
+                        .entry(sub_id.to_string())
+                        .or_default()
+                        .insert(seq, None);
                 }
                 0
             }
@@ -1032,21 +1052,44 @@ impl State {
                 .as_ref()
                 .map(|c| c.model.clone())
                 .unwrap_or_else(|| "unknown".to_string());
-            return TierStep::Done(self.deliver_judged(
-                sub_id,
-                sub,
-                event,
+            let ready = ReadyJudgment {
+                event: event.clone(),
                 meaning_record,
-                &verdict,
-                true,
-                &model,
-            ));
+                verdict,
+                cached: true,
+                model,
+            };
+            if let (Some(seq), Some(order)) = (self.current_seq, self.judge_order.get_mut(sub_id)) {
+                if !order.is_empty() {
+                    order.insert(seq, Some(ready));
+                    return TierStep::Done(0);
+                }
+            }
+            return TierStep::Done(self.deliver_ready_judgment(sub_id, sub, ready));
         }
         if !self.reserve_judge_budget(sub_id, &scope, &judge_clause) {
             return TierStep::Stop("budgetExhausted");
         }
         if let Some(sample) = judge_clause.sample {
             if pseudo_random() > sample {
+                if !self.judge_scopes.contains_key(sub_id) {
+                    return TierStep::Done(0);
+                }
+                let verdict = crate::judge::Verdict {
+                    verdict: false,
+                    rationale: "sampled out".to_string(),
+                };
+                let record = json!({
+                    "ts": now_unix(),
+                    "key": cache_key,
+                    "subscription": sub_id,
+                    "event": event.id,
+                    "verdict": false,
+                    "rationale": verdict.rationale,
+                    "sampledOut": true,
+                });
+                let _ = self.db.append_verdict(&cache_key, now_unix(), &record);
+                self.verdict_cache.insert(cache_key, verdict);
                 return TierStep::Done(0);
             }
         }
@@ -1070,6 +1113,11 @@ impl State {
         job: JudgeJob,
         result: Result<crate::judge::Verdict, String>,
     ) -> u64 {
+        let ordered_seq = job.seq.filter(|seq| {
+            self.judge_order
+                .get(&job.sub_id)
+                .is_some_and(|order| order.contains_key(seq))
+        });
         let verdict = match result {
             Ok(verdict) => verdict,
             Err(e) => {
@@ -1078,7 +1126,7 @@ impl State {
                     "pher.judge.error",
                     json!({ "subscription": job.sub_id, "event": job.event.id, "error": e }),
                 );
-                return 0;
+                return self.release_judge_slot(&job.sub_id, ordered_seq, None);
             }
         };
         self.verdict_cache
@@ -1093,22 +1141,80 @@ impl State {
             "rationale": verdict.rationale,
         });
         let _ = self.db.append_verdict(&job.cache_key, now_unix(), &record);
-        if !verdict.verdict {
-            return 0;
+        let ready = verdict.verdict.then(|| ReadyJudgment {
+            event: job.event,
+            meaning_record: job.meaning_record,
+            verdict,
+            cached: false,
+            model: job.config.model,
+        });
+        if ordered_seq.is_some() {
+            return self.release_judge_slot(&job.sub_id, ordered_seq, ready);
         }
-        let Some(sub) = self.matcher.get(&job.sub_id).cloned() else {
+        let (Some(ready), Some(sub)) = (ready, self.matcher.get(&job.sub_id).cloned()) else {
             return 0;
         };
         self.current_seq = job.seq;
+        self.deliver_ready_judgment(&job.sub_id, &sub, ready)
+    }
+
+    fn deliver_ready_judgment(
+        &mut self,
+        sub_id: &str,
+        sub: &Subscription,
+        ready: ReadyJudgment,
+    ) -> u64 {
         self.deliver_judged(
-            &job.sub_id,
-            &sub,
-            &job.event,
-            job.meaning_record,
-            &verdict,
-            false,
-            &job.config.model,
+            sub_id,
+            sub,
+            &ready.event,
+            ready.meaning_record,
+            &ready.verdict,
+            ready.cached,
+            &ready.model,
         )
+    }
+
+    fn release_judge_slot(
+        &mut self,
+        sub_id: &str,
+        seq: Option<u64>,
+        ready: Option<ReadyJudgment>,
+    ) -> u64 {
+        let Some(order) = self.judge_order.get_mut(sub_id) else {
+            return 0;
+        };
+        if let Some(seq) = seq {
+            match ready {
+                Some(ready) => {
+                    order.insert(seq, Some(ready));
+                }
+                None => {
+                    order.remove(&seq);
+                }
+            }
+        }
+        let mut delivered = 0;
+        loop {
+            let Some(order) = self.judge_order.get_mut(sub_id) else {
+                return delivered;
+            };
+            let Some(mut first) = order.first_entry() else {
+                self.judge_order.remove(sub_id);
+                return delivered;
+            };
+            let Some(ready) = first.get_mut().take() else {
+                return delivered;
+            };
+            let seq = *first.key();
+            first.remove();
+            let Some(sub) = self.matcher.get(sub_id).cloned() else {
+                self.judge_order.remove(sub_id);
+                return delivered;
+            };
+            self.current_seq = Some(seq);
+            delivered += self.deliver_ready_judgment(sub_id, &sub, ready);
+        }
     }
 
     /// Budget window accounting. Returns whether one judge call may proceed.
@@ -1752,6 +1858,18 @@ impl State {
                 // Delivery goes down the socket of whoever registered this
                 // subscription. No listener means the sub is mid-teardown.
                 delivery_json["deliveryId"] = json!(delivery_id);
+                if self.catchup_lines.is_none() {
+                    if let Some(handle) = self.listeners.get_mut(&block.subscription) {
+                        let allowed = handle
+                            .filter
+                            .as_ref()
+                            .is_none_or(|f| filter_matches(f, event));
+                        if let (true, Some(buf)) = (allowed, handle.release_lines.as_mut()) {
+                            buf.push(delivery_json.to_string());
+                            return json!({ "sink": "stream", "delivered": true, "catchup": true });
+                        }
+                    }
+                }
                 let result = match self.listeners.get(&block.subscription) {
                     Some(handle)
                         if handle
@@ -2025,9 +2143,9 @@ impl State {
             .map_or_else(now_unix, |d| d.as_secs());
         let event_vec = match &sub.meaning {
             Some(meaning) if !self.semantic.has_history(meaning, at_unix) => {
-                return Ok(TierStep::Stop("noveltyHistoryEvicted"));
+                return Ok(TierStep::Stop("noveltyHistoryIncomplete"));
             }
-            Some(_) => match self.event_vector(event) {
+            Some(_) => match self.catchup_event_vector(event, at_unix) {
                 Ok(v) => Some(v),
                 Err(_) => return Ok(TierStep::Stop("meaningUnavailable")),
             },
@@ -2056,6 +2174,17 @@ impl State {
         let step =
             self.evaluate_tiers(sub_id, &sub, event, seq, event_vec.as_deref(), now_unix())?;
         Ok(self.dispatch_live(sub_id, step))
+    }
+
+    fn catchup_event_vector(&mut self, event: &Envelope, at_unix: u64) -> Result<Vec<f32>, String> {
+        if let Some(vec) = self.semantic.recorded_vector(&event.id) {
+            return Ok(vec);
+        }
+        let vec = self.semantic.embed_event(event)?;
+        let _ = self.db.append_vector(at_unix, &event.id, &vec);
+        self.semantic
+            .insert_recorded(at_unix, &event.id, vec.clone());
+        Ok(vec)
     }
 
     fn event_vector(&mut self, event: &Envelope) -> Result<Vec<f32>, String> {
@@ -2136,6 +2265,7 @@ impl State {
             // closes its connection.
             self.listeners.remove(id);
             self.semantic.on_remove(id);
+            self.judge_order.remove(id);
             if self.judge_scopes.remove(id).is_none() {
                 self.judge_budgets.remove(id);
             }
@@ -3253,15 +3383,19 @@ pub(crate) fn attach_listener(
             filter,
             catchup_through: None,
             held_live: None,
+            release_lines: None,
         },
     );
 
     let sub = s.matcher.get(&id).cloned();
     if sub.as_ref().is_some_and(|sub| sub.judge.is_some()) {
-        let owner = cursor.map_or_else(|| format!("client={client}"), |c| format!("cursor={c}"));
+        let owner = cursor.map_or_else(|| "resume".to_string(), |c| format!("cursor={c}"));
+        let canonical = Subscription::parse(string)
+            .map(|parsed| parsed.canon())
+            .unwrap_or_else(|_| string.to_string());
         let scope = format!(
             "{LISTENER_JUDGE_SCOPE}{}",
-            crate::judge::fingerprint(&format!("{owner}\n{string}"))
+            crate::judge::fingerprint(&format!("{owner}\n{canonical}\n{}", options.join(" ")))
         );
         s.judge_scopes.insert(id.clone(), scope);
     }
@@ -3471,11 +3605,33 @@ pub(crate) fn replay_listen_catchup(
             from = next;
         }
         let lines = s.catchup_lines.take().unwrap_or_default();
+        let shaping_floor = s
+            .pending
+            .get(sub_id)
+            .and_then(|window| window.seqs.iter().min().copied());
         drop(s);
         for line in &lines {
             replayed += 1;
             if !emit(line) {
                 return Ok(replayed);
+            }
+        }
+        if let Some(t) = tiers.as_mut() {
+            let mut evaluated_through = match t.gap {
+                Some((gap_from, _)) => gap_from.saturating_sub(1),
+                None => from.saturating_sub(1),
+            };
+            if let Some(floor) = shaping_floor {
+                evaluated_through = evaluated_through.min(floor.saturating_sub(1));
+            }
+            if evaluated_through > t.checkpoint {
+                t.checkpoint = evaluated_through;
+                let line = json!({
+                    "checkpoint": { "subscription": sub_id, "seq": evaluated_through }
+                });
+                if !emit(&line.to_string()) {
+                    return Ok(replayed);
+                }
             }
         }
         if from > through {
@@ -3496,13 +3652,27 @@ pub(crate) fn replay_listen_catchup(
             return Ok(replayed);
         }
     }
+    let batch = if semantic { FOLLOWER_BATCH } else { usize::MAX };
     loop {
         let mut s = state.lock().unwrap();
         if semantic {
-            s.catchup_lines = Some(Vec::new());
+            if let Some(handle) = s.listeners.get_mut(sub_id) {
+                handle.release_lines.get_or_insert_with(Vec::new);
+            }
         }
-        let released = s.release_listen_catchup_batch(sub_id, FOLLOWER_BATCH);
-        let lines = s.catchup_lines.take().unwrap_or_default();
+        let released = s.release_listen_catchup_batch(sub_id, batch);
+        let finished = !matches!(released, Ok(false));
+        let lines = s
+            .listeners
+            .get_mut(sub_id)
+            .and_then(|handle| {
+                if finished {
+                    handle.release_lines.take()
+                } else {
+                    handle.release_lines.as_mut().map(std::mem::take)
+                }
+            })
+            .unwrap_or_default();
         drop(s);
         let done = released.map_err(CatchupError::Failed)?;
         for line in &lines {
@@ -3519,6 +3689,7 @@ pub(crate) fn replay_listen_catchup(
 #[derive(Default)]
 struct TierCatchup {
     evaluated: usize,
+    checkpoint: u64,
     gap: Option<(u64, &'static str)>,
 }
 

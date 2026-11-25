@@ -38,6 +38,9 @@ impl Semantic {
     /// job too — this type only owns the in-memory scan.
     pub fn new(paths: Paths, preloaded: Vec<(u64, String, Vec<f32>)>) -> Semantic {
         let disabled = std::env::var("PHER_EMBED").is_ok_and(|v| v == "off" || v == "0");
+        let mut preloaded = preloaded;
+        preloaded.sort_by_key(|(ts, _, _)| *ts);
+        let truncated = preloaded.len() >= MAX_WINDOW_VECTORS;
         let mut window: VecDeque<(u64, String, Vec<f32>)> = VecDeque::new();
         for entry in preloaded {
             window.push_back(entry);
@@ -45,7 +48,10 @@ impl Semantic {
                 window.pop_front();
             }
         }
-        let history_from = window.front().map_or(0, |(ts, _, _)| *ts);
+        let history_from = match window.front() {
+            Some((ts, _, _)) if truncated => *ts,
+            _ => 0,
+        };
         Semantic {
             paths,
             disabled,
@@ -175,7 +181,12 @@ impl Semantic {
                 let cutoff = at_unix.saturating_sub(over.secs());
                 let mut nearest = 0.0f32;
                 let mut considered = 0usize;
-                for (ts, id, vec) in self.window.iter().rev() {
+                let end = self
+                    .window
+                    .iter()
+                    .rposition(|(_, id, _)| id == event_id)
+                    .unwrap_or(self.window.len());
+                for (ts, id, vec) in self.window.range(..end).rev() {
                     if *ts > at_unix {
                         continue;
                     }
@@ -211,6 +222,16 @@ impl Semantic {
 
     /// Add an event's vector to the in-memory novelty window (the daemon
     /// persists it to SQLite alongside this call).
+    pub fn insert_recorded(&mut self, ts: u64, event_id: &str, vec: Vec<f32>) {
+        let at = self
+            .window
+            .partition_point(|(entry_ts, _, _)| *entry_ts <= ts);
+        self.window.insert(at, (ts, event_id.to_string(), vec));
+        while self.window.len() > MAX_WINDOW_VECTORS {
+            self.evict_front();
+        }
+    }
+
     pub fn record_event(&mut self, now_unix: u64, event_id: &str, vec: Vec<f32>) {
         self.window.push_back((now_unix, event_id.to_string(), vec));
         while self.window.len() > MAX_WINDOW_VECTORS {

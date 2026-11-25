@@ -91,18 +91,23 @@ const sub = await hub.on(
   the cursor (or the last seen `seq`); the listener emits `'reconnect'`.
 - Catch-up replay is bounded by the hub's retention (default 7d). For
   `meaning`/`judge` subscriptions, catch-up runs the missed events through
-  tiers 3–4. Judge verdicts and the judge budget belong to the cursor (or,
-  without one, the client name) plus the subscription text, so a reattach
-  reuses recorded verdicts instead of re-asking, and reconnecting does not
-  refill the budget. It evaluates at most 1000 tier-3/4 candidates per attach. When
-  it has to stop early (judge budget exhausted, that limit, judge call
+  tiers 3–4. Judge verdicts (including sampled-out decisions) and the judge
+  budget belong to the cursor (if any) plus the canonical subscription, so a reattach reuses recorded verdicts instead of
+  re-asking, and reconnecting does not refill the budget. Judge deliveries
+  for one subscription always arrive in `seq` order: a cached verdict waits
+  behind an earlier one still being judged.
+- As catch-up evaluates events it sends checkpoints, and the cursor commits
+  up to them, so events judged "no" are not evaluated again on the next
+  attach. Catch-up evaluates at most 1000 tier-3/4 candidates per attach.
+  When it has to stop early (judge budget exhausted, that limit, judge call
   failed, embedder or judge provider unavailable, or `meaning novel`
-  history for the event already evicted), the hub sends a gap
+  history for the event incomplete), the hub sends a gap
   `{ subscription, from, through, reason }` and the listener emits `'gap'`.
   Pass `onGap` to handle it; the cursor moves past the range only after
   `onGap` finishes. Without `onGap`, the gap is an `'error'` (with a `gap`
-  property) and the cursor stops before the range, so the next attach
-  retries it.
+  property), or a process warning if nothing listens for `'error'`, and the
+  cursor commits up to the gap but never past it, so the next attach retries
+  the range.
 
 Every delivery carries `seq` (the hub log position) if you'd rather track
 resume state yourself (`on(sub, h, { after: lastSeq })`).
