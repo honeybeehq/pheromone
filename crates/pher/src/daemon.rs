@@ -2187,6 +2187,18 @@ impl State {
         Ok(vec)
     }
 
+    fn resume_catchup_buffer(&mut self, sub_id: &str, held: Option<Vec<String>>) {
+        let mut lines = held.unwrap_or_default();
+        if let Some(released) = self
+            .listeners
+            .get_mut(sub_id)
+            .and_then(|handle| handle.release_lines.as_mut())
+        {
+            lines.append(released);
+        }
+        self.catchup_lines = Some(lines);
+    }
+
     fn event_vector(&mut self, event: &Envelope) -> Result<Vec<f32>, String> {
         match self.semantic.recorded_vector(&event.id) {
             Some(v) => Ok(v),
@@ -3513,13 +3525,19 @@ pub(crate) fn replay_listen_catchup(
     ts_cutoff: Option<&str>,
     mut emit: impl FnMut(&str) -> bool,
 ) -> Result<u64, CatchupError> {
-    let mut tiers = state
-        .lock()
-        .unwrap()
-        .matcher
-        .get(sub_id)
-        .is_some_and(|sub| sub.meaning.is_some() || sub.judge.is_some())
-        .then(TierCatchup::default);
+    let mut tiers = {
+        let mut s = state.lock().unwrap();
+        let semantic = s
+            .matcher
+            .get(sub_id)
+            .is_some_and(|sub| sub.meaning.is_some() || sub.judge.is_some());
+        if semantic {
+            if let Some(handle) = s.listeners.get_mut(sub_id) {
+                handle.release_lines = Some(Vec::new());
+            }
+        }
+        semantic.then(TierCatchup::default)
+    };
     let mut replayed = 0u64;
     let mut from = from;
     loop {
@@ -3539,7 +3557,7 @@ pub(crate) fn replay_listen_catchup(
             break;
         }
         let mut s = state.lock().unwrap();
-        s.catchup_lines = Some(Vec::new());
+        s.resume_catchup_buffer(sub_id, None);
         for (pos, event) in page {
             if pos.seq > through {
                 break;
@@ -3584,7 +3602,7 @@ pub(crate) fn replay_listen_catchup(
                         }
                         let result = crate::judge::ask(&job.config, &job.question, &job.summary);
                         s = state.lock().unwrap();
-                        s.catchup_lines = Some(Vec::new());
+                        s.resume_catchup_buffer(sub_id, None);
                         if result.is_err() {
                             t.gap = Some((pos.seq, "judgeFailed"));
                         }
@@ -3599,7 +3617,7 @@ pub(crate) fn replay_listen_catchup(
                     let held = s.catchup_lines.take();
                     drop(s);
                     s = state.lock().unwrap();
-                    s.catchup_lines = held;
+                    s.resume_catchup_buffer(sub_id, held);
                 }
             }
             from = next;
@@ -3640,12 +3658,24 @@ pub(crate) fn replay_listen_catchup(
     }
     let semantic = tiers.is_some();
     if let Some((gap_from, reason)) = tiers.and_then(|t| t.gap) {
-        let shaping_floor = state
-            .lock()
-            .unwrap()
-            .pending
-            .get(sub_id)
-            .and_then(|window| window.seqs.iter().min().copied());
+        let (shaping_floor, released) = {
+            let mut s = state.lock().unwrap();
+            let floor = s
+                .pending
+                .get(sub_id)
+                .and_then(|window| window.seqs.iter().min().copied());
+            let released = s
+                .listeners
+                .get_mut(sub_id)
+                .and_then(|handle| handle.release_lines.as_mut().map(std::mem::take))
+                .unwrap_or_default();
+            (floor, released)
+        };
+        for line in &released {
+            if !emit(line) {
+                return Ok(replayed);
+            }
+        }
         let commit_through =
             shaping_floor.map_or(through, |floor| through.min(floor.saturating_sub(1)));
         let gap = json!({
