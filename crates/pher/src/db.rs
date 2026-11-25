@@ -364,23 +364,6 @@ fn blob_to_f32s(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Migration keeps `.jsonl.migrated` backups; this is where a `pher doctor`
-/// could offer to trash them once the operator trusts the db.
-#[allow(dead_code)]
-pub fn migrated_backup_paths(paths: &Paths) -> Vec<std::path::PathBuf> {
-    [
-        "events",
-        "deliveries",
-        "verdicts",
-        "vectors",
-        "forwarded_seen",
-    ]
-    .iter()
-    .map(|n| paths.home.join(format!("{n}.jsonl.migrated")))
-    .filter(|p| p.exists())
-    .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
