@@ -32,9 +32,10 @@ subscription string against a bag of events, in-process, with no daemon.
   segmented event log behind the storage trait, subject-trie hot path.
 - `pher emit`, `pher when`, `pher ls`, `pher rm`, `pher tail` (WS event plane with comb-style
   cursor resume), `pher why` / `pher why-not`.
-- Lifetimes: `for <ttl>`, `limit <n>`, `while <client> alive` on listener connections. Stored
-  subscriptions refuse `while <bee> alive` until pherd has a bee liveness source (lease
-  renewal); a lease nothing can end would deliver forever.
+- Lifetimes: `for <ttl>`, `limit <n>`, `while <client> alive` on listener connections. pherd
+  refuses `while <bee> alive` on stored subscriptions until it has a bee liveness source
+  (lease renewal); a lease nothing can end would deliver forever. Embedding hosts enforce
+  leases themselves (see LANGUAGE.md).
 - Delivery: at-least-once with `deliveryId` dedup; sinks `cmd`, `http`, `emit` (with hop-cap
   cycle guard). Retention/evaporation policies + GC sweep.
 - `pher wait` (one-shot mode) over the caller's connection.

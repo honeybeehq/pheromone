@@ -73,6 +73,19 @@ assert.equal(wasm.whyNot.matched, true);
 assert.equal(wasm.survives, true);
 assert.equal(wasm.validate, null);
 
+const leased = `${rule} while apiary-41c0 alive`;
+const leasedJson = JSON.parse(pher.parse(leased));
+assert.deepEqual(leasedJson.lifetime, { kind: "lease", lessee: "apiary-41c0" });
+assert.equal(pher.canon(leased), leased);
+const spawnFailed = envelopeWith({ flag: { flag: "spawn_failed" } });
+assert.equal(JSON.parse(pher.evaluate(leased, spawnFailed)).outcome, "matched");
+assert.equal(pher.evaluate(leased, spawnFailed), pher.evaluate(rule, spawnFailed));
+assert.equal(JSON.parse(pher.whyNot(leased, spawnFailed)).matched, true);
+assert.equal(pher.whyNot(leased, spawnFailed), pher.whyNot(rule, spawnFailed));
+assert.equal(pher.survives(leased, spawnFailed), true);
+compareWithNative(leased, spawnFailed);
+assert.match(pher.validate("when on a then stream for 7d while x alive"), /'for' and 'while' are mutually exclusive/);
+
 assert.equal(pher.validate("on hive.seal then cmd echo hi"), undefined);
 assert.match(pher.validate("nonsense"), /on/);
 assert.deepEqual(JSON.parse(pher.parse('on hive.seal where payload.status == "blocked" then buz CL.1')).on, ["hive.seal"]);
@@ -88,4 +101,5 @@ assert.throws(() => pher.parse("nonsense"), /on/);
 
 console.log(`@pheromone/wasm: glue clean of ${forbidden.map(([n]) => n).join(", ")}`);
 console.log("@pheromone/wasm: initSync from bytes; parse, canon, validate, evaluate, survives, whyNot match native Rust");
+console.log("@pheromone/wasm: `then stream while <x> alive` parses to a lease, round-trips, and never changes evaluate/whyNot");
 console.log("@pheromone/wasm: all tests passed");
