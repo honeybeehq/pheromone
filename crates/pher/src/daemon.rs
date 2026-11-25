@@ -819,7 +819,9 @@ impl State {
         if source_ts_dropped {
             let warning = format!(
                 "sourceTs {} is not RFC 3339 or epoch seconds/ms; admitted without it",
-                partial.source_ts.unwrap_or_default()
+                crate::connector::truncate_for_log(
+                    &partial.source_ts.unwrap_or_default().to_string()
+                )
             );
             eprintln!("pherd: event {} on {}: {warning}", event.id, event.subject);
             return Ok(ok(

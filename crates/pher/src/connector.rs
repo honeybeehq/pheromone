@@ -544,7 +544,7 @@ fn vendor_ts(record: &Value, spec: &PollSpec) -> VendorTs {
     }
 }
 
-fn truncate_for_log(text: &str) -> String {
+pub(crate) fn truncate_for_log(text: &str) -> String {
     const MAX: usize = 64;
     match text.char_indices().nth(MAX) {
         Some((cut, _)) => format!("{}…", &text[..cut]),

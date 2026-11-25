@@ -206,8 +206,8 @@ Every envelope has `ts`, the time the origin node admitted the event (RFC 3339 U
 millisecond precision; bridged and forwarded events keep their origin's `ts`). An event may
 also carry `sourceTs`, the time its source says it happened: a connector reads it from the
 record field its manifest names in `ts` (Sentry `lastSeen`, GitHub `created_at`, Stripe
-`created`), and any emitter (exec connector JSONL, `pher emit` over the socket, HTTP
-`/emit`) may send it. The origin node normalizes it to the same shape as `ts`, so
+`created`), and any emitter speaking the wire protocol (exec connector JSONL, socket `emit`, HTTP
+`/emit`) may send it as `sourceTs`; the `pher emit` CLI does not set it. The origin node normalizes it to the same shape as `ts`, so
 `where sourceTs < ts` compares correctly. Accepted: RFC 3339 with `Z` or a `±HH:MM` offset,
 and Unix epoch seconds or milliseconds (as a number or numeric string), between 1970 and
 year 9999. Anything else is dropped from the envelope, never the event: the event is
