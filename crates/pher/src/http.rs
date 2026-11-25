@@ -54,6 +54,7 @@ pub(crate) fn start(state: Arc<Mutex<State>>, config: HttpConfig) -> anyhow::Res
     let server = tiny_http::Server::http(&config.addr)
         .map_err(|e| anyhow::anyhow!("cannot bind http ingress on {}: {e}", config.addr))?;
     eprintln!("pherd http ingress on {}", config.addr);
+    crate::webhook::warn_unusable_env_secrets();
     let paths = state.lock().unwrap().paths_clone();
     std::thread::spawn(move || {
         for request in server.incoming_requests() {

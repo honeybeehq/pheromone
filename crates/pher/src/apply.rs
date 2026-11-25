@@ -297,14 +297,13 @@ pub fn run(
             }
         }
     }
-    {
-        let mut seen = std::collections::HashSet::new();
-        for entry in &config.webhooks {
-            entry.validate()?;
-            if !seen.insert(entry.name.as_str()) {
-                bail!("duplicate webhook name '{}' in config", entry.name);
-            }
+    let mut webhook_secrets: Vec<(&str, String)> = Vec::new();
+    for entry in &config.webhooks {
+        entry.validate()?;
+        if webhook_secrets.iter().any(|(name, _)| *name == entry.name) {
+            bail!("duplicate webhook name '{}' in config", entry.name);
         }
+        webhook_secrets.push((entry.name.as_str(), entry.resolve_secret()?));
     }
 
     let act = |line: String| {
@@ -696,27 +695,25 @@ pub fn run(
             .into_iter()
             .filter_map(|w| Some((w.get("name")?.as_str()?.to_string(), w)))
             .collect();
-        for entry in &config.webhooks {
-            let secret = entry.resolve_secret()?;
-            let same = existing.get(&entry.name).is_some_and(|w| {
+        for (name, secret) in &webhook_secrets {
+            let same = existing.get(*name).is_some_and(|w| {
                 w["secretFingerprint"].as_str()
-                    == Some(crate::connector::token_fingerprint(&secret).as_str())
+                    == Some(crate::connector::token_fingerprint(secret).as_str())
             });
             if same {
-                println!("  webhook {}: unchanged", entry.name);
+                println!("  webhook {name}: unchanged");
                 continue;
             }
-            let existed = existing.contains_key(&entry.name);
+            let existed = existing.contains_key(*name);
             act(format!(
-                "webhook {}: {}",
-                entry.name,
+                "webhook {name}: {}",
                 if existed { "secret updated" } else { "created" }
             ));
             if !dry_run {
                 client::call_target(
                     target,
                     &Request::WebhookSet {
-                        def: json!({ "name": entry.name, "secret": secret }),
+                        def: json!({ "name": name, "secret": secret }),
                     },
                 )?;
             }

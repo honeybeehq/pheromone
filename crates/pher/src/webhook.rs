@@ -19,6 +19,7 @@ const SIGNATURE_HEADERS: [&str; 5] = [
 ];
 const TOKEN_HEADERS: [&str; 2] = ["x-pher-webhook-token", "x-gitlab-token"];
 pub(crate) const MIN_SECRET_LEN: usize = 16;
+const GLOBAL_ENV_VAR: &str = "PHER_WEBHOOK_SECRET";
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -50,11 +51,9 @@ impl Rejection {
 
     pub(crate) fn message(&self, name: &str) -> String {
         match self {
-            Rejection::NotConfigured => format!(
-                "webhook '{name}' has no secret configured; add a [[webhook]] entry and run \
-                 `pher apply`, or set {} (at least {MIN_SECRET_LEN} characters) on the daemon",
-                env_var_for(name)
-            ),
+            Rejection::NotConfigured => {
+                format!("webhook '{name}' has no secret configured, so it admits nothing")
+            }
             Rejection::BadCredentials => format!(
                 "webhook '{name}' authentication failed: sign the body with HMAC-SHA256 \
                  (X-Hub-Signature-256: sha256=<hex>) or send the hook's own secret in \
@@ -187,29 +186,43 @@ fn remove(paths: &Paths, name: &str) -> Value {
     ok(json!({ "removed": removed }))
 }
 
+pub(crate) fn warn_unusable_env_secrets() {
+    for (var, value) in std::env::vars() {
+        let is_secret_var = var == GLOBAL_ENV_VAR || var.starts_with("PHER_WEBHOOK_SECRET_");
+        if is_secret_var && !value.is_empty() && value.len() < MIN_SECRET_LEN {
+            eprintln!(
+                "pherd: warning: {var} is shorter than {MIN_SECRET_LEN} characters; \
+                 webhooks it covers reject every request"
+            );
+        }
+    }
+}
+
 fn secret_for(paths: &Paths, name: &str) -> Result<Option<Secret>, Rejection> {
     let defs = load(paths).map_err(|_| Rejection::SecretsUnreadable)?;
-    let hook_specific = defs
+    let secret = match defs
         .into_iter()
         .find(|d| d.name == name)
         .map(|d| d.secret)
-        .or_else(|| usable_env(&env_var_for(name)))
-        .map(|value| Secret {
+        .or_else(|| env_secret(&env_var_for(name)))
+    {
+        Some(value) => Secret {
             value,
             hook_specific: true,
-        });
-    Ok(hook_specific.or_else(|| {
-        usable_env("PHER_WEBHOOK_SECRET").map(|value| Secret {
-            value,
-            hook_specific: false,
-        })
-    }))
+        },
+        None => match env_secret(GLOBAL_ENV_VAR) {
+            Some(value) => Secret {
+                value,
+                hook_specific: false,
+            },
+            None => return Ok(None),
+        },
+    };
+    Ok((secret.value.len() >= MIN_SECRET_LEN).then_some(secret))
 }
 
-fn usable_env(var: &str) -> Option<String> {
-    std::env::var(var)
-        .ok()
-        .filter(|s| s.len() >= MIN_SECRET_LEN)
+fn env_secret(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|s| !s.is_empty())
 }
 
 fn env_var_for(name: &str) -> String {
