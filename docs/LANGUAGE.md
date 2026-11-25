@@ -159,9 +159,11 @@ else then buz operator --tier queue
   the receptor evaporates. Leaf-node subscriptions (ephemeral containers) are always leases.
 - `every <window>` / `batch <window>` — debounce/batch, **delegated to Pollinate's
   DeliveryManager semantics** (immediate/throttled/batched/debounced with persisted state).
-- `since <lookback>` — replay: run the backlog through the matcher first (recorded verdicts
-  for tiers 3–4 where available; fresh evaluation is opt-in via `since ... reevaluate`),
-  then continue live with no gap (comb-style cursor handoff).
+- `since <lookback>` — replay: run the backlog through the matcher first, then continue
+  live with no gap (comb-style cursor handoff). Replay never re-rolls tiers 3–4, and a new
+  subscription has no recorded verdicts, so `since` is rejected on subscriptions with
+  `meaning` or `judge`. `since ... reevaluate` (opt-in fresh evaluation under the judge
+  budget) is designed but not implemented.
 - `limit <n>` — one-shot and n-shot subscriptions; `limit 1` + timeout is the primitive
   under `pher.wait()`.
 
@@ -266,7 +268,7 @@ pher when 'on hive.bee.spawned
            else then buz operator'
 
 # Retroactive investigation, then live
-pher when 'on crash.sentry.* meaning "OOM or memory pressure"
+pher when 'on crash.sentry.* where payload.level == "fatal"
            then cmd ./triage.sh' --since 24h
 
 # Metrics (condition transitions from the tap — never raw datapoints)

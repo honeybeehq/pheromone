@@ -36,5 +36,6 @@ tuning is a one-command loop.
   requires dropping `vectors.jsonl` (enforcement of the mismatch is TODO).
 - Candidate models to benchmark against the corpus: nomic-embed (matryoshka 256), newer
   small models (ROADMAP open question 2).
-- Replay (`since`) does not evaluate the meaning tier yet; registration warns.
+- Replay (`since`) does not evaluate the meaning or judge tiers; registration rejects
+  `since` on such subscriptions with the fix.
 - The labeled corpus should grow with real hive/Sentry/CI events as taps run.

@@ -610,6 +610,9 @@ impl State {
                 ));
             }
         }
+        if let Some(e) = replay_tier_error(&sub) {
+            return Err(e);
+        }
         // Honesty gate: a judge subscription needs a working provider config
         // NOW, not at first event — refuse registration with the exact fix.
         if sub.judge.is_some() {
@@ -672,13 +675,6 @@ impl State {
             _ => None,
         };
         let mut warnings: Vec<String> = Vec::new();
-        if (sub.meaning.is_some() || sub.judge.is_some()) && sub.replay.is_some() {
-            warnings.push(
-                "replay ('since') does not evaluate the meaning/judge tiers; backlog \
-                 events are matched on tiers 1-2 only"
-                    .to_string(),
-            );
-        }
         // Stream subs are exempt: their lease IS enforced, by connection
         // liveness — disconnect removes the subscription.
         if matches!(sub.lifetime, pher_core::Lifetime::Lease { .. })
@@ -3071,8 +3067,8 @@ pub(crate) fn attach_listener(
     if semantic_sub && (resume_after.is_some() || catchup_from.is_some()) {
         if let Some(w) = ack.get_mut("warnings").and_then(|w| w.as_array_mut()) {
             w.push(json!(
-                "catch-up replay evaluates tiers 1-2 only; meaning/judge verdicts \
-                 were not recorded for this subscription while it was away"
+                "catch-up delivers nothing for meaning/judge subscriptions; only \
+                 live events are evaluated"
             ));
         }
     }
@@ -3092,6 +3088,21 @@ pub(crate) fn attach_listener(
         catchup_through: through,
         ts_cutoff,
     })
+}
+
+pub(crate) fn replay_tier_error(sub: &Subscription) -> Option<String> {
+    sub.replay.as_ref()?;
+    let tiers = match (sub.meaning.is_some(), sub.judge.is_some()) {
+        (true, true) => "meaning/judge",
+        (true, false) => "meaning",
+        (false, true) => "judge",
+        (false, false) => return None,
+    };
+    Some(format!(
+        "'since' cannot replay a {tiers} subscription: replay never evaluates or re-rolls \
+         tiers 3-4 over the backlog ('reevaluate' is not supported). Drop 'since' to match \
+         live events only, or replay the backlog with a separate on/where subscription"
+    ))
 }
 
 fn next_after(seq: u64) -> Option<u64> {
@@ -4830,6 +4841,37 @@ mod follower_tests {
         assert!(
             s.matcher.ids().is_empty(),
             "failed since replay must not leave the subscription"
+        );
+    }
+
+    #[test]
+    fn since_rejects_meaning_and_judge_subscriptions() {
+        let paths = fresh_home("since-tiers");
+        let mut s = State::load(paths).unwrap();
+        for _ in 0..3 {
+            s.ingest(partial("t.x"), 0).unwrap();
+        }
+        s.drain();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key-not-used");
+        let judged = s.register(
+            r#"on t.** judge "is this bad?" budget 2/day then emit seen.hit since 24h"#,
+            &[],
+            None,
+        );
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        let err = judged.expect_err("since + judge must be rejected, not replay nothing");
+        assert!(err.contains("'since'") && err.contains("judge"), "{err}");
+        let err = s
+            .register(
+                r#"on t.** meaning "something broke" then emit seen.hit since 24h reevaluate"#,
+                &[],
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("'since'") && err.contains("meaning"), "{err}");
+        assert!(
+            s.matcher.ids().is_empty(),
+            "rejected subs must not register"
         );
     }
 
