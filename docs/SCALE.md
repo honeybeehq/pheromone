@@ -40,9 +40,10 @@ follower thread: follow_step(32) from `matched_through` → cascade → delivery
   cascades; emitters interleave. Not yet parallel matching — that needs shard leases
   (Phase C/§8.13) and is unnecessary until one follower saturates.
 
-Remaining for Phase A: lift `Db::append_event/max_seq/events_after/events_since_ts/gc` into `TrailLog` as
-`SqliteLog`; `event_by_id` becomes a side index (SQLite locally; Comb `.idx` segments in
-the cloud).
+Phase A local split: `TrailLog` + `SqliteLog` own sequence allocation and prefix
+retention (`log_state.head` / `log_state.floor`). Prefix GC may retain a later
+old-ts event; `since` still filters every envelope on `ts >= cutoff`.
+`event_by_id` stays a Db side index. ObjectLog / Comb dependency is a later slice.
 
 ## What stays Pheromone-owned above the log (Comb §8.13, §13.5)
 

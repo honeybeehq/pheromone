@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,11 +9,12 @@ use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use pher_core::matcher::{evaluate, why_not, MatchBlock, Outcome};
+use pher_core::matcher::{check, evaluate, why_not, Check, MatchBlock, Outcome};
 use pher_core::{ids, Envelope, Matcher, Sink, SubjectPattern, Subscription};
 
 use crate::protocol::{err, ok, PartialEvent, Request};
 use crate::store::{write_json_atomic, Paths};
+use crate::traillog::{for_each_page, Pos, SqliteLog, TrailError, TrailLog, LOG_PAGE};
 
 const DEFAULT_RETENTION_SECS: u64 = 7 * 86400;
 const MAX_EMIT_HOPS: u32 = 8;
@@ -72,7 +73,7 @@ pub struct CursorEntry {
 }
 
 struct TailClient {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
     subject: Option<SubjectPattern>,
 }
 
@@ -99,16 +100,19 @@ const MAX_BATCH_QUEUE: usize = 1000;
 /// Log entries the follower processes per lock acquisition. Small enough
 /// that an emitter never waits behind more than a few ms of cascade.
 const FOLLOWER_BATCH: usize = 32;
+/// Live tail/listen queue. try_send only; Full drops the slow consumer.
+const LIVE_QUEUE: usize = 256;
 
 pub(crate) struct State {
     paths: Paths,
     /// SQLite storage for the growing logs (events, deliveries, verdicts,
     /// vectors, forwarded-dedup). Small operator state stays in JSON files.
     db: crate::db::Db,
+    /// Event log. Owns sequence allocation and the retention floor.
+    log: Arc<SqliteLog>,
     node: String,
     matcher: Matcher,
     metas: HashMap<String, SubMeta>,
-    next_seq: u64,
     /// Log seq the matcher has processed through (inclusive). Ingest only
     /// appends; the follower advances this as it runs the cascade, and
     /// commits it to the db after each batch. A crash between append and
@@ -123,6 +127,8 @@ pub(crate) struct State {
     /// ends the listener's delivery loop; a vanished listener removes the
     /// subscription — the enforced form of `while <client> alive`.
     listeners: HashMap<String, ListenerHandle>,
+    /// When set, stream deliveries append here instead of the live channel.
+    catchup_lines: Option<Vec<String>>,
     /// Named consumer cursors (client-committed positions in this log).
     cursors: HashMap<String, CursorEntry>,
     /// Named token grants (authorization = the subscription language).
@@ -157,6 +163,17 @@ pub(crate) struct State {
     outbox: Vec<OutboxEntry>,
     /// Nudges the outbox worker after an enqueue (fallback: 1s tick).
     outbox_tx: Option<mpsc::Sender<()>>,
+    /// Last seq each listener fully applied. Retry of a failed seq skips
+    /// these so delivery/limit/shaping are not repeated.
+    applied_seqs: HashMap<String, u64>,
+    /// Test seam: persist_timers returns Err so catch-up/follower fail closed.
+    #[cfg(test)]
+    fail_persist_timers: bool,
+    /// Test seam: fail on this 1-based persist_timers call (others succeed).
+    #[cfg(test)]
+    fail_persist_on_nth: Option<u32>,
+    #[cfg(test)]
+    persist_call_n: u32,
 }
 
 /// Evaporation bound for the forwarded-delivery dedup window.
@@ -273,8 +290,25 @@ pub(crate) fn filter_matches(filter: &Subscription, event: &Envelope) -> bool {
 /// A live stream listener: its delivery channel, plus the grant filter it
 /// is bounded by (None = local/admin, unfiltered).
 pub(crate) struct ListenerHandle {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
     filter: Option<Subscription>,
+    /// Inclusive seq catch-up covers. The follower never applies this
+    /// listener's cascade at or below this seq.
+    catchup_through: Option<u64>,
+    /// Some while catch-up is in flight: live events this listener cares
+    /// about (on-matches and expect follow-ups) with seq above
+    /// `catchup_through` wait here (cap `LIVE_QUEUE`). Applied after
+    /// catch-up through the same per-listener path. None once released.
+    held_live: Option<VecDeque<(u64, Envelope)>>,
+}
+
+enum ListenCatchupHold {
+    /// Follower/live path may apply matching, limits, and shaping.
+    Proceed,
+    /// seq <= captured through: catch-up owns this seq.
+    Skip,
+    /// seq > through, catch-up still in flight: held until release.
+    Held,
 }
 
 /// A pending tier-4 evaluation, processed off-lock by the judge worker.
@@ -320,12 +354,13 @@ impl State {
         }
 
         let db = crate::db::Db::open(&paths)?;
-        let next_seq = db.max_seq()?.map(|s| s + 1).unwrap_or(1);
+        let log = Arc::new(SqliteLog::open(&paths)?);
+        let head = log.head_seq()?;
         // A database from before the ingest/match split has no marker: every
         // event in it was matched synchronously at ingest, so start caught up.
         let matched_through = match db.matched_through()? {
-            Some(m) => m.min(next_seq - 1),
-            None => next_seq - 1,
+            Some(m) => m.min(head),
+            None => head,
         };
         db.set_matched_through(matched_through)?;
 
@@ -426,10 +461,10 @@ impl State {
         let mut state = State {
             paths,
             db,
+            log,
             node,
             matcher,
             metas,
-            next_seq,
             matched_through,
             follower_tx: None,
             timers,
@@ -454,6 +489,14 @@ impl State {
             forwarded_seen,
             outbox,
             outbox_tx: None,
+            catchup_lines: None,
+            applied_seqs: HashMap::new(),
+            #[cfg(test)]
+            fail_persist_timers: false,
+            #[cfg(test)]
+            fail_persist_on_nth: None,
+            #[cfg(test)]
+            persist_call_n: 0,
         };
         let has_judge_subs = state
             .matcher
@@ -489,7 +532,14 @@ impl State {
         write_json_atomic(&self.paths.subs(), &serde_json::to_value(list)?)
     }
 
-    fn persist_timers(&self) -> anyhow::Result<()> {
+    fn persist_timers(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            self.persist_call_n = self.persist_call_n.saturating_add(1);
+            if self.fail_persist_timers || self.fail_persist_on_nth == Some(self.persist_call_n) {
+                anyhow::bail!("injected persist_timers failure");
+            }
+        }
         write_json_atomic(&self.paths.timers(), &serde_json::to_value(&self.timers)?)
     }
 
@@ -662,10 +712,11 @@ impl State {
         if sub.then.sink != Sink::Stream {
             if let Some(replay) = sub.replay.clone() {
                 let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
-                for (seq, event) in self.read_events_since_ts(&cutoff) {
-                    self.current_seq = Some(seq);
-                    if let Some(n) = self.try_deliver(&id, &event) {
-                        replayed += n;
+                match self.replay_from_ts(&id, &cutoff) {
+                    Ok(n) => replayed += n,
+                    Err(e) => {
+                        self.remove_sub(&id, "since replay failed");
+                        return Err(e.to_string());
                     }
                 }
             }
@@ -711,16 +762,15 @@ impl State {
     /// visible to tails before return; the cascade runs later in the
     /// follower (`follow_step`), so ingest latency never includes matching.
     fn ingest_envelope(&mut self, event: Envelope) -> Result<u64, String> {
-        let seq = self.next_seq;
-        self.db
-            .append_event(seq, &event)
+        let pos = self
+            .log
+            .append(std::slice::from_ref(&event))
             .map_err(|e| e.to_string())?;
-        self.next_seq += 1;
-        self.notify_tails(seq, &event);
+        self.notify_tails(pos.seq, &event);
         if let Some(tx) = &self.follower_tx {
             let _ = tx.send(());
         }
-        Ok(seq)
+        Ok(pos.seq)
     }
 
     /// Follower step: run the cascade over the next `max` unprocessed log
@@ -728,22 +778,40 @@ impl State {
     /// (0 = caught up). Called under the state lock in small batches so
     /// ingest interleaves; tests call it directly to drain synchronously.
     pub(crate) fn follow_step(&mut self, max: usize) -> usize {
-        let batch = match self.db.events_next(self.matched_through, max) {
+        let from = Pos::local(self.matched_through.saturating_add(1));
+        let n = max.clamp(1, LOG_PAGE);
+        let batch = match self.log.read(from, n) {
             Ok(b) => b,
+            Err(TrailError::Trimmed { resume_at }) => {
+                self.matched_through = resume_at.seq.saturating_sub(1);
+                match self.log.read(resume_at, n) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("pherd: follower read failed: {e}");
+                        let _ = self.db.set_matched_through(self.matched_through);
+                        return 0;
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("pherd: follower read failed: {e}");
                 return 0;
             }
         };
         if batch.is_empty() {
+            let _ = self.db.set_matched_through(self.matched_through);
             return 0;
         }
         let mut processed = 0;
-        for (seq, event) in batch {
-            if let Err(e) = self.process_event(seq, &event) {
-                eprintln!("pherd: cascade failed for {} (seq {seq}): {e}", event.id);
+        for (pos, event) in batch {
+            if let Err(e) = self.process_event(pos.seq, &event) {
+                eprintln!(
+                    "pherd: cascade failed for {} (seq {}): {e}",
+                    event.id, pos.seq
+                );
+                break;
             }
-            self.matched_through = seq;
+            self.matched_through = pos.seq;
             processed += 1;
         }
         if let Err(e) = self.db.set_matched_through(self.matched_through) {
@@ -770,34 +838,33 @@ impl State {
     fn process_event(&mut self, seq: u64, event: &Envelope) -> Result<u64, String> {
         self.current_seq = Some(seq);
 
-        // Expect bookkeeping first: an incoming event can disarm timers.
-        self.disarm_matching_timers(event);
-
-        let matched_ids: Vec<String> = self
+        let mut ids: Vec<String> = self
             .matcher
             .match_ids(event)
             .into_iter()
             .map(String::from)
             .collect();
+        for id in self.expect_followup_ids(event) {
+            if !ids.iter().any(|x| x == &id) {
+                ids.push(id);
+            }
+        }
         let mut deliveries = 0u64;
-        for sub_id in matched_ids {
-            let Some(sub) = self.matcher.get(&sub_id).cloned() else {
-                continue;
-            };
-            if let Some(expect) = &sub.expect {
-                // Origin match arms the absence timer; the action fires on expiry.
-                self.timers.push(Timer {
-                    sub_id: sub_id.clone(),
-                    origin: event.clone(),
-                    deadline: now_unix() + expect.within.secs(),
-                    seq: Some(seq),
-                });
-                self.persist_timers().map_err(|e| e.to_string())?;
+        for sub_id in ids {
+            if !matches!(
+                self.hold_listen_catchup(&sub_id, seq, event),
+                ListenCatchupHold::Proceed
+            ) {
                 continue;
             }
-            if let Some(n) = self.try_deliver(&sub_id, event) {
-                deliveries += n;
+            if self
+                .applied_seqs
+                .get(&sub_id)
+                .is_some_and(|&applied| applied >= seq)
+            {
+                continue;
             }
+            deliveries += self.apply_to_listener(&sub_id, seq, event)?;
         }
 
         // Tiers 3-4: subscriptions whose tiers 1-2 passed but carry `meaning`
@@ -825,6 +892,9 @@ impl State {
             }
             let now = now_unix();
             for sub_id in pending_subs {
+                if self.listener_catchup_owns(&sub_id, seq) {
+                    continue;
+                }
                 let Some(sub) = self.matcher.get(&sub_id).cloned() else {
                     continue;
                 };
@@ -839,14 +909,8 @@ impl State {
                     }
                     meaning_record = Some(record);
                 }
-                if let Some(expect) = &sub.expect {
-                    self.timers.push(Timer {
-                        sub_id: sub_id.clone(),
-                        origin: event.clone(),
-                        deadline: now_unix() + expect.within.secs(),
-                        seq: Some(seq),
-                    });
-                    self.persist_timers().map_err(|e| e.to_string())?;
+                if sub.expect.is_some() {
+                    self.arm_expect_timer(&sub_id, &sub, event, seq)?;
                     continue;
                 }
                 if sub.judge.is_some() {
@@ -1527,9 +1591,7 @@ impl State {
                 // Delivery goes down the socket of whoever registered this
                 // subscription. No listener means the sub is mid-teardown.
                 delivery_json["deliveryId"] = json!(delivery_id);
-                match self.listeners.get(&block.subscription) {
-                    // Grant enforcement: the delivery must also match the
-                    // listener's allow filter — intersection, not trust.
+                let result = match self.listeners.get(&block.subscription) {
                     Some(handle)
                         if handle
                             .filter
@@ -1538,11 +1600,27 @@ impl State {
                     {
                         json!({ "sink": "stream", "filtered": "grant allow" })
                     }
-                    Some(handle) if handle.tx.send(delivery_json.to_string()).is_ok() => {
-                        json!({ "sink": "stream", "delivered": true })
+                    Some(_) if self.catchup_lines.is_some() => {
+                        if let Some(buf) = &mut self.catchup_lines {
+                            buf.push(delivery_json.to_string());
+                        }
+                        json!({ "sink": "stream", "delivered": true, "catchup": true })
                     }
+                    Some(handle) => match handle.tx.try_send(delivery_json.to_string()) {
+                        Ok(()) => json!({ "sink": "stream", "delivered": true }),
+                        Err(TrySendError::Disconnected(_)) => {
+                            json!({ "sink": "stream", "error": "listener gone" })
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            json!({ "sink": "stream", "error": "lag" })
+                        }
+                    },
                     _ => json!({ "sink": "stream", "error": "listener gone" }),
+                };
+                if result.get("error").and_then(|e| e.as_str()) == Some("lag") {
+                    self.remove_sub(&block.subscription, "listener lagged");
                 }
+                result
             }
         }
     }
@@ -1561,8 +1639,226 @@ impl State {
         );
     }
 
+    fn listener_catchup_owns(&self, sub_id: &str, seq: u64) -> bool {
+        self.listeners
+            .get(sub_id)
+            .and_then(|h| h.catchup_through)
+            .is_some_and(|through| seq <= through)
+    }
+
+    fn expect_followup_ids(&self, event: &Envelope) -> Vec<String> {
+        self.matcher
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                let expect = self.matcher.get(id)?.expect.as_ref()?;
+                expect
+                    .subject
+                    .matches(&event.subject)
+                    .then(|| id.to_string())
+            })
+            .collect()
+    }
+
+    /// Per-listener cascade: disarm expect timers, then arm or
+    /// shape/limit-deliver. Catch-up, hold release, and the follower share
+    /// this path so listen+expect keeps arm/disarm order across handoff.
+    /// Persist failures propagate so catch-up can fail closed. A listener
+    /// that fully applied this seq is recorded so a later retry cannot
+    /// repeat delivery, limit, shaping, or timer arm. Delivery that
+    /// retires the subscription must not reinsert that progress.
+    fn apply_to_listener(
+        &mut self,
+        sub_id: &str,
+        seq: u64,
+        event: &Envelope,
+    ) -> Result<u64, String> {
+        if self
+            .applied_seqs
+            .get(sub_id)
+            .is_some_and(|&applied| applied >= seq)
+        {
+            return Ok(0);
+        }
+        self.apply_timer_phase(sub_id, seq, event)?;
+        let n = self.apply_delivery_phase(sub_id, seq, event);
+        if self.matcher.get(sub_id).is_some() {
+            self.applied_seqs.insert(sub_id.to_string(), seq);
+        }
+        Ok(n)
+    }
+
+    fn apply_timer_phase(
+        &mut self,
+        sub_id: &str,
+        seq: u64,
+        event: &Envelope,
+    ) -> Result<(), String> {
+        self.current_seq = Some(seq);
+        self.disarm_listener_timers(sub_id, event)?;
+        let Some(sub) = self.matcher.get(sub_id).cloned() else {
+            return Ok(());
+        };
+        if matches!(check(&sub, event, None), Check::Matched) && sub.expect.is_some() {
+            self.arm_expect_timer(sub_id, &sub, event, seq)?;
+        }
+        Ok(())
+    }
+
+    fn apply_delivery_phase(&mut self, sub_id: &str, seq: u64, event: &Envelope) -> u64 {
+        self.current_seq = Some(seq);
+        let Some(sub) = self.matcher.get(sub_id).cloned() else {
+            return 0;
+        };
+        if matches!(check(&sub, event, None), Check::Matched) && sub.expect.is_none() {
+            self.try_deliver(sub_id, event).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn arm_expect_timer(
+        &mut self,
+        sub_id: &str,
+        sub: &Subscription,
+        event: &Envelope,
+        seq: u64,
+    ) -> Result<(), String> {
+        let Some(expect) = &sub.expect else {
+            return Ok(());
+        };
+        // Same origin must not grow a second timer if persist failed after
+        // push, or if the follower retries the seq.
+        if self
+            .timers
+            .iter()
+            .any(|t| t.sub_id == sub_id && t.origin.id == event.id)
+        {
+            return self.persist_timers().map_err(|e| e.to_string());
+        }
+        let n = self.timers.len();
+        self.timers.push(Timer {
+            sub_id: sub_id.to_string(),
+            origin: event.clone(),
+            deadline: now_unix() + expect.within.secs(),
+            seq: Some(seq),
+        });
+        if let Err(e) = self.persist_timers() {
+            self.timers.truncate(n);
+            return Err(e.to_string());
+        }
+        Ok(())
+    }
+
+    fn disarm_listener_timers(&mut self, sub_id: &str, event: &Envelope) -> Result<(), String> {
+        let Some(sub) = self.matcher.get(sub_id) else {
+            let snapshot = self.timers.clone();
+            let before = self.timers.len();
+            self.timers.retain(|t| t.sub_id != sub_id);
+            if self.timers.len() != before {
+                if let Err(e) = self.persist_timers() {
+                    self.timers = snapshot;
+                    return Err(e.to_string());
+                }
+            }
+            return Ok(());
+        };
+        let Some(expect) = &sub.expect else {
+            return Ok(());
+        };
+        if !expect.subject.matches(&event.subject) {
+            return Ok(());
+        }
+        let where_expr = expect.where_expr.clone();
+        let snapshot = self.timers.clone();
+        let mut disarmed = false;
+        self.timers.retain(|timer| {
+            if timer.sub_id != sub_id {
+                return true;
+            }
+            let joined = match &where_expr {
+                None => true,
+                Some(w) => pher_core::expr::eval_bool(
+                    w,
+                    &pher_core::EvalCtx::new(event, Some(&timer.origin)),
+                )
+                .unwrap_or(false),
+            };
+            if joined {
+                disarmed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if disarmed {
+            if let Err(e) = self.persist_timers() {
+                self.timers = snapshot;
+                return Err(e.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Catch-up owns seqs <= captured through. Live matches and expect
+    /// follow-ups above that seq wait until catch-up finishes so the
+    /// per-listener cascade (expect arm/disarm, limits, shaping) runs once
+    /// in seq order.
+    fn hold_listen_catchup(
+        &mut self,
+        sub_id: &str,
+        seq: u64,
+        event: &Envelope,
+    ) -> ListenCatchupHold {
+        if self
+            .applied_seqs
+            .get(sub_id)
+            .is_some_and(|&applied| applied >= seq)
+        {
+            return ListenCatchupHold::Skip;
+        }
+        {
+            let Some(handle) = self.listeners.get_mut(sub_id) else {
+                return ListenCatchupHold::Proceed;
+            };
+            if handle.catchup_through.is_some_and(|through| seq <= through) {
+                return ListenCatchupHold::Skip;
+            }
+            let Some(held) = handle.held_live.as_mut() else {
+                return ListenCatchupHold::Proceed;
+            };
+            if held.iter().any(|(held_seq, _)| *held_seq == seq) {
+                return ListenCatchupHold::Held;
+            }
+            if held.len() < LIVE_QUEUE {
+                held.push_back((seq, event.clone()));
+                return ListenCatchupHold::Held;
+            }
+        }
+        self.remove_sub(sub_id, "listener lagged");
+        ListenCatchupHold::Held
+    }
+
+    fn release_listen_catchup(&mut self, sub_id: &str) -> Result<(), String> {
+        let Some(held) = self
+            .listeners
+            .get_mut(sub_id)
+            .and_then(|h| h.held_live.take())
+        else {
+            return Ok(());
+        };
+        for (seq, event) in held {
+            if self.matcher.get(sub_id).is_none() {
+                break;
+            }
+            self.apply_to_listener(sub_id, seq, &event)?;
+        }
+        Ok(())
+    }
+
     fn remove_sub(&mut self, id: &str, reason: &str) -> bool {
         let removed = self.matcher.remove(id);
+        self.applied_seqs.remove(id);
         if removed {
             self.metas.remove(id);
             self.timers.retain(|t| t.sub_id != id);
@@ -1584,41 +1880,6 @@ impl State {
     }
 
     // -- expect timers -----------------------------------------------------
-
-    fn disarm_matching_timers(&mut self, event: &Envelope) {
-        let mut disarmed = false;
-        let matcher = &self.matcher;
-        self.timers.retain(|timer| {
-            let Some(sub) = matcher.get(&timer.sub_id) else {
-                disarmed = true;
-                return false;
-            };
-            let Some(expect) = &sub.expect else {
-                disarmed = true;
-                return false;
-            };
-            if !expect.subject.matches(&event.subject) {
-                return true;
-            }
-            let joined = match &expect.where_expr {
-                None => true,
-                Some(w) => pher_core::expr::eval_bool(
-                    w,
-                    &pher_core::EvalCtx::new(event, Some(&timer.origin)),
-                )
-                .unwrap_or(false),
-            };
-            if joined {
-                disarmed = true;
-                false
-            } else {
-                true
-            }
-        });
-        if disarmed {
-            let _ = self.persist_timers();
-        }
-    }
 
     fn fire_expired_timers(&mut self) {
         let now = now_unix();
@@ -1697,12 +1958,65 @@ impl State {
 
     // -- events / tail / introspection -------------------------------------
 
-    fn read_events(&self, after: Option<u64>) -> Vec<(u64, Envelope)> {
-        self.db.events_after(after, None).unwrap_or_default()
+    fn log_head(&self) -> u64 {
+        self.log
+            .head()
+            .ok()
+            .and_then(|h| h.first().map(|p| p.seq))
+            .unwrap_or(0)
     }
 
-    fn read_events_since_ts(&self, ts: &str) -> Vec<(u64, Envelope)> {
-        self.db.events_since_ts(ts).unwrap_or_default()
+    /// Page `since` catch-up: seek_ts finds the first candidate; every later
+    /// event must still have envelope.ts >= cutoff (timestamps are not monotonic).
+    fn replay_from_ts(&mut self, sub_id: &str, ts: &str) -> Result<u64, TrailError> {
+        let from = self.log.seek_ts(0, ts)?.seq;
+        Ok(self.replay_from_seq(sub_id, from, Some(ts))?.1)
+    }
+
+    /// Page deliveries from `from_seq` inclusive. Returns (first seq seen, count).
+    fn replay_from_seq(
+        &mut self,
+        sub_id: &str,
+        from_seq: u64,
+        ts_min: Option<&str>,
+    ) -> Result<(Option<u64>, u64), TrailError> {
+        let mut first = None;
+        let mut replayed = 0u64;
+        let mut from = from_seq;
+        loop {
+            let page = match self.log.read(Pos::local(from.max(1)), LOG_PAGE) {
+                Ok(p) => p,
+                Err(TrailError::Trimmed { resume_at }) => {
+                    return Err(TrailError::Trimmed { resume_at });
+                }
+                Err(e) => return Err(e),
+            };
+            if page.is_empty() {
+                break;
+            }
+            for (pos, event) in page {
+                if first.is_none() {
+                    first = Some(pos.seq);
+                }
+                if let Some(min) = ts_min {
+                    if event.ts.as_str() < min {
+                        from = pos
+                            .seq
+                            .checked_add(1)
+                            .ok_or(TrailError::SeqOutOfRange { seq: pos.seq })?;
+                        continue;
+                    }
+                }
+                replayed += self
+                    .apply_to_listener(sub_id, pos.seq, &event)
+                    .map_err(|e| TrailError::Storage(anyhow::anyhow!(e)))?;
+                from = pos
+                    .seq
+                    .checked_add(1)
+                    .ok_or(TrailError::SeqOutOfRange { seq: pos.seq })?;
+            }
+        }
+        Ok((first, replayed))
     }
 
     fn notify_tails(&mut self, seq: u64, event: &Envelope) {
@@ -1713,13 +2027,20 @@ impl State {
                     return true; // filtered out, but keep the client
                 }
             }
-            client.tx.send(line.clone()).is_ok()
+            match client.tx.try_send(line.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Disconnected(_)) => false,
+                Err(TrySendError::Full(_)) => false,
+            }
         });
     }
 
     fn gc(&mut self) -> anyhow::Result<()> {
         let cutoff = unix_to_ts(now_unix().saturating_sub(self.retention_secs));
         let cutoff_unix = now_unix().saturating_sub(self.retention_secs);
+        if let Err(e) = self.log.trim_before(&cutoff) {
+            eprintln!("pherd: log trim failed: {e}");
+        }
         self.db.gc(&cutoff, cutoff_unix, MAX_FORWARDED_SEEN)?;
         self.semantic.gc(cutoff_unix);
         // Cursors evaporate with the events they point into: one not
@@ -1809,7 +2130,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
             sock_path.display(),
             s.node,
             s.matcher.len(),
-            s.next_seq
+            s.log_head() + 1
         );
         let node = s.node.clone();
         s.emit_trail_event("pher.node.online", json!({ "node": node }));
@@ -2135,7 +2456,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
                 "node": s.node,
                 "build": if cfg!(debug_assertions) { "debug" } else { "release" },
                 "subscriptions": s.matcher.len(),
-                "nextSeq": s.next_seq,
+                "nextSeq": s.log_head() + 1,
                 "matchedThrough": s.matched_through,
                 "armedTimers": s.timers.len(),
                 "tails": s.tails.len(),
@@ -2214,7 +2535,7 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
                 .map(|(name, e)| json!({ "name": name, "seq": e.seq, "committedAt": unix_to_ts(e.ts) }))
                 .collect();
             cursors.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-            ok(json!({ "cursors": cursors, "head": s.next_seq.saturating_sub(1) }))
+            ok(json!({ "cursors": cursors, "head": s.log_head() }))
         }
         Request::CursorRm { name } => {
             let mut s = state.lock().unwrap();
@@ -2486,15 +2807,16 @@ fn rpc_why_not(sub: &str, event: &str, state: &Arc<Mutex<State>>) -> Value {
     ok(json!({ "report": report }))
 }
 
-/// Attach a raw-event tail: register the live feed and snapshot the backlog
-/// atomically (seq dedup at the handoff makes the seam exact). Shared by the
-/// unix socket and HTTP /tail. `last` truncates the backlog to its tail —
-/// consoles want recent context, not a week of history.
-pub(crate) type TailAttachment = (
-    Vec<(u64, Envelope)>,
-    mpsc::Receiver<String>,
-    Option<SubjectPattern>,
-);
+/// Attach a raw-event tail: register the live feed and snapshot the head
+/// so catch-up pages `seq <= through` while live lines are `seq > through`.
+pub(crate) struct TailAttachment {
+    pub rx: mpsc::Receiver<String>,
+    pub pattern: Option<SubjectPattern>,
+    pub after: Option<u64>,
+    pub last: Option<usize>,
+    pub through: u64,
+    pub log: Arc<SqliteLog>,
+}
 
 pub(crate) fn attach_tail(
     state: &Arc<Mutex<State>>,
@@ -2506,29 +2828,81 @@ pub(crate) fn attach_tail(
         Ok(p) => p,
         Err(e) => return Err(err(e)),
     };
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::sync_channel::<String>(LIVE_QUEUE);
     let mut s = state.lock().unwrap();
+    let through = match s.log.head_seq() {
+        Ok(h) => h,
+        Err(e) => return Err(err(e)),
+    };
     s.tails.push(TailClient {
         tx,
         subject: pattern.clone(),
     });
-    // With a subject pattern the SQL limit can't apply (matching happens
-    // here), so over-fetch a bounded window and trim after filtering.
-    let fetch = match (&pattern, last) {
-        (None, n) => n,
-        (Some(_), Some(n)) => Some((n * 20).clamp(1000, 20_000)),
-        (Some(_), None) => None,
+    Ok(TailAttachment {
+        rx,
+        pattern,
+        after,
+        last,
+        through,
+        log: Arc::clone(&s.log),
+    })
+}
+
+/// Page historical tail lines. `last` keeps a ring of that many matches;
+/// unfiltered `last` starts near `through` so we do not scan the whole log.
+pub(crate) fn page_tail_backlog(
+    log: &SqliteLog,
+    after: Option<u64>,
+    last: Option<usize>,
+    pattern: Option<&SubjectPattern>,
+    through: u64,
+    mut emit: impl FnMut(u64, Envelope) -> bool,
+) -> Result<(), TrailError> {
+    let from = match after {
+        None => 1,
+        Some(a) => match next_after(a) {
+            Some(f) => f,
+            None => return Ok(()),
+        },
     };
-    let mut backlog = s.db.events_after(after, fetch).unwrap_or_default();
-    if let Some(p) = &pattern {
-        backlog.retain(|(_, e)| p.matches(&e.subject));
+    if last == Some(0) {
+        return Ok(());
     }
     if let Some(n) = last {
-        if backlog.len() > n {
-            backlog.drain(..backlog.len() - n);
+        let mut ring: VecDeque<(u64, Envelope)> = VecDeque::new();
+        let start = if pattern.is_none() {
+            let keep = n as u64;
+            from.max(through.saturating_add(1).saturating_sub(keep))
+        } else {
+            from
+        };
+        for_each_page(log, start, Some(through), |seq, event| {
+            if let Some(p) = pattern {
+                if !p.matches(&event.subject) {
+                    return true;
+                }
+            }
+            if ring.len() == n {
+                ring.pop_front();
+            }
+            ring.push_back((seq, event));
+            true
+        })?;
+        for (seq, event) in ring {
+            if !emit(seq, event) {
+                break;
+            }
         }
+        return Ok(());
     }
-    Ok((backlog, rx, pattern))
+    for_each_page(log, from, Some(through), |seq, event| {
+        if let Some(p) = pattern {
+            if !p.matches(&event.subject) {
+                return true;
+            }
+        }
+        emit(seq, event)
+    })
 }
 
 fn handle_tail(
@@ -2537,7 +2911,7 @@ fn handle_tail(
     stream: &UnixStream,
     state: &Arc<Mutex<State>>,
 ) -> anyhow::Result<()> {
-    let (backlog, rx, _pattern) = match attach_tail(state, after, subject, None) {
+    let attached = match attach_tail(state, after, subject, None) {
         Ok(t) => t,
         Err(e) => {
             respond(stream, &e)?;
@@ -2546,13 +2920,31 @@ fn handle_tail(
     };
     let mut writer = stream.try_clone()?;
     let mut last_sent = after.unwrap_or(0);
-    for (seq, event) in backlog {
-        let line = json!({ "seq": seq, "event": event }).to_string();
-        writeln!(writer, "{line}")?;
-        last_sent = seq;
+    let mut write_ok = true;
+    if let Err(e) = page_tail_backlog(
+        &attached.log,
+        attached.after,
+        attached.last,
+        attached.pattern.as_ref(),
+        attached.through,
+        |seq, event| {
+            let line = json!({ "seq": seq, "event": event }).to_string();
+            if writeln!(writer, "{line}").is_err() {
+                write_ok = false;
+                return false;
+            }
+            last_sent = seq;
+            true
+        },
+    ) {
+        let _ = writeln!(writer, "{}", err(&e));
+        return Ok(());
+    }
+    if !write_ok {
+        return Ok(());
     }
     writer.flush()?;
-    for line in rx {
+    for line in attached.rx {
         let seq = serde_json::from_str::<Value>(&line)
             .ok()
             .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
@@ -2573,10 +2965,18 @@ fn handle_tail(
 /// the ack to send first, and the delivery channel. Err carries the protocol
 /// error Value to send back.
 ///
-/// Resume order of precedence: explicit `after` beats the named cursor's
-/// stored position. Replay runs AFTER the listener channel is attached and
-/// under the same lock as registration, so there is no window where a live
-/// event can slip between backlog and stream: no gap, no duplicate.
+/// Resume: explicit `after` beats the named cursor. Catch-up is NOT queued
+/// into the live channel; the caller pages it after releasing State.
+pub(crate) struct ListenAttachment {
+    pub id: String,
+    pub ack: Value,
+    pub rx: mpsc::Receiver<String>,
+    pub log: Arc<SqliteLog>,
+    pub catchup_from: Option<u64>,
+    pub catchup_through: u64,
+    pub ts_cutoff: Option<String>,
+}
+
 pub(crate) fn attach_listener(
     state: &Arc<Mutex<State>>,
     string: &str,
@@ -2585,8 +2985,8 @@ pub(crate) fn attach_listener(
     after: Option<u64>,
     cursor: Option<&str>,
     filter: Option<Subscription>,
-) -> Result<(String, Value, mpsc::Receiver<String>), Value> {
-    let (tx, rx) = mpsc::channel::<String>();
+) -> Result<ListenAttachment, Value> {
+    let (tx, rx) = mpsc::sync_channel::<String>(LIVE_QUEUE);
     let mut s = state.lock().unwrap();
     let stored_cursor = cursor.and_then(|c| s.cursors.get(c)).map(|e| e.seq);
     let resume_after = after.or(stored_cursor);
@@ -2599,40 +2999,63 @@ pub(crate) fn attach_listener(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    s.listeners
-        .insert(id.clone(), ListenerHandle { tx, filter });
+    s.listeners.insert(
+        id.clone(),
+        ListenerHandle {
+            tx,
+            filter,
+            catchup_through: None,
+            held_live: None,
+        },
+    );
 
-    // Catch-up replay into the now-attached channel. Cursor resume (exact,
-    // by seq) wins over the subscription's own `since` (fuzzy, by time).
     let sub = s.matcher.get(&id).cloned();
-    let mut replayed = 0u64;
+    let through = match s.log.head_seq() {
+        Ok(h) => h,
+        Err(e) => {
+            s.remove_sub(&id, "log head unreadable");
+            return Err(err(e));
+        }
+    };
+    let log = Arc::clone(&s.log);
+    let mut catchup_from = None;
+    let mut ts_cutoff = None;
     let mut gap_expired = 0u64;
     if let Some(after) = resume_after {
-        let backlog = s.read_events(Some(after));
-        if let Some((first_seq, _)) = backlog.first() {
-            // Retention already evaporated part of the gap.
-            gap_expired = first_seq.saturating_sub(after + 1);
-        }
-        for (seq, event) in backlog {
-            s.current_seq = Some(seq);
-            if let Some(n) = s.try_deliver(&id, &event) {
-                replayed += n;
+        match next_after(after) {
+            None => {}
+            Some(from) => {
+                catchup_from = Some(from);
+                match s.log.read(Pos::local(from.max(1)), 1) {
+                    Ok(page) => {
+                        if let Some((pos, _)) = page.first() {
+                            gap_expired = pos.seq.saturating_sub(from);
+                        }
+                    }
+                    Err(TrailError::Trimmed { resume_at }) => {
+                        gap_expired = resume_at.seq.saturating_sub(from);
+                        catchup_from = Some(resume_at.seq);
+                    }
+                    Err(e) => {
+                        s.remove_sub(&id, "catch-up read failed");
+                        return Err(err(e));
+                    }
+                }
             }
         }
     } else if let Some(replay) = sub.as_ref().and_then(|sub| sub.replay.clone()) {
         let cutoff = unix_to_ts(now_unix().saturating_sub(replay.lookback.secs()));
-        for (seq, event) in s.read_events_since_ts(&cutoff) {
-            s.current_seq = Some(seq);
-            if let Some(n) = s.try_deliver(&id, &event) {
-                replayed += n;
+        match s.log.seek_ts(0, &cutoff) {
+            Ok(p) => catchup_from = Some(p.seq),
+            Err(e) => {
+                s.remove_sub(&id, "catch-up seek failed");
+                return Err(err(e));
             }
         }
+        ts_cutoff = Some(cutoff);
     }
 
-    // Ack tells the consumer exactly where it stands: the log head (start a
-    // cursor even with no traffic), what was replayed, and what is gone.
-    ack["seq"] = json!(s.next_seq.saturating_sub(1));
-    ack["replayed"] = json!(replayed);
+    ack["seq"] = json!(through);
     if let Some(after) = resume_after {
         ack["resumedFrom"] = json!(after);
     }
@@ -2645,7 +3068,7 @@ pub(crate) fn attach_listener(
     let semantic_sub = sub
         .as_ref()
         .is_some_and(|sub| sub.meaning.is_some() || sub.judge.is_some());
-    if semantic_sub && (resume_after.is_some() || replayed > 0) {
+    if semantic_sub && (resume_after.is_some() || catchup_from.is_some()) {
         if let Some(w) = ack.get_mut("warnings").and_then(|w| w.as_array_mut()) {
             w.push(json!(
                 "catch-up replay evaluates tiers 1-2 only; meaning/judge verdicts \
@@ -2653,7 +3076,122 @@ pub(crate) fn attach_listener(
             ));
         }
     }
-    Ok((id, ack, rx))
+    if catchup_from.is_some() {
+        if let Some(handle) = s.listeners.get_mut(&id) {
+            handle.catchup_through = Some(through);
+            handle.held_live = Some(VecDeque::new());
+        }
+    }
+    drop(s);
+    Ok(ListenAttachment {
+        id,
+        ack,
+        rx,
+        log,
+        catchup_from,
+        catchup_through: through,
+        ts_cutoff,
+    })
+}
+
+fn next_after(seq: u64) -> Option<u64> {
+    seq.checked_add(1)
+}
+
+/// Page catch-up matches to `emit` without filling the live channel.
+/// Short State lock per page. Trim or corruption after ack is an error so
+/// the client disconnects and resumes; omitted records are not success.
+pub(crate) fn replay_listen_catchup(
+    state: &Arc<Mutex<State>>,
+    sub_id: &str,
+    log: &SqliteLog,
+    from: u64,
+    through: u64,
+    ts_cutoff: Option<&str>,
+    mut emit: impl FnMut(&str) -> bool,
+) -> Result<u64, CatchupError> {
+    let mut replayed = 0u64;
+    let mut from = from;
+    loop {
+        if from > through {
+            break;
+        }
+        let page = match log.read(Pos::local(from.max(1)), LOG_PAGE) {
+            Ok(p) => p,
+            Err(TrailError::Trimmed { resume_at }) => {
+                return Err(CatchupError::Trimmed {
+                    resume_at: resume_at.seq,
+                });
+            }
+            Err(e) => return Err(CatchupError::Failed(e.to_string())),
+        };
+        if page.is_empty() {
+            break;
+        }
+        let mut s = state.lock().unwrap();
+        s.catchup_lines = Some(Vec::new());
+        for (pos, event) in page {
+            if pos.seq > through {
+                break;
+            }
+            if let Some(min) = ts_cutoff {
+                if event.ts.as_str() < min {
+                    from = match pos.seq.checked_add(1) {
+                        Some(n) => n,
+                        None => {
+                            s.catchup_lines = None;
+                            return Err(CatchupError::Failed("sequence overflow".into()));
+                        }
+                    };
+                    continue;
+                }
+            }
+            if let Err(e) = s.apply_to_listener(sub_id, pos.seq, &event) {
+                s.catchup_lines = None;
+                return Err(CatchupError::Failed(e));
+            }
+            from = match pos.seq.checked_add(1) {
+                Some(n) => n,
+                None => {
+                    s.catchup_lines = None;
+                    return Err(CatchupError::Failed("sequence overflow".into()));
+                }
+            };
+        }
+        let lines = s.catchup_lines.take().unwrap_or_default();
+        drop(s);
+        for line in &lines {
+            replayed += 1;
+            if !emit(line) {
+                return Ok(replayed);
+            }
+        }
+        if from > through {
+            break;
+        }
+    }
+    let mut s = state.lock().unwrap();
+    if let Err(e) = s.release_listen_catchup(sub_id) {
+        return Err(CatchupError::Failed(e));
+    }
+    Ok(replayed)
+}
+
+#[derive(Debug)]
+pub(crate) enum CatchupError {
+    Trimmed { resume_at: u64 },
+    Failed(String),
+}
+
+impl std::fmt::Display for CatchupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CatchupError::Trimmed { resume_at } => {
+                write!(f, "catch-up trimmed; resume at seq {resume_at}")
+            }
+            CatchupError::Failed(e) => write!(f, "catch-up failed: {e}"),
+        }
+    }
 }
 
 /// Tear a listener's subscription down. Guarded: only the party that still
@@ -2681,7 +3219,7 @@ fn handle_listen(
 ) -> anyhow::Result<()> {
     let client = client.unwrap_or_else(|| "listener".to_string());
     // Unix socket = local operator = unfiltered.
-    let (sub_id, ack, rx) = match attach_listener(
+    let attached = match attach_listener(
         state,
         string,
         options,
@@ -2696,7 +3234,45 @@ fn handle_listen(
             return Ok(());
         }
     };
-    respond(stream, &ack)?;
+    let sub_id = attached.id.clone();
+    respond(stream, &attached.ack)?;
+    let mut writer = stream.try_clone()?;
+    let mut last_sent = 0u64;
+    if let Some(from) = attached.catchup_from {
+        let mut write_ok = true;
+        match replay_listen_catchup(
+            state,
+            &sub_id,
+            &attached.log,
+            from,
+            attached.catchup_through,
+            attached.ts_cutoff.as_deref(),
+            |line| {
+                let seq = serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
+                    .unwrap_or(0);
+                if writeln!(writer, "{line}").is_err() {
+                    write_ok = false;
+                    return false;
+                }
+                last_sent = last_sent.max(seq);
+                true
+            },
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                let _ = writeln!(writer, "{}", err(&e));
+                detach_listener(state, &sub_id, &e.to_string());
+                return Ok(());
+            }
+        }
+        if !write_ok {
+            detach_listener(state, &sub_id, "listener disconnected");
+            return Ok(());
+        }
+        let _ = writer.flush();
+    }
 
     let teardown = |reason: &str| detach_listener(state, &sub_id, reason);
 
@@ -2720,12 +3296,19 @@ fn handle_listen(
         });
     }
 
-    let mut writer = stream.try_clone()?;
-    for line in rx {
+    for line in attached.rx {
+        let seq = serde_json::from_str::<Value>(&line)
+            .ok()
+            .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
+            .unwrap_or(u64::MAX);
+        if seq <= last_sent {
+            continue;
+        }
         if writeln!(writer, "{line}").is_err() || writer.flush().is_err() {
             teardown("listener disconnected");
             break;
         }
+        last_sent = seq;
     }
     // Channel closed: the subscription was removed daemon-side (limit hit,
     // rm, ttl), the client hung up, or teardown already ran. The watchdog's
@@ -2816,6 +3399,7 @@ mod grant_tests {
 #[cfg(test)]
 mod follower_tests {
     use super::*;
+    use crate::traillog::TrailLog;
 
     fn fresh_home(tag: &str) -> Paths {
         let home = std::env::temp_dir().join(format!("pher-follower-{tag}-{}", std::process::id()));
@@ -2834,6 +3418,136 @@ mod follower_tests {
         }
     }
 
+    fn plant(s: &State, id: &str) {
+        s.log
+            .append(&[Envelope {
+                id: id.into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: "t.x".into(),
+                subject: "t.x".into(),
+                correlation: None,
+                payload: json!({ "id": id }),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+    }
+
+    fn line_event_id(line: &str) -> String {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| {
+                v.get("event")
+                    .and_then(|e| e.get("id"))
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    }
+
+    fn drain_rx(rx: &mpsc::Receiver<String>) -> Vec<String> {
+        let mut ids = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            ids.push(line_event_id(&line));
+        }
+        ids
+    }
+
+    const LISTEN_EXPECT: &str = "on job.started expect job.finished where correlation == $origin.correlation within 30s else then stream";
+
+    fn plant_job(s: &State, id: &str, subject: &str, corr: &str) {
+        s.log
+            .append(&[Envelope {
+                id: id.into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: subject.into(),
+                subject: subject.into(),
+                correlation: Some(corr.into()),
+                payload: json!({}),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+    }
+
+    fn ingest_job(s: &mut State, subject: &str, corr: &str) -> String {
+        s.ingest(
+            PartialEvent {
+                subject: subject.into(),
+                payload: Some(json!({})),
+                event_type: None,
+                source: Some("test".into()),
+                correlation: Some(corr.into()),
+            },
+            0,
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn timer_origin_ids(s: &State, sub_id: &str) -> Vec<String> {
+        s.timers
+            .iter()
+            .filter(|t| t.sub_id == sub_id)
+            .map(|t| t.origin.id.clone())
+            .collect()
+    }
+
+    fn persisted_timer_origin_ids(s: &State, sub_id: &str) -> Vec<String> {
+        let path = s.paths.timers();
+        let text = match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => panic!("read timers {}: {e}", path.display()),
+            Ok(t) if t.trim().is_empty() => return Vec::new(),
+            Ok(t) => t,
+        };
+        let timers: Vec<Timer> = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("parse timers {}: {e}", path.display()));
+        timers
+            .into_iter()
+            .filter(|t| t.sub_id == sub_id)
+            .map(|t| t.origin.id)
+            .collect()
+    }
+
+    #[test]
+    fn persisted_timer_origin_ids_fails_on_corrupt_json_and_unexpected_io() {
+        let paths = fresh_home("timers-helper");
+        let s = State::load(paths).unwrap();
+        let path = s.paths.timers();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            persisted_timer_origin_ids(&s, "missing").is_empty(),
+            "missing timers file is empty, not an error"
+        );
+
+        std::fs::write(&path, "not-json").unwrap();
+        let corrupt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persisted_timer_origin_ids(&s, "missing")
+        }));
+        assert!(
+            corrupt.is_err(),
+            "malformed timers JSON must not look like no timers"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let io_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persisted_timer_origin_ids(&s, "missing")
+        }));
+        assert!(
+            io_err.is_err(),
+            "unexpected timers read error must not look like no timers"
+        );
+        let _ = std::fs::remove_dir(&path);
+    }
+
     #[test]
     fn ingest_appends_only_and_follower_runs_the_cascade() {
         let paths = fresh_home("split");
@@ -2848,11 +3562,11 @@ mod follower_tests {
             "ack carries no match result"
         );
         // Durable and visible before any matching happened.
-        assert_eq!(s.db.max_seq().unwrap(), Some(seq));
+        assert_eq!(s.log.head_seq().unwrap(), seq);
         assert!(s.matched_through < seq);
         assert!(s.db.event_by_id("nope").unwrap().is_none());
         assert_eq!(
-            s.db.events_next(seq, 10).unwrap().len(),
+            s.log.read(Pos::local(seq + 1), 10).unwrap().len(),
             0,
             "no re-emit yet"
         );
@@ -2860,7 +3574,7 @@ mod follower_tests {
         assert_eq!(s.follow_step(32), 1);
         assert_eq!(s.matched_through, seq);
         assert_eq!(s.db.matched_through().unwrap(), Some(seq));
-        let re = s.db.events_next(seq, 10).unwrap();
+        let re = s.log.read(Pos::local(seq + 1), 10).unwrap();
         let subjects: Vec<_> = re.iter().map(|(_, e)| e.subject.clone()).collect();
         assert_eq!(
             re.len(),
@@ -2872,7 +3586,7 @@ mod follower_tests {
 
         // Draining processes the re-emitted event too (no match, position moves).
         assert_eq!(s.drain(), 1);
-        assert_eq!(s.matched_through, re[0].0);
+        assert_eq!(s.matched_through, re[0].0.seq);
         assert_eq!(s.follow_step(32), 0);
     }
 
@@ -2888,16 +3602,17 @@ mod follower_tests {
             // "Crash" before the follower ran.
         }
         let mut s = State::load(paths).unwrap();
-        let head = s.db.max_seq().unwrap().unwrap();
+        let head = s.log.head_seq().unwrap();
         assert!(s.matched_through < head, "gap is remembered across restart");
         s.drain();
-        assert_eq!(s.matched_through, s.db.max_seq().unwrap().unwrap());
-        let cds: Vec<_> =
-            s.db.events_after(Some(0), None)
-                .unwrap()
-                .into_iter()
-                .filter(|(_, e)| e.subject == "c.d")
-                .collect();
+        assert_eq!(s.matched_through, s.log.head_seq().unwrap());
+        let cds: Vec<_> = s
+            .log
+            .read(Pos::local(1), LOG_PAGE)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| e.subject == "c.d")
+            .collect();
         assert_eq!(
             cds.len(),
             2,
@@ -2910,6 +3625,7 @@ mod follower_tests {
         let paths = fresh_home("legacy");
         {
             let db = crate::db::Db::open(&paths).unwrap();
+            let log = SqliteLog::open(&paths).unwrap();
             for seq in 1..=5u64 {
                 let ev = Envelope {
                     id: format!("E.{seq}"),
@@ -2923,7 +3639,7 @@ mod follower_tests {
                     ttl_class: None,
                     hops: None,
                 };
-                db.append_event(seq, &ev).unwrap();
+                log.append(&[ev]).unwrap();
             }
             assert!(db.matched_through().unwrap().is_none());
         }
@@ -2933,5 +3649,1213 @@ mod follower_tests {
             "old events were matched at ingest; never replay them"
         );
         assert_eq!(s.follow_step(32), 0);
+    }
+
+    #[test]
+    fn follower_jumps_trimmed_prefix_and_survives_restart() {
+        let paths = fresh_home("trim-follow");
+        let mut s = State::load(paths.clone()).unwrap();
+        let old = Envelope {
+            id: "PH.old".into(),
+            ts: "2020-01-01T00:00:00Z".into(),
+            node: "n".into(),
+            source: "test".into(),
+            event_type: "keep.a".into(),
+            subject: "keep.a".into(),
+            correlation: None,
+            payload: json!({}),
+            ttl_class: None,
+            hops: None,
+        };
+        s.log.append(&[old.clone(), old]).unwrap();
+        assert_eq!(s.log.head_seq().unwrap(), 2);
+        assert_eq!(s.matched_through, 0, "appended off the ingest path");
+        s.log.trim_before("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(s.log.floor().unwrap(), 2);
+        assert_eq!(s.follow_step(32), 0);
+        assert_eq!(s.matched_through, 2);
+        drop(s);
+        let mut s = State::load(paths).unwrap();
+        assert_eq!(s.matched_through, 2);
+        assert_eq!(s.follow_step(32), 0);
+        assert!(matches!(
+            s.log.read(Pos::local(1), LOG_PAGE),
+            Err(TrailError::Trimmed { .. })
+        ));
+    }
+
+    #[test]
+    fn follower_pages_a_long_backlog() {
+        let paths = fresh_home("pages");
+        let mut s = State::load(paths).unwrap();
+        for i in 0..80 {
+            s.ingest(
+                PartialEvent {
+                    subject: format!("page.{i}"),
+                    payload: Some(json!({ "i": i })),
+                    event_type: None,
+                    source: Some("test".into()),
+                    correlation: None,
+                },
+                0,
+            )
+            .unwrap();
+        }
+        assert_eq!(s.log.head_seq().unwrap(), 80);
+        assert_eq!(s.matched_through, 0);
+        assert_eq!(s.drain(), 80);
+        assert_eq!(s.matched_through, 80);
+        assert_eq!(s.follow_step(32), 0);
+    }
+
+    #[test]
+    fn since_skips_later_old_ts_after_seek() {
+        let paths = fresh_home("since-ooo");
+        let mut s = State::load(paths).unwrap();
+        let old = "2020-01-01T00:00:00.000Z";
+        let new = now_ts();
+        for (id, ts) in [
+            ("PH.o1", old),
+            ("PH.n1", new.as_str()),
+            ("PH.o2", old),
+            ("PH.n2", new.as_str()),
+        ] {
+            s.log
+                .append(&[Envelope {
+                    id: id.into(),
+                    ts: ts.into(),
+                    node: "n".into(),
+                    source: "test".into(),
+                    event_type: "t.x".into(),
+                    subject: "t.x".into(),
+                    correlation: None,
+                    payload: json!({}),
+                    ttl_class: None,
+                    hops: None,
+                }])
+                .unwrap();
+        }
+        s.matched_through = s.log.head_seq().unwrap();
+        s.register("on t.** then emit seen.hit since 24h", &[], None)
+            .unwrap();
+        s.drain();
+        let hits: Vec<_> = s
+            .log
+            .read(Pos::local(1), LOG_PAGE)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| e.subject == "seen.hit")
+            .collect();
+        assert_eq!(
+            hits.len(),
+            2,
+            "since must drop later old-ts events (got {})",
+            hits.len()
+        );
+    }
+
+    #[test]
+    fn listen_catchup_does_not_fill_live_queue() {
+        let paths = fresh_home("listen-bound");
+        let s = State::load(paths).unwrap();
+        for i in 0..40 {
+            s.log
+                .append(&[Envelope {
+                    id: format!("PH.{i}"),
+                    ts: now_ts(),
+                    node: "n".into(),
+                    source: "test".into(),
+                    event_type: "t.x".into(),
+                    subject: "t.x".into(),
+                    correlation: None,
+                    payload: json!({ "i": i }),
+                    ttl_class: None,
+                    hops: None,
+                }])
+                .unwrap();
+        }
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            att.catchup_from.is_some(),
+            "history is a catch-up cursor, not a queued dump"
+        );
+        assert!(
+            att.rx.try_recv().is_err(),
+            "live queue must be empty until the consumer pages catch-up"
+        );
+        assert!(
+            att.ack.get("replayed").is_none(),
+            "ack must not claim an evaluate() estimate as delivered"
+        );
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 40);
+    }
+
+    #[test]
+    fn after_u64_max_does_not_overflow() {
+        let paths = fresh_home("after-max");
+        let s = State::load(paths).unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(u64::MAX),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(att.catchup_from.is_none());
+        assert_eq!(att.ack.get("gapExpired"), None);
+    }
+
+    #[test]
+    fn catchup_fails_on_trim_not_omits_records() {
+        let paths = fresh_home("catchup-trim");
+        let s = State::load(paths).unwrap();
+        for i in 0..5 {
+            s.log
+                .append(&[Envelope {
+                    id: format!("PH.{i}"),
+                    ts: "2020-01-01T00:00:00Z".into(),
+                    node: "n".into(),
+                    source: "test".into(),
+                    event_type: "t.x".into(),
+                    subject: "t.x".into(),
+                    correlation: None,
+                    payload: json!({}),
+                    ttl_class: None,
+                    hops: None,
+                }])
+                .unwrap();
+        }
+        let through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        state
+            .lock()
+            .unwrap()
+            .log
+            .trim_before("2026-01-01T00:00:00Z")
+            .unwrap();
+        let err = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            through,
+            None,
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CatchupError::Trimmed { .. }), "{err}");
+    }
+
+    #[test]
+    fn catchup_fails_on_corrupt_row() {
+        let paths = fresh_home("catchup-corrupt");
+        let s = State::load(paths.clone()).unwrap();
+        s.log
+            .append(&[Envelope {
+                id: "PH.1".into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: "t.x".into(),
+                subject: "t.x".into(),
+                correlation: None,
+                payload: json!({}),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+        rusqlite::Connection::open(paths.home.join("pher.db"))
+            .unwrap()
+            .execute("UPDATE events SET envelope = 'nope' WHERE seq = 1", [])
+            .unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        );
+        match att {
+            Err(e) => assert!(e["error"].as_str().unwrap_or("").contains("corrupt")),
+            Ok(att) => {
+                let err = replay_listen_catchup(
+                    &state,
+                    &att.id,
+                    &att.log,
+                    att.catchup_from.unwrap_or(1),
+                    att.catchup_through.max(1),
+                    None,
+                    |_| true,
+                )
+                .unwrap_err();
+                assert!(matches!(err, CatchupError::Failed(_)), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn live_queue_overflow_removes_matcher_subscription() {
+        let paths = fresh_home("lag-sub");
+        let s = State::load(paths).unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att =
+            attach_listener(&state, "on t.** then stream", &[], "test", None, None, None).unwrap();
+        let id = att.id.clone();
+        for i in 0..(LIVE_QUEUE as u64 + 5) {
+            let mut s = state.lock().unwrap();
+            s.ingest(
+                PartialEvent {
+                    subject: "t.x".into(),
+                    payload: Some(json!({ "i": i })),
+                    event_type: None,
+                    source: Some("test".into()),
+                    correlation: None,
+                },
+                0,
+            )
+            .unwrap();
+            s.drain();
+        }
+        assert!(
+            state.lock().unwrap().matcher.get(&id).is_none(),
+            "lag must remove the matcher subscription, not only the channel"
+        );
+    }
+
+    #[test]
+    fn catchup_spans_pages_and_live_arrivals_use_the_bounded_queue() {
+        let paths = fresh_home("pages-live");
+        let mut s = State::load(paths).unwrap();
+        for i in 0..(LOG_PAGE as u64 + 20) {
+            s.log
+                .append(&[Envelope {
+                    id: format!("PH.{i}"),
+                    ts: now_ts(),
+                    node: "n".into(),
+                    source: "test".into(),
+                    event_type: "t.x".into(),
+                    subject: "t.x".into(),
+                    correlation: None,
+                    payload: json!({ "i": i }),
+                    ttl_class: None,
+                    hops: None,
+                }])
+                .unwrap();
+        }
+        let historical = s.log.head_seq().unwrap();
+        s.matched_through = historical;
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut n = 0u64;
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| {
+                n += 1;
+                if n == 1 {
+                    let mut s = state.lock().unwrap();
+                    s.ingest(
+                        PartialEvent {
+                            subject: "t.x".into(),
+                            payload: Some(json!({ "live": true })),
+                            event_type: None,
+                            source: Some("test".into()),
+                            correlation: None,
+                        },
+                        0,
+                    )
+                    .unwrap();
+                    s.drain();
+                }
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(n, historical);
+        assert!(
+            att.rx.try_recv().is_ok(),
+            "live arrival during catch-up goes on the bounded queue, not the catch-up page"
+        );
+    }
+
+    #[test]
+    fn listen_limit_applies_in_seq_order_when_live_arrives_before_catchup() {
+        let paths = fresh_home("limit-order");
+        let mut s = State::load(paths).unwrap();
+        plant(&s, "PH.h1");
+        plant(&s, "PH.h2");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream limit 1",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.ingest(
+                PartialEvent {
+                    subject: "t.x".into(),
+                    payload: Some(json!({ "live": true })),
+                    event_type: None,
+                    source: Some("test".into()),
+                    correlation: None,
+                },
+                0,
+            )
+            .unwrap();
+            s.drain();
+        }
+        let mut catchup = Vec::new();
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |line| {
+                catchup.push(line_event_id(line));
+                true
+            },
+        )
+        .unwrap();
+        let live = drain_rx(&att.rx);
+        let delivered = state.lock().unwrap().db.delivery_event_ids();
+        assert_eq!(n, 1, "one-shot must fire on the first historical match");
+        assert_eq!(catchup, vec!["PH.h1".to_string()]);
+        assert!(
+            live.is_empty(),
+            "live match must not consume the limit before history: {live:?}"
+        );
+        assert_eq!(delivered, vec!["PH.h1".to_string()]);
+        assert!(
+            state.lock().unwrap().matcher.get(&att.id).is_none(),
+            "limit 1 retires the matcher after the historical delivery"
+        );
+    }
+
+    #[test]
+    fn listen_held_live_applies_after_history_when_limit_allows() {
+        let paths = fresh_home("limit-held");
+        let mut s = State::load(paths).unwrap();
+        plant(&s, "PH.h1");
+        plant(&s, "PH.h2");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream limit 3",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        let live_id = {
+            let mut s = state.lock().unwrap();
+            let ack = s
+                .ingest(
+                    PartialEvent {
+                        subject: "t.x".into(),
+                        payload: Some(json!({ "live": true })),
+                        event_type: None,
+                        source: Some("test".into()),
+                        correlation: None,
+                    },
+                    0,
+                )
+                .unwrap();
+            s.drain();
+            ack["id"].as_str().unwrap().to_string()
+        };
+        let mut catchup = Vec::new();
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |line| {
+                catchup.push(line_event_id(line));
+                true
+            },
+        )
+        .unwrap();
+        let live = drain_rx(&att.rx);
+        let delivered = state.lock().unwrap().db.delivery_event_ids();
+        assert_eq!(catchup, vec!["PH.h1".to_string(), "PH.h2".to_string()]);
+        assert_eq!(live, vec![live_id.clone()]);
+        assert_eq!(
+            delivered,
+            vec!["PH.h1".to_string(), "PH.h2".to_string(), live_id]
+        );
+        assert!(
+            state.lock().unwrap().matcher.get(&att.id).is_none(),
+            "limit 3 retires after history then the held live match"
+        );
+    }
+
+    #[test]
+    fn listen_follower_backlog_does_not_double_deliver_catchup_range() {
+        let paths = fresh_home("follow-dup");
+        let s = State::load(paths).unwrap();
+        plant(&s, "PH.h1");
+        plant(&s, "PH.h2");
+        assert_eq!(s.matched_through, 0, "follower has not processed history");
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(
+            &state,
+            "on t.** then stream",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.drain();
+        }
+        assert!(
+            drain_rx(&att.rx).is_empty(),
+            "follower must not deliver seq <= captured through"
+        );
+        let mut catchup = Vec::new();
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |line| {
+                catchup.push(line_event_id(line));
+                true
+            },
+        )
+        .unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.drain();
+        }
+        let live = drain_rx(&att.rx);
+        let delivered = state.lock().unwrap().db.delivery_event_ids();
+        assert_eq!(catchup, vec!["PH.h1".to_string(), "PH.h2".to_string()]);
+        assert!(
+            live.is_empty(),
+            "follower must not replay catch-up seqs after release: {live:?}"
+        );
+        assert_eq!(delivered, vec!["PH.h1".to_string(), "PH.h2".to_string()]);
+
+        let live_id = {
+            let mut s = state.lock().unwrap();
+            let ack = s
+                .ingest(
+                    PartialEvent {
+                        subject: "t.x".into(),
+                        payload: Some(json!({ "after": true })),
+                        event_type: None,
+                        source: Some("test".into()),
+                        correlation: None,
+                    },
+                    0,
+                )
+                .unwrap();
+            s.drain();
+            ack["id"].as_str().unwrap().to_string()
+        };
+        assert_eq!(drain_rx(&att.rx), vec![live_id.clone()]);
+        assert_eq!(
+            state.lock().unwrap().db.delivery_event_ids(),
+            vec!["PH.h1".to_string(), "PH.h2".to_string(), live_id]
+        );
+    }
+
+    #[test]
+    fn listen_held_origin_arms_expect_timer_not_deliver() {
+        let paths = fresh_home("expect-arm");
+        let mut s = State::load(paths).unwrap();
+        s.matched_through = s.log.head_seq().unwrap_or(0);
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        let origin_id = {
+            let mut s = state.lock().unwrap();
+            let id = ingest_job(&mut s, "job.started", "batch-7");
+            s.drain();
+            id
+        };
+        assert!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty(),
+            "origin must wait in the hold, not arm before catch-up"
+        );
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 0, "expect origin is not an immediate delivery");
+        assert!(drain_rx(&att.rx).is_empty());
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec![origin_id.clone()]
+        );
+        {
+            let mut s = state.lock().unwrap();
+            s.timers[0].deadline = 0;
+            s.fire_expired_timers();
+        }
+        assert_eq!(
+            state.lock().unwrap().db.delivery_event_ids(),
+            vec![origin_id]
+        );
+    }
+
+    #[test]
+    fn listen_held_completion_disarms_held_origin() {
+        let paths = fresh_home("expect-disarm");
+        let mut s = State::load(paths).unwrap();
+        s.matched_through = s.log.head_seq().unwrap_or(0);
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            ingest_job(&mut s, "job.started", "batch-8");
+            s.drain();
+            ingest_job(&mut s, "job.finished", "batch-8");
+            s.drain();
+        }
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty(),
+            "completion must disarm the held origin in seq order"
+        );
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+        assert!(drain_rx(&att.rx).is_empty());
+        {
+            let mut s = state.lock().unwrap();
+            s.fire_expired_timers();
+        }
+        assert!(
+            state.lock().unwrap().db.delivery_event_ids().is_empty(),
+            "disarmed expect must not fire"
+        );
+    }
+
+    #[test]
+    fn listen_catchup_expect_origin_and_completion_no_delivery() {
+        let paths = fresh_home("expect-hist");
+        let mut s = State::load(paths).unwrap();
+        plant_job(&s, "PH.start", "job.started", "batch-9");
+        plant_job(&s, "PH.done", "job.finished", "batch-9");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert!(timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty());
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+    }
+
+    #[test]
+    fn listen_catchup_expect_origin_arms_timer() {
+        let paths = fresh_home("expect-hist-arm");
+        let mut s = State::load(paths).unwrap();
+        plant_job(&s, "PH.start", "job.started", "batch-10");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()]
+        );
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+    }
+
+    #[test]
+    fn listen_catchup_fails_closed_when_expect_timer_persist_fails() {
+        let paths = fresh_home("expect-persist");
+        let mut s = State::load(paths).unwrap();
+        plant_job(&s, "PH.start", "job.started", "batch-11");
+        s.matched_through = s.log.head_seq().unwrap();
+        s.fail_persist_timers = true;
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        let err = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, CatchupError::Failed(e) if e.contains("injected persist_timers")),
+            "{err}"
+        );
+        assert!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id).is_empty(),
+            "failed persist must not leave an undurable timer"
+        );
+        assert!(state.lock().unwrap().db.delivery_event_ids().is_empty());
+        assert!(
+            state.lock().unwrap().matcher.get(&att.id).is_some(),
+            "replay error is fail-closed; caller detaches"
+        );
+        state.lock().unwrap().fail_persist_timers = false;
+        let n = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()]
+        );
+        assert_eq!(
+            persisted_timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()]
+        );
+        let n2 = replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n2, 0);
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()],
+            "same-origin catch-up replay must not duplicate the timer"
+        );
+    }
+
+    #[test]
+    fn follower_does_not_advance_matched_through_on_timer_persist_failure() {
+        let paths = fresh_home("follow-persist");
+        let s = State::load(paths).unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let (prior, origin_id) = {
+            let mut s = state.lock().unwrap();
+            s.drain();
+            let prior = s.matched_through;
+            s.fail_persist_timers = true;
+            let origin_id = ingest_job(&mut s, "job.started", "batch-12");
+            s.drain();
+            (prior, origin_id)
+        };
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.matched_through, prior,
+                "failed persist must not consume the origin seq"
+            );
+            assert!(
+                timer_origin_ids(&s, &att.id).is_empty(),
+                "failed arm persist must roll back the in-memory timer"
+            );
+            assert!(
+                persisted_timer_origin_ids(&s, &att.id).is_empty(),
+                "failed arm persist must not leave the origin on disk"
+            );
+        }
+        {
+            let mut s = state.lock().unwrap();
+            s.drain();
+            assert!(
+                timer_origin_ids(&s, &att.id).is_empty(),
+                "retry while persist still failing must not accumulate timers"
+            );
+            s.fail_persist_timers = false;
+            s.drain();
+            s.drain();
+        }
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                timer_origin_ids(&s, &att.id),
+                vec![origin_id.clone()],
+                "same-origin follower retry must arm exactly once"
+            );
+            assert_eq!(persisted_timer_origin_ids(&s, &att.id), vec![origin_id]);
+            assert!(
+                s.matched_through > prior,
+                "retry after durable persist must advance past the origin"
+            );
+        }
+    }
+
+    #[test]
+    fn follower_disarm_persist_failure_restores_timer() {
+        let paths = fresh_home("disarm-persist");
+        let mut s = State::load(paths).unwrap();
+        plant_job(&s, "PH.start", "job.started", "batch-13");
+        s.matched_through = s.log.head_seq().unwrap();
+        let state = Arc::new(Mutex::new(s));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", Some(0), None, None).unwrap();
+        replay_listen_catchup(
+            &state,
+            &att.id,
+            &att.log,
+            att.catchup_from.unwrap(),
+            att.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            timer_origin_ids(&state.lock().unwrap(), &att.id),
+            vec!["PH.start".to_string()]
+        );
+        let prior = {
+            let mut s = state.lock().unwrap();
+            s.drain();
+            let prior = s.matched_through;
+            s.fail_persist_timers = true;
+            ingest_job(&mut s, "job.finished", "batch-13");
+            s.drain();
+            prior
+        };
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                timer_origin_ids(&s, &att.id),
+                vec!["PH.start".to_string()],
+                "failed disarm persist must keep the timer in memory"
+            );
+            assert_eq!(
+                persisted_timer_origin_ids(&s, &att.id),
+                vec!["PH.start".to_string()],
+                "failed disarm persist must leave the timer on disk"
+            );
+            assert_eq!(s.matched_through, prior);
+        }
+        {
+            let mut s = state.lock().unwrap();
+            s.drain();
+            assert_eq!(
+                timer_origin_ids(&s, &att.id),
+                vec!["PH.start".to_string()],
+                "retry while persist still failing must not drop the disk timer from memory"
+            );
+            s.fail_persist_timers = false;
+            s.drain();
+        }
+        {
+            let s = state.lock().unwrap();
+            assert!(timer_origin_ids(&s, &att.id).is_empty());
+            assert!(persisted_timer_origin_ids(&s, &att.id).is_empty());
+        }
+    }
+
+    #[test]
+    fn review_failed_timer_arm_does_not_advance_follower() {
+        let paths = fresh_home("review-arm-cursor");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        let before = s.matched_through;
+        ingest_job(&mut s, "job.started", "review-arm");
+        s.fail_persist_timers = true;
+        s.follow_step(256);
+        assert_eq!(
+            s.matched_through, before,
+            "failed durable timer must not consume replay position"
+        );
+        assert!(timer_origin_ids(&s, &att.id).is_empty());
+    }
+
+    #[test]
+    fn review_failed_disarm_retry_clears_durable_timer() {
+        let paths = fresh_home("review-disarm");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let att = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        ingest_job(&mut s, "job.started", "review-disarm");
+        s.drain();
+        assert_eq!(timer_origin_ids(&s, &att.id).len(), 1);
+        ingest_job(&mut s, "job.finished", "review-disarm");
+        let head = s.log.head_seq().unwrap();
+        let completion = s.log.read(Pos::local(head), 1).unwrap().pop().unwrap().1;
+        s.fail_persist_timers = true;
+        assert!(s.disarm_listener_timers(&att.id, &completion).is_err());
+        assert_eq!(
+            timer_origin_ids(&s, &att.id).len(),
+            1,
+            "failed disarm persist must restore the in-memory timer"
+        );
+        s.fail_persist_timers = false;
+        s.disarm_listener_timers(&att.id, &completion).unwrap();
+        let persisted: Vec<Timer> =
+            serde_json::from_slice(&std::fs::read(s.paths.timers()).unwrap()).unwrap();
+        assert!(
+            persisted.is_empty(),
+            "successful retry left the cancelled timer on disk"
+        );
+        assert!(timer_origin_ids(&s, &att.id).is_empty());
+    }
+
+    #[test]
+    fn review_retired_listener_drops_applied_progress() {
+        let paths = fresh_home("review-retired-progress");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let att = attach_listener(
+            &state,
+            "on job.started then stream limit 1",
+            &[],
+            "test",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        ingest_job(&mut s, "job.started", "review-retired");
+        s.follow_step(256);
+        assert_eq!(drain_rx(&att.rx).len(), 1);
+        assert!(s.matcher.get(&att.id).is_none());
+        assert!(
+            !s.applied_seqs.contains_key(&att.id),
+            "retired listener leaked its applied progress entry"
+        );
+    }
+
+    #[test]
+    fn review_timer_retry_does_not_repeat_successful_listener() {
+        let paths = fresh_home("review-partial-cascade");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let plain = attach_listener(
+            &state,
+            "on job.started then stream limit 2",
+            &[],
+            "test",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let expect = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        let before = s.matched_through;
+        ingest_job(&mut s, "job.started", "review-partial");
+        let head = s.log.head_seq().unwrap();
+        let origin = s.log.read(Pos::local(head), 1).unwrap().pop().unwrap().1;
+        let order = s.matcher.match_ids(&origin);
+        assert_eq!(
+            order,
+            vec![plain.id.as_str(), expect.id.as_str()],
+            "fixture must deliver before failed timer arm"
+        );
+        s.fail_persist_timers = true;
+        s.follow_step(256);
+        assert_eq!(s.matched_through, before);
+        assert_eq!(drain_rx(&plain.rx), vec![origin.id.clone()]);
+        s.fail_persist_timers = false;
+        s.follow_step(256);
+        assert_eq!(timer_origin_ids(&s, &expect.id).len(), 1);
+        assert!(
+            drain_rx(&plain.rx).is_empty(),
+            "retry repeated delivery to an already successful listener"
+        );
+        assert!(
+            s.matcher.get(&plain.id).is_some(),
+            "retry consumed the listener limit twice"
+        );
+    }
+
+    #[test]
+    fn review_timer_retry_does_not_repeat_successful_expect_arm() {
+        let paths = fresh_home("review-partial-expect");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let first = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let second = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        let before = s.matched_through;
+        ingest_job(&mut s, "job.started", "review-two-expect");
+        let head = s.log.head_seq().unwrap();
+        let origin = s.log.read(Pos::local(head), 1).unwrap().pop().unwrap().1;
+        let order = s.matcher.match_ids(&origin);
+        assert_eq!(
+            order,
+            vec![first.id.as_str(), second.id.as_str()],
+            "fixture must arm the first expect before the later persist failure"
+        );
+        s.fail_persist_on_nth = Some(2);
+        s.follow_step(256);
+        assert_eq!(s.matched_through, before);
+        assert_eq!(timer_origin_ids(&s, &first.id).len(), 1);
+        assert!(
+            timer_origin_ids(&s, &second.id).is_empty(),
+            "later expect persist must fail after the first arm"
+        );
+        assert_eq!(persisted_timer_origin_ids(&s, &first.id).len(), 1);
+        s.fail_persist_on_nth = None;
+        s.follow_step(256);
+        assert_eq!(
+            timer_origin_ids(&s, &first.id).len(),
+            1,
+            "retry duplicated a timer that already armed"
+        );
+        assert_eq!(timer_origin_ids(&s, &second.id).len(), 1);
+        assert_eq!(s.matched_through, head);
+    }
+
+    #[test]
+    fn review_timer_retry_does_not_duplicate_held_live() {
+        let paths = fresh_home("review-held-retry");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let held = attach_listener(
+            &state,
+            "on job.started then stream limit 2",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        let expect = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let mut s = state.lock().unwrap();
+        s.matched_through = s.log.head_seq().unwrap();
+        let before = s.matched_through;
+        let origin = ingest_job(&mut s, "job.started", "review-held");
+        s.fail_persist_timers = true;
+        s.follow_step(256);
+        assert_eq!(s.matched_through, before);
+        s.fail_persist_timers = false;
+        s.follow_step(256);
+        assert_eq!(timer_origin_ids(&s, &expect.id).len(), 1);
+        s.release_listen_catchup(&held.id).unwrap();
+        assert_eq!(
+            drain_rx(&held.rx),
+            vec![origin],
+            "retry queued duplicate live events during catch-up"
+        );
+        assert!(
+            s.matcher.get(&held.id).is_some(),
+            "duplicate held event consumed limit twice"
+        );
+    }
+
+    #[test]
+    fn review_timer_retry_does_not_repeat_released_held_live() {
+        let paths = fresh_home("review-held-release-retry");
+        let state = Arc::new(Mutex::new(State::load(paths).unwrap()));
+        let held = attach_listener(
+            &state,
+            "on job.started then stream limit 2",
+            &[],
+            "test",
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+        let expect = attach_listener(&state, LISTEN_EXPECT, &[], "test", None, None, None).unwrap();
+        let origin = {
+            let mut s = state.lock().unwrap();
+            s.matched_through = s.log.head_seq().unwrap();
+            let before = s.matched_through;
+            let origin = ingest_job(&mut s, "job.started", "review-held-rel");
+            s.fail_persist_timers = true;
+            s.follow_step(256);
+            assert_eq!(s.matched_through, before);
+            origin
+        };
+        replay_listen_catchup(
+            &state,
+            &held.id,
+            &held.log,
+            held.catchup_from.unwrap(),
+            held.catchup_through,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(drain_rx(&held.rx), vec![origin.clone()]);
+        {
+            let mut s = state.lock().unwrap();
+            s.fail_persist_timers = false;
+            s.follow_step(256);
+            assert_eq!(timer_origin_ids(&s, &expect.id).len(), 1);
+            assert!(
+                drain_rx(&held.rx).is_empty(),
+                "retry re-delivered after catch-up already released the hold"
+            );
+            assert!(
+                s.matcher.get(&held.id).is_some(),
+                "retry consumed the released listener limit twice"
+            );
+        }
+    }
+
+    #[test]
+    fn since_replay_fails_closed_on_corrupt_and_drops_sub() {
+        let paths = fresh_home("since-corrupt");
+        let mut s = State::load(paths.clone()).unwrap();
+        s.log
+            .append(&[Envelope {
+                id: "PH.1".into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: "t.x".into(),
+                subject: "t.x".into(),
+                correlation: None,
+                payload: json!({}),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+        rusqlite::Connection::open(paths.home.join("pher.db"))
+            .unwrap()
+            .execute("UPDATE events SET envelope = 'nope' WHERE seq = 1", [])
+            .unwrap();
+        s.matched_through = s.log.head_seq().unwrap_or(1);
+        let err = s
+            .register("on t.** then emit seen.hit since 24h", &[], None)
+            .unwrap_err();
+        assert!(err.contains("corrupt"), "{err}");
+        assert!(
+            s.matcher.ids().is_empty(),
+            "failed since replay must not leave the subscription"
+        );
+    }
+
+    #[test]
+    fn tail_backlog_fails_closed_on_corrupt() {
+        let paths = fresh_home("tail-corrupt");
+        let s = State::load(paths.clone()).unwrap();
+        s.log
+            .append(&[Envelope {
+                id: "PH.1".into(),
+                ts: now_ts(),
+                node: "n".into(),
+                source: "test".into(),
+                event_type: "t.x".into(),
+                subject: "t.x".into(),
+                correlation: None,
+                payload: json!({}),
+                ttl_class: None,
+                hops: None,
+            }])
+            .unwrap();
+        rusqlite::Connection::open(paths.home.join("pher.db"))
+            .unwrap()
+            .execute("UPDATE events SET envelope = 'nope' WHERE seq = 1", [])
+            .unwrap();
+        let err = page_tail_backlog(&s.log, None, None, None, 1, |_, _| true).unwrap_err();
+        assert!(matches!(err, TrailError::Corrupt { .. }), "{err}");
     }
 }

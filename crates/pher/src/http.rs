@@ -134,7 +134,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             let after = v.get("after").and_then(|a| a.as_u64());
             let subject = v.get("subject").and_then(|s| s.as_str()).map(String::from);
             let last = v.get("last").and_then(|l| l.as_u64()).map(|l| l as usize);
-            let (backlog, rx, _) =
+            let attached =
                 match crate::daemon::attach_tail(&state, after, subject, last.or(Some(100))) {
                     Ok(t) => t,
                     Err(e) => return respond(request, 400, e),
@@ -145,19 +145,35 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                 return;
             }
             let mut last_sent = after.unwrap_or(0);
-            for (seq, event) in backlog {
-                if write_chunk(
-                    &mut writer,
-                    &format!("{}\n", json!({"seq": seq, "event": event})),
-                )
-                .is_err()
-                {
-                    return;
-                }
-                last_sent = seq;
+            let mut write_ok = true;
+            if let Err(e) = crate::daemon::page_tail_backlog(
+                &attached.log,
+                attached.after,
+                attached.last,
+                attached.pattern.as_ref(),
+                attached.through,
+                |seq, event| {
+                    if write_chunk(
+                        &mut writer,
+                        &format!("{}\n", json!({"seq": seq, "event": event})),
+                    )
+                    .is_err()
+                    {
+                        write_ok = false;
+                        return false;
+                    }
+                    last_sent = seq;
+                    true
+                },
+            ) {
+                let _ = write_chunk(&mut writer, &format!("{}\n", crate::protocol::err(&e)));
+                return;
+            }
+            if !write_ok {
+                return;
             }
             loop {
-                match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                match attached.rx.recv_timeout(std::time::Duration::from_secs(5)) {
                     Ok(line) => {
                         let seq = serde_json::from_str::<Value>(&line)
                             .ok()
@@ -283,12 +299,15 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                 .to_string();
             let after = v.get("after").and_then(|a| a.as_u64());
             let cursor = v.get("cursor").and_then(|c| c.as_str());
-            let (sub_id, ack, rx) = match crate::daemon::attach_listener(
+            let attached = match crate::daemon::attach_listener(
                 &state, string, &options, &client, after, cursor, filter,
             ) {
                 Ok(attached) => attached,
                 Err(e) => return respond(request, 400, e),
             };
+            let sub_id = attached.id.clone();
+            let ack = attached.ack.clone();
+            let rx = attached.rx;
             // Hand-rolled response: tiny_http's Response path buffers twice
             // (1KiB BufWriter + the chunked encoder's 8KiB chunk buffer), so
             // nothing would reach the client until the stream ENDS. Writing
@@ -303,12 +322,56 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                 if write_chunk(&mut writer, &format!("{ack}\n")).is_err() {
                     return "listener disconnected";
                 }
+                let mut last_sent = 0u64;
+                if let Some(from) = attached.catchup_from {
+                    let mut write_ok = true;
+                    match crate::daemon::replay_listen_catchup(
+                        &state,
+                        &sub_id,
+                        &attached.log,
+                        from,
+                        attached.catchup_through,
+                        attached.ts_cutoff.as_deref(),
+                        |line| {
+                            let seq = serde_json::from_str::<Value>(line)
+                                .ok()
+                                .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
+                                .unwrap_or(0);
+                            if write_chunk(&mut writer, &format!("{line}\n")).is_err() {
+                                write_ok = false;
+                                return false;
+                            }
+                            last_sent = last_sent.max(seq);
+                            true
+                        },
+                    ) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = write_chunk(
+                                &mut writer,
+                                &format!("{}\n", crate::protocol::err(&e)),
+                            );
+                            return "catch-up failed";
+                        }
+                    }
+                    if !write_ok {
+                        return "listener disconnected";
+                    }
+                }
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
                         Ok(line) => {
+                            let seq = serde_json::from_str::<Value>(&line)
+                                .ok()
+                                .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
+                                .unwrap_or(u64::MAX);
+                            if seq <= last_sent {
+                                continue;
+                            }
                             if write_chunk(&mut writer, &format!("{line}\n")).is_err() {
                                 return "listener disconnected";
                             }
+                            last_sent = seq;
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             // Heartbeat: detects a vanished client within one
