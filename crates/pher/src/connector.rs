@@ -16,7 +16,7 @@
 //! env:VAR / cmd:...) — secret managers (hem, 1Password, pass) are addons
 //! via cmd:, never a dependency.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -203,7 +203,8 @@ pub struct ConnectorDef {
 pub struct PollState {
     #[serde(default)]
     pub watermark: String,
-    /// Recently seen vendor ids (covers watermark ties and wm-less polls).
+    /// Recently seen (vendor id, watermark value) pairs; bare vendor ids
+    /// for polls without a watermark. Covers watermark ties and wm-less polls.
     #[serde(default)]
     pub recent: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -283,6 +284,21 @@ fn wm_newer(candidate: &str, stored: &str) -> bool {
     }
 }
 
+fn record_version(record: &Value, spec: &PollSpec) -> String {
+    spec.watermark
+        .as_deref()
+        .and_then(|f| field_str(record, f))
+        .unwrap_or_default()
+}
+
+fn seen_key(vendor_id: &str, version: &str) -> String {
+    if version.is_empty() {
+        vendor_id.to_string()
+    } else {
+        format!("{vendor_id}\u{1f}{version}")
+    }
+}
+
 /// Pure poll-cycle core: which records are NEW given the state, and the
 /// updated state. Records are processed oldest-first regardless of API
 /// order, so watermark advancement is monotonic.
@@ -292,43 +308,43 @@ pub fn filter_new(
     state: &PollState,
 ) -> (Vec<Value>, PollState) {
     let mut new_state = state.clone();
-    let mut fresh: Vec<(String, Value)> = Vec::new();
+    let mut fresh: Vec<(String, String, Value)> = Vec::new();
+    let mut batch: HashSet<String> = HashSet::new();
     for r in records {
         let Some(id) = field_str(r, &spec.id) else {
             continue; // no id, no dedup, no admission
         };
-        if state.recent.contains(&id) {
+        let version = record_version(r, spec);
+        let key = seen_key(&id, &version);
+        let legacy_tie = version == state.watermark && state.recent.contains(&id);
+        if legacy_tie || state.recent.contains(&key) || batch.contains(&key) {
             continue;
         }
-        if let Some(wm_field) = &spec.watermark {
-            let wm = field_str(r, wm_field).unwrap_or_default();
+        if spec.watermark.is_some() {
             // Admit strictly-newer, AND watermark ties (two events in the
             // same second) — the recent-ids window dedups tie repeats.
             let admissible = state.watermark.is_empty()
-                || wm_newer(&wm, &state.watermark)
-                || wm == state.watermark;
+                || wm_newer(&version, &state.watermark)
+                || version == state.watermark;
             if !admissible {
                 continue;
             }
-            fresh.push((wm, r.clone()));
-        } else {
-            fresh.push((String::new(), r.clone()));
         }
+        batch.insert(key.clone());
+        fresh.push((version, key, r.clone()));
     }
     fresh.sort_by(|a, b| a.0.cmp(&b.0)); // oldest first
-    for (wm, r) in &fresh {
+    for (wm, key, _) in &fresh {
         if wm_newer(wm, &new_state.watermark) {
             new_state.watermark = wm.clone();
         }
-        if let Some(id) = field_str(r, &spec.id) {
-            new_state.recent.push(id);
-        }
+        new_state.recent.push(key.clone());
     }
     let excess = new_state.recent.len().saturating_sub(RECENT_IDS);
     if excess > 0 {
         new_state.recent.drain(..excess);
     }
-    (fresh.into_iter().map(|(_, r)| r).collect(), new_state)
+    (fresh.into_iter().map(|(_, _, r)| r).collect(), new_state)
 }
 
 // -- the engine ---------------------------------------------------------------
@@ -449,11 +465,7 @@ fn poll_once(
             );
             continue;
         }
-        let version = spec
-            .watermark
-            .as_deref()
-            .and_then(|f| field_str(record, f))
-            .unwrap_or_default();
+        let version = record_version(record, spec);
         let event = PartialEvent {
             event_type: Some(subject.clone()),
             subject,
@@ -655,7 +667,9 @@ fn is_known(record: &Value, spec: &PollSpec, stored: &PollState) -> bool {
                 && wm != stored.watermark
                 && !wm_newer(&wm, &stored.watermark)
         }
-        None => field_str(record, &spec.id).is_some_and(|id| stored.recent.contains(&id)),
+        None => {
+            field_str(record, &spec.id).is_some_and(|id| stored.recent.contains(&seen_key(&id, "")))
+        }
     }
 }
 
@@ -951,6 +965,21 @@ mod tests {
         assert_eq!(fresh.len(), 1, "same-second events must not be lost");
         let (fresh, _st) = filter_new(&tie, &s, &st);
         assert!(fresh.is_empty(), "recent-ids window dedups the tie repeat");
+    }
+
+    #[test]
+    fn reoccurrence_with_newer_watermark_is_admitted() {
+        let s = spec();
+        let seen = [rec("7", "2026-08-12T10:00:00Z", "error")];
+        let (_, st) = filter_new(&seen, &s, &PollState::default());
+
+        let regressed = [rec("7", "2026-08-12T12:00:00Z", "error")];
+        let (fresh, st) = filter_new(&regressed, &s, &st);
+        assert_eq!(fresh.len(), 1, "a regressed issue must not be dropped");
+        assert_eq!(st.watermark, "2026-08-12T12:00:00Z");
+
+        let (fresh, _) = filter_new(&regressed, &s, &st);
+        assert!(fresh.is_empty(), "the same version is still a duplicate");
     }
 
     #[test]

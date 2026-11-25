@@ -2,7 +2,7 @@
 #   pher connect add sentry --token env:SENTRY_TOKEN --param org=<slug>
 # Token: an auth token with org:read + project:read (Settings → Auth Tokens).
 name = "sentry"
-description = "Sentry issues (new/regressed errors) as sentry.issue.<level> events"
+description = "Sentry issue activity (new, regressed or recurring errors; one event per lastSeen advance) as sentry.issue.<level> events"
 docs = "https://docs.sentry.io/api/"
 
 [auth]
