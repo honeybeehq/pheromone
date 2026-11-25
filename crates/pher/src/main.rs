@@ -356,7 +356,7 @@ enum ConditionCmd {
 enum TapCmd {
     /// Follow the Honeybee v2 ledger (`hive events`) and emit `hive.<kind>` events
     Hive {
-        /// Backlog lookback for the first attach (e.g. 15m, at most the last 1000 ledger rows); default: live only
+        /// Backlog lookback when there is no saved cursor (e.g. 15m, at most the last 1000 ledger rows); default: live only
         #[arg(long, default_value = "1s")]
         since: String,
         /// Ledger kind prefixes to drop at the tap edge (repeatable),

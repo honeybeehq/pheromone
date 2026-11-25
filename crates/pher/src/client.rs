@@ -7,6 +7,17 @@ use serde_json::Value;
 use crate::protocol::Request;
 use crate::store::Paths;
 
+#[derive(Debug)]
+pub struct Rejected(pub String);
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
 /// Where a CLI command is directed: the local daemon's unix socket, or a
 /// remote daemon's HTTP /rpc (cross-node).
 pub enum Target {
@@ -83,7 +94,12 @@ pub fn call_target(target: &Target, request: &Request) -> anyhow::Result<Value> 
                                     v.get("error").and_then(|x| x.as_str()).map(String::from)
                                 })
                                 .unwrap_or(text);
-                            anyhow::anyhow!("remote node refused ({code}): {msg}")
+                            let refused = format!("remote node refused ({code}): {msg}");
+                            if (400..500).contains(&code) && ![401, 408, 429].contains(&code) {
+                                anyhow::Error::new(Rejected(refused))
+                            } else {
+                                anyhow::anyhow!(refused)
+                            }
                         }
                         other => anyhow::anyhow!("remote node unreachable at {url}: {other}"),
                     })?;

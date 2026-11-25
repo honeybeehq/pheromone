@@ -9,6 +9,10 @@ pub enum Request {
     Emit {
         event: PartialEvent,
     },
+    EmitOnce {
+        key: String,
+        event: PartialEvent,
+    },
     When {
         string: String,
         #[serde(default)]

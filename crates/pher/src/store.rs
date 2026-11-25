@@ -83,6 +83,14 @@ impl Paths {
         self.home.join("forwarded_seen.jsonl")
     }
 
+    pub fn hive_tap_cursor(&self, target: &str) -> PathBuf {
+        let name: String = target
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        self.home.join(format!("tap_hive_cursor.{name}.json"))
+    }
+
     pub fn bridges(&self) -> PathBuf {
         self.home.join("bridges.json")
     }

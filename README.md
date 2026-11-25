@@ -87,12 +87,14 @@ What works today:
 - **Hive ledger tap** (`pher tap hive`) — the flagship: follows
   the Honeybee v2 ledger (`hive events --follow --json`) and puts every row on
   the trail as `hive.<kind>` (`hive.bee.created`, `hive.question.asked`, …),
-  correlated by `beeId`. While the tap runs it tracks the last ledger `seq`, so
-  a hive or pherd outage delays rows instead of duplicating or dropping them;
-  rows `hive events` could not deliver (more than 1000 at once) are reported as
-  one `pher.tap.gap` event. Restarting the tap itself starts again from
-  `--since`. The ledger stream with zero programmatic subscribers has its
-  subscriber.
+  correlated by `beeId`. The tap saves its ledger cursor in
+  `$PHEROMONE_HOME/tap_hive_cursor.<target>.json` and resumes from it after a
+  hive, pherd or tap restart (`--since` only applies when there is no cursor).
+  Each row is emitted with a `(ledger, seq, ts)` dedup key, so re-sent rows are
+  no-ops. Rows `hive events` can no longer return (more than 1000 behind) are
+  reported as a `pher.tap.gap` event with the missed seq range, and a row the
+  trail refuses (e.g. over the 1 MiB remote body limit) as `pher.tap.rejected`.
+  The ledger stream with zero programmatic subscribers has its subscriber.
 - **Code-based subscribers** — `then stream` + the `@pheromone/client` Node SDK
   (`sdk/node`): `pher.on('on ci.* where …', handler)` registers a
   connection-scoped subscription; the daemon evaluates the full cascade and

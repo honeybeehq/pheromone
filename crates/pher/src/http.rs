@@ -233,7 +233,7 @@ fn handle(
                     // Grants speak (filtered emit) and track their position;
                     // operating the trail needs the admin token.
                     match &rpc {
-                        Request::Emit { event } => {
+                        Request::Emit { event } | Request::EmitOnce { event, .. } => {
                             if let Err(e) = state.lock().unwrap().check_grant_emit(name, event) {
                                 return respond(request, 403, json!({"ok": false, "error": e}));
                             }

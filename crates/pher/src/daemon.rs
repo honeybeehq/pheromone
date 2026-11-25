@@ -1066,6 +1066,26 @@ impl State {
         emitted
     }
 
+    pub(crate) fn ingest_once(
+        &mut self,
+        key: String,
+        partial: PartialEvent,
+    ) -> Result<Value, String> {
+        let key = format!("once|{key}");
+        if self.forwarded_seen.contains(&key) {
+            return Ok(ok(json!({ "deduped": true })));
+        }
+        let admitted = self.ingest(partial, 0)?;
+        self.forwarded_seen.push_back(key.clone());
+        while self.forwarded_seen.len() > MAX_FORWARDED_SEEN {
+            self.forwarded_seen.pop_front();
+        }
+        self.db
+            .forwarded_insert(&key)
+            .map_err(|e| format!("event admitted but its dedup key was not saved: {e}"))?;
+        Ok(admitted)
+    }
+
     /// Ingest a delivery forwarded from another node (filter-at-source:
     /// the remote ran the cascade; only the match crossed the wire).
     /// Preserves the origin envelope (id/ts/node/correlation), dedups by
@@ -2418,6 +2438,11 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<State>>) -> anyhow::Re
 pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
     match request {
         Request::Emit { event } => state.lock().unwrap().ingest(event, 0).unwrap_or_else(err),
+        Request::EmitOnce { key, event } => state
+            .lock()
+            .unwrap()
+            .ingest_once(key, event)
+            .unwrap_or_else(err),
         Request::When {
             string,
             options,
