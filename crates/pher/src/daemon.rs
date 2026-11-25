@@ -1193,6 +1193,14 @@ impl State {
             &self.paths.connector_state(),
             &serde_json::to_value(&self.connector_states).unwrap_or_default(),
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                self.paths.connector_state(),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
     }
 
     /// Resolve a bearer token to a grant name (http auth).

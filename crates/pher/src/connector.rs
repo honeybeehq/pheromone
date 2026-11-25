@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::daemon::State;
 use crate::protocol::PartialEvent;
@@ -82,10 +82,35 @@ pub struct PollSpec {
     /// ISO-8601, numerically when both sides parse as numbers.
     #[serde(default)]
     pub watermark: Option<String>,
+    #[serde(default)]
+    pub paginate: Paginate,
+    #[serde(default = "default_page_param")]
+    pub page_param: String,
+    #[serde(default)]
+    pub has_more: Option<String>,
+    #[serde(default = "default_max_pages")]
+    pub max_pages: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Paginate {
+    #[default]
+    Link,
+    AfterId,
+    None,
 }
 
 fn default_records() -> String {
     "$".to_string()
+}
+
+fn default_page_param() -> String {
+    "starting_after".to_string()
+}
+
+fn default_max_pages() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,6 +206,12 @@ pub struct PollState {
     /// Recently seen vendor ids (covers watermark ties and wm-less polls).
     #[serde(default)]
     pub recent: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub draining_watermark: String,
+    #[serde(default)]
+    pub baselined: bool,
 }
 
 const RECENT_IDS: usize = 500;
@@ -326,14 +357,7 @@ fn run_polls(
     manifest: &Manifest,
     cancel: &Arc<AtomicBool>,
 ) {
-    let vars = |key: &str| -> Option<String> {
-        if key == "token" {
-            Some(def.token.clone())
-        } else {
-            def.params.get(key).cloned()
-        }
-    };
-    let mut due: HashMap<String, u64> = HashMap::new(); // poll name -> unix next
+    let mut due: HashMap<String, u64> = HashMap::new();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -347,74 +371,432 @@ fn run_polls(
                 .map(|d| d.secs().max(5))
                 .unwrap_or(60);
             due.insert(spec.name.clone(), now + interval);
-
-            let url = template(&spec.url, &vars);
-            let mut req = ureq::get(&url)
-                .timeout(Duration::from_secs(20))
-                .set("accept", "application/json")
-                .set("user-agent", "pher-connector");
-            if let Some(auth) = &manifest.auth {
-                req = req.set(&auth.header, &template(&auth.format, &vars));
-            }
-            let body = match req.call() {
-                Ok(resp) => resp.into_string().unwrap_or_default(),
-                Err(e) => {
-                    eprintln!("pherd connector '{}' poll '{}': {e}", def.name, spec.name);
-                    continue;
-                }
-            };
-            let Ok(parsed) = serde_json::from_str::<Value>(&body) else {
-                eprintln!(
-                    "pherd connector '{}' poll '{}': response is not JSON",
-                    def.name, spec.name
-                );
-                continue;
-            };
-            let records = if spec.records == "$" {
-                parsed.as_array().cloned().unwrap_or_default()
-            } else {
-                field(&parsed, &spec.records)
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-            };
-
-            let mut s = state.lock().unwrap();
-            let key = format!("{}:{}", def.name, spec.name);
-            let poll_state = s.connector_state(&key);
-            let first_run = poll_state.watermark.is_empty() && poll_state.recent.is_empty();
-            let (fresh, new_state) = filter_new(&records, spec, &poll_state);
-            s.set_connector_state(&key, new_state);
-            if first_run {
-                // Live-from-now, like taps: the first poll only establishes
-                // the cursor. Backfill is a deliberate act, not a default.
-                drop(s);
-                eprintln!(
-                    "pherd connector '{}' poll '{}': baseline set ({} records seen, live from now)",
-                    def.name,
-                    spec.name,
-                    records.len()
-                );
-                continue;
-            }
-            for record in fresh {
-                let subject = template(&spec.subject, &|key: &str| {
-                    field_str(&record, key).map(|v| sanitize_token(&v))
-                });
-                let event = PartialEvent {
-                    event_type: Some(subject.clone()),
-                    subject,
-                    payload: Some(record.clone()),
-                    source: Some(format!("connector:{}", def.name)),
-                    correlation: field_str(&record, &spec.id),
-                };
-                if let Err(e) = s.ingest(event, 0) {
-                    eprintln!("pherd connector '{}': emit failed: {e}", def.name);
-                }
+            if let Err(e) = poll_once(state, def, manifest, spec, cancel) {
+                eprintln!("pherd connector '{}' poll '{}': {e}", def.name, spec.name);
             }
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+struct Page {
+    records: Vec<Value>,
+    next: Next,
+}
+
+enum Next {
+    End,
+    More(String),
+    Unreachable(String),
+}
+
+struct Fetched {
+    records: Vec<Value>,
+    resume: Option<String>,
+    complete: bool,
+}
+
+struct FetchError {
+    status: Option<u16>,
+    message: String,
+}
+
+fn poll_once(
+    state: &Arc<Mutex<State>>,
+    def: &ConnectorDef,
+    manifest: &Manifest,
+    spec: &PollSpec,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let key = format!("{}:{}", def.name, spec.name);
+    let stored = state.lock().unwrap().connector_state(&key);
+    let first_run = !stored.baselined
+        && stored.watermark.is_empty()
+        && stored.recent.is_empty()
+        && stored.resume.is_none();
+    let fetched = fetch_pages(def, manifest, spec, &stored, first_run)?;
+    let (fresh, filtered) = filter_new(&fetched.records, spec, &stored);
+
+    if first_run {
+        let mut baseline = filtered;
+        baseline.resume = None;
+        baseline.baselined = true;
+        state.lock().unwrap().set_connector_state(&key, baseline);
+        eprintln!(
+            "pherd connector '{}' poll '{}': baseline set ({} records seen, live from now)",
+            def.name,
+            spec.name,
+            fetched.records.len()
+        );
+        return Ok(());
+    }
+
+    let mut s = state.lock().unwrap();
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    for record in &fresh {
+        let Some(vendor_id) = field_str(record, &spec.id) else {
+            continue;
+        };
+        let subject = template(&spec.subject, &|key: &str| {
+            field_str(record, key).map(|v| sanitize_token(&v))
+        });
+        if !pher_core::SubjectPattern::parse(&subject).is_ok_and(|p| p.is_concrete()) {
+            eprintln!(
+                "pherd connector '{}' poll '{}': skipping record {vendor_id}: invalid subject '{subject}'",
+                def.name, spec.name
+            );
+            continue;
+        }
+        let version = spec
+            .watermark
+            .as_deref()
+            .and_then(|f| field_str(record, f))
+            .unwrap_or_default();
+        let event = PartialEvent {
+            event_type: Some(subject.clone()),
+            subject,
+            payload: Some(record.clone()),
+            source: Some(format!("connector:{}", def.name)),
+            correlation: Some(vendor_id.clone()),
+        };
+        s.ingest_once(once_key(&def.name, &spec.name, &vendor_id, &version), event)
+            .map_err(|e| format!("emit failed, cursor held for retry: {e}"))?;
+    }
+    s.set_connector_state(&key, advance(&stored, filtered, &fetched));
+    Ok(())
+}
+
+fn advance(stored: &PollState, filtered: PollState, fetched: &Fetched) -> PollState {
+    let mut highest = stored.draining_watermark.clone();
+    if wm_newer(&filtered.watermark, &highest) {
+        highest = filtered.watermark;
+    }
+    if fetched.complete && fetched.resume.is_none() {
+        PollState {
+            watermark: highest,
+            recent: filtered.recent,
+            resume: None,
+            draining_watermark: String::new(),
+            baselined: true,
+        }
+    } else {
+        PollState {
+            watermark: stored.watermark.clone(),
+            recent: filtered.recent,
+            resume: fetched.resume.clone(),
+            draining_watermark: highest,
+            baselined: true,
+        }
+    }
+}
+
+fn once_key(connector: &str, poll: &str, vendor_id: &str, version: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{connector}\0{poll}\0{vendor_id}\0{version}").as_bytes());
+    format!("connector|{}", &hex::encode(digest)[..32])
+}
+
+struct Secret<'a>(&'a str);
+
+impl Secret<'_> {
+    fn forms(&self) -> Vec<(String, &'static str)> {
+        if self.0.is_empty() {
+            return Vec::new();
+        }
+        let encoded = percent_encode(self.0);
+        let lower = encoded.to_ascii_lowercase();
+        let mut forms = vec![(self.0.to_string(), "{token}")];
+        if encoded != self.0 {
+            if lower != encoded && lower != self.0 {
+                forms.push((lower, "{token_pct_lower}"));
+            }
+            forms.push((encoded, "{token_pct}"));
+        }
+        forms
+    }
+
+    fn seal(&self, url: &str) -> String {
+        self.forms()
+            .iter()
+            .fold(url.to_string(), |acc, (value, slot)| {
+                acc.replace(value, slot)
+            })
+    }
+
+    fn unseal(&self, url: &str) -> String {
+        self.forms()
+            .iter()
+            .rev()
+            .fold(url.to_string(), |acc, (value, slot)| {
+                acc.replace(slot, value)
+            })
+    }
+
+    fn redact(&self, text: &str) -> String {
+        self.forms()
+            .iter()
+            .fold(text.to_string(), |acc, (value, _)| {
+                acc.replace(value, "***")
+            })
+    }
+}
+
+fn fetch_pages(
+    def: &ConnectorDef,
+    manifest: &Manifest,
+    spec: &PollSpec,
+    stored: &PollState,
+    first_run: bool,
+) -> Result<Fetched, String> {
+    let vars = |key: &str| -> Option<String> {
+        if key == "token" {
+            Some(def.token.clone())
+        } else {
+            def.params.get(key).cloned()
+        }
+    };
+    let base = template(&spec.url, &vars);
+    let auth = manifest
+        .auth
+        .as_ref()
+        .map(|a| (a.header.clone(), template(&a.format, &vars)));
+    let secret = Secret(&def.token);
+    let max_pages = if first_run { 1 } else { spec.max_pages.max(1) };
+    let mut cursor = stored.resume.clone();
+    let mut records = Vec::new();
+    for fetched_pages in 0..max_pages {
+        let url = match &cursor {
+            Some(c) => page_url(spec, &base, &secret.unseal(c)),
+            None => base.clone(),
+        };
+        let fetched_page = fetch_page(&url, &base, auth.as_ref(), spec).map_err(|e| FetchError {
+            status: e.status,
+            message: secret.redact(&e.message),
+        });
+        let page = match fetched_page {
+            Ok(page) => page,
+            Err(e)
+                if fetched_pages == 0
+                    && cursor.is_some()
+                    && e.status
+                        .is_some_and(|code| matches!(code, 400 | 404 | 410 | 422)) =>
+            {
+                eprintln!(
+                    "pherd connector '{}' poll '{}': resume cursor rejected ({}), ending the drain; older records past it are unreachable",
+                    def.name, spec.name, e.message
+                );
+                return Ok(Fetched {
+                    records,
+                    resume: None,
+                    complete: true,
+                });
+            }
+            Err(e) if fetched_pages == 0 => return Err(e.message),
+            Err(e) => {
+                eprintln!(
+                    "pherd connector '{}' poll '{}': page fetch failed, resuming next poll: {}",
+                    def.name, spec.name, e.message
+                );
+                return Ok(Fetched {
+                    records,
+                    resume: cursor,
+                    complete: false,
+                });
+            }
+        };
+        let reached_known = page.records.iter().any(|r| is_known(r, spec, stored));
+        let empty = page.records.is_empty();
+        records.extend(page.records);
+        if first_run || reached_known || empty {
+            return Ok(Fetched {
+                records,
+                resume: None,
+                complete: true,
+            });
+        }
+        match page.next {
+            Next::End => {
+                return Ok(Fetched {
+                    records,
+                    resume: None,
+                    complete: true,
+                })
+            }
+            Next::Unreachable(reason) => {
+                eprintln!(
+                    "pherd connector '{}' poll '{}': more pages exist but {}; watermark held",
+                    def.name,
+                    spec.name,
+                    secret.redact(&reason)
+                );
+                return Ok(Fetched {
+                    records,
+                    resume: None,
+                    complete: false,
+                });
+            }
+            Next::More(next) => cursor = Some(secret.seal(&next)),
+        }
+    }
+    Ok(Fetched {
+        records,
+        resume: cursor,
+        complete: false,
+    })
+}
+
+fn is_known(record: &Value, spec: &PollSpec, stored: &PollState) -> bool {
+    match &spec.watermark {
+        Some(wm_field) => {
+            let wm = field_str(record, wm_field).unwrap_or_default();
+            !stored.watermark.is_empty()
+                && wm != stored.watermark
+                && !wm_newer(&wm, &stored.watermark)
+        }
+        None => field_str(record, &spec.id).is_some_and(|id| stored.recent.contains(&id)),
+    }
+}
+
+fn page_url(spec: &PollSpec, base: &str, cursor: &str) -> String {
+    match spec.paginate {
+        Paginate::AfterId => {
+            let sep = if base.contains('?') { '&' } else { '?' };
+            format!("{base}{sep}{}={}", spec.page_param, percent_encode(cursor))
+        }
+        Paginate::Link | Paginate::None => cursor.to_string(),
+    }
+}
+
+fn fetch_page(
+    url: &str,
+    base: &str,
+    auth: Option<&(String, String)>,
+    spec: &PollSpec,
+) -> Result<Page, FetchError> {
+    let mut req = ureq::get(url)
+        .timeout(Duration::from_secs(20))
+        .set("accept", "application/json")
+        .set("user-agent", "pher-connector");
+    if let Some((header, value)) = auth {
+        req = req.set(header, value);
+    }
+    let failed = |message: String| FetchError {
+        status: None,
+        message,
+    };
+    let resp = req.call().map_err(|e| match e {
+        ureq::Error::Status(code, _) => FetchError {
+            status: Some(code),
+            message: format!("HTTP {code}"),
+        },
+        other => failed(other.to_string()),
+    })?;
+    let link = resp.header("link").map(str::to_string);
+    let body = resp.into_string().map_err(|e| failed(e.to_string()))?;
+    let parsed: Value =
+        serde_json::from_str(&body).map_err(|_| failed("response is not JSON".to_string()))?;
+    let records = if spec.records == "$" {
+        parsed.as_array().cloned().unwrap_or_default()
+    } else {
+        field(&parsed, &spec.records)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let next = match spec.paginate {
+        Paginate::None => Next::End,
+        Paginate::Link => match link.as_deref().and_then(next_link) {
+            None => Next::End,
+            Some(target) => match resolve_link(&target, base) {
+                Some(url) if same_origin(&url, base) => Next::More(url),
+                _ => Next::Unreachable(format!(
+                    "the next-page link is not on {}",
+                    origin(base).unwrap_or("the poll's origin")
+                )),
+            },
+        },
+        Paginate::AfterId => {
+            let more = match &spec.has_more {
+                Some(path) => field(&parsed, path).and_then(Value::as_bool) == Some(true),
+                None => !records.is_empty(),
+            };
+            match (more, records.last().and_then(|r| field_str(r, &spec.id))) {
+                (false, _) => Next::End,
+                (true, Some(id)) => Next::More(id),
+                (true, None) => Next::Unreachable("the last record has no id".to_string()),
+            }
+        }
+    };
+    Ok(Page { records, next })
+}
+
+fn next_link(header: &str) -> Option<String> {
+    let mut rest = header;
+    while let Some(open) = rest.find('<') {
+        let after = &rest[open + 1..];
+        let close = after.find('>')?;
+        let target = &after[..close];
+        let tail = &after[close + 1..];
+        let params_end = tail.find('<').unwrap_or(tail.len());
+        let params: Vec<(String, String)> = tail[..params_end]
+            .split([';', ','])
+            .filter_map(|p| {
+                let (k, v) = p.trim().split_once('=')?;
+                Some((
+                    k.trim().to_ascii_lowercase(),
+                    v.trim().trim_matches('"').to_string(),
+                ))
+            })
+            .collect();
+        let is_next = params
+            .iter()
+            .any(|(k, v)| k == "rel" && v.split_whitespace().any(|r| r == "next"));
+        let empty = params.iter().any(|(k, v)| k == "results" && v == "false");
+        if is_next && !empty {
+            return Some(target.to_string());
+        }
+        rest = &tail[params_end..];
+    }
+    None
+}
+
+fn resolve_link(target: &str, base: &str) -> Option<String> {
+    if target.contains("://") {
+        Some(target.to_string())
+    } else if target.starts_with('/') && !target.starts_with("//") {
+        Some(format!("{}{target}", origin(base)?))
+    } else {
+        None
+    }
+}
+
+fn origin(url: &str) -> Option<&str> {
+    let scheme_end = url.find("://")? + 3;
+    let host_end = url[scheme_end..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| scheme_end + i);
+    Some(&url[..host_end])
+}
+
+fn same_origin(a: &str, b: &str) -> bool {
+    match (origin(a), origin(b)) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 /// The escape hatch: supervise any process that emits envelope JSONL on
@@ -518,6 +900,7 @@ pub fn token_fingerprint(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn spec() -> PollSpec {
         PollSpec {
@@ -529,6 +912,10 @@ mod tests {
             id: "id".into(),
             ts: Some("dateCreated".into()),
             watermark: Some("dateCreated".into()),
+            paginate: Paginate::Link,
+            page_param: default_page_param(),
+            has_more: None,
+            max_pages: default_max_pages(),
         }
     }
 
