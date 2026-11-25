@@ -45,10 +45,11 @@ assert.equal(new Set(rules).size, RULE_COUNT, "rules must be distinct");
 const before = settledRss();
 
 pher.initSync({ module: bytes });
-const parsed = [];
+const instantiated = settledRss();
+const parsed = rules.map((rule) => pher.parse(rule));
+const afterParse = settledRss();
 let matched = 0;
 for (const rule of rules) {
-  parsed.push(pher.parse(rule));
   if (pher.evaluate(rule, envelope).includes('"outcome":"matched"')) matched++;
 }
 
@@ -62,6 +63,10 @@ console.log(`module size: ${moduleBytes} bytes (${mb(moduleBytes)}), budget ${mb
 console.log(
   `rss growth: ${growth} bytes (${mb(growth)}) from ${mb(before)} to ${mb(after)} ` +
     `for ${RULE_COUNT} rules parsed + evaluated (${matched} matched), budget ${mb(RSS_BUDGET_BYTES)}`,
+);
+console.log(
+  `rss by stage: instantiate +${mb(instantiated - before)}, parse +${mb(afterParse - instantiated)}, ` +
+    `evaluate +${mb(after - afterParse)}`,
 );
 
 const failures = [];
