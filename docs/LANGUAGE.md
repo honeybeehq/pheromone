@@ -181,7 +181,8 @@ else then buz operator --tier queue
 - Listener resume (`pher listen --cursor`/`--after`, SDK `cursor`/`after`/`reconnect`) is
   different: catch-up runs the missed events through `meaning` and `judge`, recording verdicts
   (and sampled-out decisions) and charging the judge budget like live matching. Verdicts and
-  budget are keyed by the cursor (if any) plus the canonical subscription, so a
+  budget are keyed by the cursor (if any) plus the canonical subscription (so listeners without a
+  cursor on the same subscription share one budget), so a
   reattach reuses recorded verdicts instead of re-rolling and does not refill the budget.
   Judge deliveries for a subscription leave in `seq` order. Catch-up sends
   `{"checkpoint": {subscription, seq}}` lines as it goes so cursors advance past evaluated
@@ -190,7 +191,8 @@ else then buz operator --tier queue
   embeds so later backlog events see them, and gaps if the window no longer reaches back far
   enough. If catch-up stops early (budget exhausted, that limit, judge failure, provider
   down, `novel` history incomplete), the stream carries an explicit
-  `{"gap": {subscription, from, through, reason}}` line; the SDK surfaces it as a `gap`
+  `{"gap": {subscription, from, through, commitThrough, reason}}` line (`commitThrough` stays
+  below events still waiting in a debounce/batch window); the SDK surfaces it as a `gap`
   (handled via `onGap`) or an error. Neither the SDK nor `pher listen --cursor` commits past
   an unhandled gap; `pher listen --accept-gaps` commits past it after reporting it on stderr.
 - `limit <n>` — one-shot and n-shot subscriptions; `limit 1` + timeout is the primitive

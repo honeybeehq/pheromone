@@ -92,7 +92,8 @@ const sub = await hub.on(
 - Catch-up replay is bounded by the hub's retention (default 7d). For
   `meaning`/`judge` subscriptions, catch-up runs the missed events through
   tiers 3–4. Judge verdicts (including sampled-out decisions) and the judge
-  budget belong to the cursor (if any) plus the canonical subscription, so a reattach reuses recorded verdicts instead of
+  budget belong to the cursor (if any) plus the canonical subscription
+  (listeners without a cursor on the same subscription share one budget), so a reattach reuses recorded verdicts instead of
   re-asking, and reconnecting does not refill the budget. Judge deliveries
   for one subscription always arrive in `seq` order: a cached verdict waits
   behind an earlier one still being judged.
@@ -102,9 +103,11 @@ const sub = await hub.on(
   When it has to stop early (judge budget exhausted, that limit, judge call
   failed, embedder or judge provider unavailable, or `meaning novel`
   history for the event incomplete), the hub sends a gap
-  `{ subscription, from, through, reason }` and the listener emits `'gap'`.
+  `{ subscription, from, through, commitThrough, reason }` and the listener
+  emits `'gap'`.
   Pass `onGap` to handle it; the cursor moves past the range only after
-  `onGap` finishes. Without `onGap`, the gap is an `'error'` (with a `gap`
+  `onGap` finishes (up to `commitThrough`, which stays below events still
+  waiting in a debounce/batch window). Without `onGap`, the gap is an `'error'` (with a `gap`
   property), or a process warning if nothing listens for `'error'`, and the
   cursor commits up to the gap but never past it, so the next attach retries
   the range.

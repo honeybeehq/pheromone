@@ -646,9 +646,13 @@ fn run() -> anyhow::Result<()> {
                             "gap: seqs {}-{} were not evaluated for meaning/judge ({reason}); accepted, committing past them",
                             gap["from"], gap["through"]
                         );
-                        if let (Some(name), Some(_), Some(seq), false) =
-                            (commit_cursor.as_deref(), from, through, unhandled_gap)
-                        {
+                        let commit_through = gap["commitThrough"].as_u64().or(through);
+                        if let (Some(name), Some(_), Some(seq), false) = (
+                            commit_cursor.as_deref(),
+                            from,
+                            commit_through,
+                            unhandled_gap,
+                        ) {
                             let _ = client::call_target(
                                 commit_target,
                                 &Request::CursorCommit {

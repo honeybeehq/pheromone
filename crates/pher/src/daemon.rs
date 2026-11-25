@@ -3640,11 +3640,20 @@ pub(crate) fn replay_listen_catchup(
     }
     let semantic = tiers.is_some();
     if let Some((gap_from, reason)) = tiers.and_then(|t| t.gap) {
+        let shaping_floor = state
+            .lock()
+            .unwrap()
+            .pending
+            .get(sub_id)
+            .and_then(|window| window.seqs.iter().min().copied());
+        let commit_through =
+            shaping_floor.map_or(through, |floor| through.min(floor.saturating_sub(1)));
         let gap = json!({
             "gap": {
                 "subscription": sub_id,
                 "from": gap_from,
                 "through": through,
+                "commitThrough": commit_through,
                 "reason": reason,
             }
         });

@@ -261,7 +261,8 @@ export class PherClient {
       Math.min(listener.lastSeq, unhandledGapFrom - 1);
 
     const gapHandlerFor = (commitQueue) => (gap) => {
-      const entry = cursor && autoCommit ? commitQueue.track(gap.through) : null;
+      const commitThrough = gap.commitThrough ?? gap.through;
+      const entry = cursor && autoCommit ? commitQueue.track(commitThrough) : null;
       setImmediate(() => listener.emit("gap", gap));
       if (!onGap) {
         commitQueue.bar(entry);
@@ -284,7 +285,7 @@ export class PherClient {
       }
       handled.then(
         () => {
-          listener.lastSeq = Math.max(listener.lastSeq, gap.through);
+          listener.lastSeq = Math.max(listener.lastSeq, commitThrough);
           commitQueue.settle(entry, true);
         },
         (e) => {
@@ -292,7 +293,10 @@ export class PherClient {
           unhandledGapFrom = Math.min(unhandledGapFrom, gap.from);
           const err = e instanceof Error ? e : new Error(String(e));
           err.gap = gap;
-          setImmediate(() => listener.emit("error", err));
+          setImmediate(() => {
+            if (listener.listenerCount("error") > 0) listener.emit("error", err);
+            else process.emitWarning(err.message, "PherGapWarning");
+          });
         },
       );
     };

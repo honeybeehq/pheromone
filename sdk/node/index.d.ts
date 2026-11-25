@@ -56,6 +56,7 @@ export interface CatchupGap {
   subscription: string;
   from: number;
   through: number;
+  commitThrough: number;
   reason:
     | "budgetExhausted"
     | "backlogLimit"

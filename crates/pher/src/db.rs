@@ -293,8 +293,8 @@ impl Db {
     pub fn load_vectors(&self, limit: usize) -> anyhow::Result<Vec<(u64, String, Vec<f32>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT ts, event_id, vec FROM (
-                SELECT rowid, ts, event_id, vec FROM vectors ORDER BY rowid DESC LIMIT ?1
-             ) ORDER BY rowid ASC",
+                SELECT rowid, ts, event_id, vec FROM vectors ORDER BY ts DESC, rowid DESC LIMIT ?1
+             ) ORDER BY ts ASC, rowid ASC",
         )?;
         let rows = stmt
             .query_map(params![limit as u64], |r| {
