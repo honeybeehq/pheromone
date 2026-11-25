@@ -82,3 +82,7 @@ jobs:
       - name: pher-wasm suite
         working-directory: crates/pher-wasm
         run: node test.mjs
+
+      - name: pher-wasm size and memory budget
+        working-directory: crates/pher-wasm
+        run: node --expose-gc budget.mjs
