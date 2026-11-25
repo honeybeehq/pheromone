@@ -23,8 +23,20 @@ pub struct Envelope {
     pub ttl_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hops: Option<u32>,
-    #[serde(rename = "sourceTs", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "sourceTs",
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "string_or_absent"
+    )]
     pub source_ts: Option<String>,
+}
+
+fn string_or_absent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => Some(s),
+        _ => None,
+    })
 }
 
 impl Envelope {

@@ -795,6 +795,11 @@ impl State {
                 partial.subject
             ));
         }
+        let source_ts = partial
+            .source_ts
+            .as_ref()
+            .and_then(crate::connector::normalize_source_ts);
+        let source_ts_dropped = partial.source_ts.is_some() && source_ts.is_none();
         let event = Envelope {
             id: ids::event_id("PH"),
             ts: now_ts(),
@@ -808,12 +813,19 @@ impl State {
             payload: partial.payload.unwrap_or(Value::Null),
             ttl_class: None,
             hops: (hops > 0).then_some(hops),
-            source_ts: partial
-                .source_ts
-                .as_ref()
-                .and_then(crate::connector::normalize_source_ts),
+            source_ts,
         };
         let seq = self.ingest_envelope(event.clone())?;
+        if source_ts_dropped {
+            let warning = format!(
+                "sourceTs {} is not RFC 3339 or epoch seconds/ms; admitted without it",
+                partial.source_ts.unwrap_or_default()
+            );
+            eprintln!("pherd: event {} on {}: {warning}", event.id, event.subject);
+            return Ok(ok(
+                json!({ "id": event.id, "seq": seq, "warnings": [warning] }),
+            ));
+        }
         Ok(ok(json!({ "id": event.id, "seq": seq })))
     }
 
@@ -1500,7 +1512,10 @@ impl State {
             payload: event.payload.clone().unwrap_or(Value::Null),
             ttl_class: None,
             hops: None,
-            source_ts: None,
+            source_ts: event
+                .source_ts
+                .as_ref()
+                .and_then(crate::connector::normalize_source_ts),
         };
         if filter_matches(filter, &probe) {
             Ok(())

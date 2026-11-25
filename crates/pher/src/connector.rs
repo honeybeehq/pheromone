@@ -561,6 +561,10 @@ pub(crate) fn normalize_source_ts(value: &Value) -> Option<String> {
         }
         _ => return None,
     };
+    let year_10000 = std::time::UNIX_EPOCH + Duration::from_secs(253_402_300_800);
+    if instant >= year_10000 {
+        return None;
+    }
     Some(humantime::format_rfc3339_millis(instant).to_string())
 }
 
@@ -587,7 +591,7 @@ fn epoch_instant(text: &str) -> Option<std::time::SystemTime> {
 }
 
 fn rfc3339_instant(s: &str) -> Option<std::time::SystemTime> {
-    if !s.is_ascii() || s.len() < 20 || !matches!(s.as_bytes()[10], b'T' | b't') {
+    if !s.is_ascii() || s.len() < 20 || s.as_bytes()[10] != b'T' {
         return None;
     }
     if let Some(utc) = s.strip_suffix(['Z', 'z']) {
@@ -605,11 +609,12 @@ fn rfc3339_instant(s: &str) -> Option<std::time::SystemTime> {
     }
     let shift = Duration::from_secs(hours * 3600 + minutes * 60);
     let as_if_utc = humantime::parse_rfc3339(&format!("{local}Z")).ok()?;
-    if o[0] == b'+' {
-        as_if_utc.checked_sub(shift)
+    let instant = if o[0] == b'+' {
+        as_if_utc.checked_sub(shift)?
     } else {
-        as_if_utc.checked_add(shift)
-    }
+        as_if_utc.checked_add(shift)?
+    };
+    (instant >= std::time::UNIX_EPOCH).then_some(instant)
 }
 
 fn once_key(connector: &str, poll: &str, vendor_id: &str, version: &str) -> String {

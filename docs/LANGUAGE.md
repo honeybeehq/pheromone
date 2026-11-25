@@ -202,18 +202,25 @@ else then buz operator --tier queue
 
 ### Two timestamps: `ts` and `sourceTs`
 
-Every envelope has `ts`, the time the receiving node admitted the event (RFC 3339 UTC,
-millisecond precision). An event may also carry `sourceTs`, the time its source says it
-happened: a connector reads it from the record field its manifest names in `ts` (Sentry
-`lastSeen`, GitHub `created_at`, Stripe `created`), and any emitter may send it. It is
-normalized to the same shape as `ts`, so `where sourceTs < ts` compares correctly. RFC 3339
-with `Z` or a numeric offset and Unix epoch seconds or milliseconds are read; anything else
-is dropped from the envelope, never the event: the event is admitted without `sourceTs` and
-the daemon logs the record id and the unreadable value.
+Every envelope has `ts`, the time the origin node admitted the event (RFC 3339 UTC,
+millisecond precision; bridged and forwarded events keep their origin's `ts`). An event may
+also carry `sourceTs`, the time its source says it happened: a connector reads it from the
+record field its manifest names in `ts` (Sentry `lastSeen`, GitHub `created_at`, Stripe
+`created`), and any emitter (exec connector JSONL, `pher emit` over the socket, HTTP
+`/emit`) may send it. The origin node normalizes it to the same shape as `ts`, so
+`where sourceTs < ts` compares correctly. Accepted: RFC 3339 with `Z` or a `±HH:MM` offset,
+and Unix epoch seconds or milliseconds (as a number or numeric string), between 1970 and
+year 9999. Anything else is dropped from the envelope, never the event: the event is
+admitted without `sourceTs`, the daemon logs it, and an emit reply carries a `warnings`
+entry. A connector logs the record id and the unreadable value.
+
+`sourceTs` belongs to the event it arrived on. An event derived by `then emit` is a new
+event without `sourceTs`; subscribe to the original subject when vendor time matters.
 
 `ts` is authoritative. Trail order is append order (`seq`); cursors and catch-up resume by
-`seq`; `since` lookbacks, replay seeks and retention (evaporation) cut by `ts`. `sourceTs` is informational: it
-never reorders the trail and never decides what a lookback includes. The reasons:
+`seq`; `since` lookbacks, replay seeks and retention (evaporation) cut by `ts`. `sourceTs`
+is informational: it never reorders the trail and never decides what a lookback includes.
+The reasons:
 
 - Vendor clocks skew; one vendor's "now" is not ours, and two vendors disagree.
 - Records arrive late or backdated: a connector catching up after an outage, a vendor
@@ -221,11 +228,12 @@ never reorders the trail and never decides what a lookback includes. The reasons
   retry. Ordering by `sourceTs` would insert them into history that subscribers have
   already consumed, and `since 1h` would silently skip a record that arrived a minute ago
   but claims to be from yesterday.
-- The trail is append-ordered by `seq`; cursors, catch-up and retention prefixes are seq
-  ranges that `ts` tracks. A second ordering would break the gap-free handoff.
+- The trail is append-ordered by `seq`, and cursors and catch-up are seq positions. A
+  second ordering by vendor time would break the gap-free handoff.
 
 To filter on when something happened at the source, say so in `where`:
-`on sentry.** where sourceTs >= "2026-11-25T00:00:00.000Z"`.
+`on sentry.** where sourceTs >= "2026-11-25T00:00:00.000Z"`, or `!has(sourceTs)` for events
+whose source gave no readable time.
 
 ## Two consumption modes, two verbs
 
