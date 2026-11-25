@@ -1111,7 +1111,13 @@ impl State {
             return Err("remote event has no id".to_string());
         }
         let key = ids::admission_key(&event);
-        if self.forwarded_seen.contains(&key) {
+        let admitted_before_upgrade = !ids::is_event_id(&event.id)
+            && self.forwarded_seen.contains(&event.id)
+            && self
+                .db
+                .has_event(&event.id, &event.node, &event.ts)
+                .unwrap_or(false);
+        if admitted_before_upgrade || self.forwarded_seen.contains(&key) {
             return Ok(json!({ "ok": true, "deduped": true }));
         }
         let _ = self.db.forwarded_insert(&key);

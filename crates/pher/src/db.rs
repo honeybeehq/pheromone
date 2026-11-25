@@ -184,6 +184,18 @@ impl Db {
         Ok(row.and_then(|t| serde_json::from_str(&t).ok()))
     }
 
+    pub fn has_event(&self, id: &str, node: &str, ts: &str) -> anyhow::Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM events WHERE id = ?1 AND ts = ?3 AND json_extract(envelope, '$.node') = ?2 LIMIT 1",
+                params![id, node, ts],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     // -- deliveries -----------------------------------------------------------
 
     pub fn append_delivery(
