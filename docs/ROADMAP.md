@@ -32,7 +32,9 @@ subscription string against a bag of events, in-process, with no daemon.
   segmented event log behind the storage trait, subject-trie hot path.
 - `pher emit`, `pher when`, `pher ls`, `pher rm`, `pher tail` (WS event plane with comb-style
   cursor resume), `pher why` / `pher why-not`.
-- Lifetimes: `for <ttl>`, `limit <n>`, lease heartbeats for `while <bee> alive`.
+- Lifetimes: `for <ttl>`, `limit <n>`, `while <client> alive` on listener connections. Stored
+  subscriptions refuse `while <bee> alive` until pherd has a bee liveness source (lease
+  renewal); a lease nothing can end would deliver forever.
 - Delivery: at-least-once with `deliveryId` dedup; sinks `cmd`, `http`, `emit` (with hop-cap
   cycle guard). Retention/evaporation policies + GC sweep.
 - `pher wait` (one-shot mode) over the caller's connection.
@@ -54,7 +56,7 @@ restart, no loss, cursor resume.
 - `@pheromone/client` TS SDK (`pher.when()`, `pher.wait()`, `pher.emit()`).
 
 **Exit criterion:** `pher when 'on hive.seal where payload.status == "blocked" then buz
-<bee> --tier next-tool' --while <bee> alive` works end-to-end on real hive traffic.
+<bee> --tier next-tool' --for 8h` works end-to-end on real hive traffic.
 
 ## Slice 4 — tier 3 (semantic + novelty)
 

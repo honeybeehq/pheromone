@@ -80,8 +80,7 @@ enum Cmd {
         /// Lifetime: evaporate after a duration, e.g. --for 30m
         #[arg(long = "for")]
         ttl: Option<String>,
-        /// Lifetime: lease to an agent, e.g. --while CL.6308
-        #[arg(long = "while")]
+        #[arg(long = "while", hide = true)]
         lessee: Option<String>,
         /// Debounce window, e.g. --every 30m
         #[arg(long)]

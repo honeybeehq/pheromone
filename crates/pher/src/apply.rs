@@ -281,6 +281,9 @@ pub fn run(
         if let Some(e) = crate::daemon::replay_tier_error(&sub) {
             bail!("subscription '{}': {e}", entry.name);
         }
+        if let Some(e) = crate::daemon::stored_lease_error(&sub) {
+            bail!("subscription '{}': {e}", entry.name);
+        }
         desired_subs.push((entry.name.clone(), sub.canon()));
     }
     for entry in &config.conditions {

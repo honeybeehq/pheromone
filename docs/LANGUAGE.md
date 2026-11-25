@@ -31,7 +31,7 @@ when
   [judge "<yes/no question>" budget <n>/<period>]     # tier 4 — LLM verdict
   [expect <subject-pattern> [where <expr>] within <dur> else]   # absence (see below)
 then <action>
-[for <ttl> | while <bee|session> alive]               # lifetime
+[for <ttl> | while <client> alive]                    # lifetime (while: then stream only)
 [every <window> | batch <window>]                     # delivery shaping
 [since <lookback>]                                    # replay backlog first, then go live
 [limit <n>]                                           # max deliveries, then retire
@@ -155,8 +155,12 @@ else then buz operator --tier queue
 ## Lifecycle, delivery shaping, replay
 
 - `for <ttl>` — evaporates after the duration (generalizes Pollinate's temporary hooks).
-- `while <bee> alive` — leased to an agent/session lifetime; heartbeat-based; the bee dies,
-  the receptor evaporates. Leaf-node subscriptions (ephemeral containers) are always leases.
+- `while <client> alive` — leased to a listener connection; the connection closes, the
+  receptor evaporates. Only `then stream` subscriptions carry it (`pher listen`, SDK
+  `.on()`). `pher when` and `pher apply` refuse it: pherd has no liveness signal for the
+  holder of a stored subscription, so it would deliver forever after the holder died.
+  Bound a stored subscription with `for <ttl>` instead. Leaf-node subscriptions (future,
+  ephemeral containers) will be leased to the leaf's connection to its parent.
 - `every <window>` / `batch <window>` — debounce/batch, **delegated to Pollinate's
   DeliveryManager semantics** (immediate/throttled/batched/debounced with persisted state).
 - `since <lookback>` — replay: run the backlog through the matcher first, then continue
@@ -199,9 +203,9 @@ then stream                                                 # deliver to the con
 `then stream` is the code-based subscriber path: it can only be registered over a live
 listener connection (`pher listen`, or an SDK client's `.on()`), deliveries are pushed
 down that connection, and the subscription is removed the moment the listener
-disconnects. It is the one place the lease lifetime (`while <client> alive`) is
-actually enforced — by connection liveness. `pher when '… then stream'` is refused:
-a stored stream subscription with no listener would be a lie.
+disconnects. It is the only place the lease lifetime (`while <client> alive`) is
+accepted, because connection liveness is what enforces it. `pher when '… then stream'`
+is refused: a stored stream subscription with no listener would be a lie.
 
 `then emit` is how subscriptions compose into pipelines; the delivery's `match` block is
 attached to the re-emitted event's metadata, and `correlation` is preserved — threads stay
@@ -244,9 +248,9 @@ effectively-once effects).
 ## Worked examples
 
 ```bash
-# Bread and butter — tier 2 only, agent-lifetime lease
+# Bread and butter — tier 2 only, evaporates after a shift
 pher when 'on hive.seal where payload.status == "blocked"
-           then buz CL.6308 --tier next-tool' --while CL.6308 alive
+           then buz CL.6308 --tier next-tool' --for 8h
 
 # Full cascade: cheap filter gates semantic gates judge
 pher when 'on ci.github.run.completed

@@ -565,6 +565,9 @@ impl State {
                     .to_string(),
             );
         }
+        if let Some(e) = stored_lease_error(&sub) {
+            return Err(e);
+        }
         self.register_parsed(sub, name)
     }
 
@@ -674,18 +677,6 @@ impl State {
             pher_core::Lifetime::Ttl { ttl } => Some(now_unix() + ttl.secs()),
             _ => None,
         };
-        let mut warnings: Vec<String> = Vec::new();
-        // Stream subs are exempt: their lease IS enforced, by connection
-        // liveness — disconnect removes the subscription.
-        if matches!(sub.lifetime, pher_core::Lifetime::Lease { .. })
-            && sub.then.sink != Sink::Stream
-        {
-            warnings.push(
-                "lease liveness (while ... alive) is not heartbeat-checked yet; \
-                 treat as durable until slice 3"
-                    .to_string(),
-            );
-        }
 
         let meta = SubMeta {
             id: id.clone(),
@@ -722,7 +713,7 @@ impl State {
             "id": id,
             "canonical": self.metas[&id].string,
             "replayedDeliveries": replayed,
-            "warnings": warnings,
+            "warnings": [],
         })))
     }
 
@@ -3094,6 +3085,16 @@ pub(crate) fn attach_listener(
     })
 }
 
+pub(crate) fn stored_lease_error(sub: &Subscription) -> Option<String> {
+    match &sub.lifetime {
+        pher_core::Lifetime::Lease { lessee } if sub.then.sink != Sink::Stream => Some(format!(
+            "'while {lessee} alive' needs a live listener: use 'then stream' via `pher listen` \
+             or an SDK client's .on(), or bound a stored subscription with 'for <ttl>'"
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) fn replay_tier_error(sub: &Subscription) -> Option<String> {
     sub.replay.as_ref()?;
     let tiers = match (sub.meaning.is_some(), sub.judge.is_some()) {
@@ -3561,6 +3562,27 @@ mod follower_tests {
             "unexpected timers read error must not look like no timers"
         );
         let _ = std::fs::remove_dir(&path);
+    }
+
+    #[test]
+    fn stored_lease_is_refused_listener_lease_is_kept() {
+        let paths = fresh_home("lease");
+        let mut s = State::load(paths).unwrap();
+        let inline = s
+            .register("on a.b then emit c.d while CL.gone alive", &[], None)
+            .unwrap_err();
+        assert!(inline.contains("'while CL.gone alive'"), "{inline}");
+        let words: Vec<String> = ["while", "CL.gone", "alive"].map(String::from).into();
+        let optioned = s
+            .register("on a.b then emit c.d", &words, None)
+            .unwrap_err();
+        assert!(optioned.contains("pher listen"), "{optioned}");
+        assert!(s.metas.is_empty(), "a refused lease must not be stored");
+
+        let ack = s
+            .register_listener("on a.b then stream while CL.live alive", &[], "CL.live")
+            .unwrap();
+        assert!(s.metas.contains_key(ack["id"].as_str().unwrap()));
     }
 
     #[test]
