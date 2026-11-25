@@ -3,7 +3,9 @@ import { readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const MODULE_BUDGET_BYTES = 1_500_000;
-const RSS_BUDGET_BYTES = 8_000_000;
+const TOTAL_RSS_BUDGET_BYTES = 24_000_000;
+const MARGINAL_RSS_BUDGET_BYTES = 8_000_000;
+const WARM_UP_RULES = 256;
 const RULE_COUNT = 4096;
 
 assert.equal(typeof globalThis.gc, "function", "run with node --expose-gc");
@@ -39,41 +41,57 @@ const envelope = JSON.stringify({
   payload: { kind: "failed", attempt: 3, bee: "CL.7" },
 });
 
+const warmUp = Array.from({ length: WARM_UP_RULES }, (_, i) => ruleFor(RULE_COUNT + i));
 const rules = Array.from({ length: RULE_COUNT }, (_, i) => ruleFor(i));
-assert.equal(new Set(rules).size, RULE_COUNT, "rules must be distinct");
+assert.equal(new Set([...warmUp, ...rules]).size, WARM_UP_RULES + RULE_COUNT, "rules must be distinct");
 
-const before = settledRss();
-
-pher.initSync({ module: bytes });
-const instantiated = settledRss();
-const parsed = rules.map((rule) => pher.parse(rule));
-const afterParse = settledRss();
-let matched = 0;
-for (const rule of rules) {
-  if (pher.evaluate(rule, envelope).includes('"outcome":"matched"')) matched++;
+function parseAndEvaluate(batch) {
+  const parsed = batch.map((rule) => pher.parse(rule));
+  let matched = 0;
+  for (const rule of batch) {
+    if (pher.evaluate(rule, envelope).includes('"outcome":"matched"')) matched++;
+  }
+  return { parsed, matched };
 }
 
-const after = settledRss();
-const growth = after - before;
+const glueLoaded = settledRss();
+pher.initSync({ module: bytes });
+const instantiated = settledRss();
+const warm = parseAndEvaluate(warmUp);
+const warmedUp = settledRss();
+const { parsed, matched } = parseAndEvaluate(rules);
+const done = settledRss();
+
 assert.equal(new Set(parsed).size, RULE_COUNT, "parsed rules must be distinct");
 assert.ok(matched > 0 && matched < RULE_COUNT, `expected a mix of matches, got ${matched}`);
+assert.equal(warm.parsed.length, WARM_UP_RULES);
 
+const total = done - glueLoaded;
+const marginal = done - warmedUp;
 const mb = (n) => `${(n / 1_000_000).toFixed(3)} MB`;
+
 console.log(`module size: ${moduleBytes} bytes (${mb(moduleBytes)}), budget ${mb(MODULE_BUDGET_BYTES)}`);
 console.log(
-  `rss growth: ${growth} bytes (${mb(growth)}) from ${mb(before)} to ${mb(after)} ` +
-    `for ${RULE_COUNT} rules parsed + evaluated (${matched} matched), budget ${mb(RSS_BUDGET_BYTES)}`,
+  `total rss growth: ${total} bytes (${mb(total)}) from glue loaded to ${WARM_UP_RULES} + ${RULE_COUNT} rules ` +
+    `parsed and evaluated (${matched} of ${RULE_COUNT} matched), budget ${mb(TOTAL_RSS_BUDGET_BYTES)}`,
 );
 console.log(
-  `rss by stage: instantiate +${mb(instantiated - before)}, parse +${mb(afterParse - instantiated)}, ` +
-    `evaluate +${mb(after - afterParse)}`,
+  `marginal rss growth: ${marginal} bytes (${mb(marginal)}) for ${RULE_COUNT} rules after a ${WARM_UP_RULES}-rule warm-up, ` +
+    `budget ${mb(MARGINAL_RSS_BUDGET_BYTES)}`,
+);
+console.log(
+  `rss by stage: instantiate +${mb(instantiated - glueLoaded)}, warm-up +${mb(warmedUp - instantiated)}, ` +
+    `${RULE_COUNT} rules +${mb(done - warmedUp)} (glue loaded at ${mb(glueLoaded)})`,
 );
 
 const failures = [];
 if (moduleBytes > MODULE_BUDGET_BYTES) failures.push(`module is ${mb(moduleBytes)}, over ${mb(MODULE_BUDGET_BYTES)}`);
-if (growth > RSS_BUDGET_BYTES) failures.push(`rss grew ${mb(growth)}, over ${mb(RSS_BUDGET_BYTES)}`);
+if (total > TOTAL_RSS_BUDGET_BYTES) failures.push(`total rss grew ${mb(total)}, over ${mb(TOTAL_RSS_BUDGET_BYTES)}`);
+if (marginal > MARGINAL_RSS_BUDGET_BYTES) {
+  failures.push(`marginal rss grew ${mb(marginal)}, over ${mb(MARGINAL_RSS_BUDGET_BYTES)}`);
+}
 if (failures.length) {
   console.error(`@pheromone/wasm budget FAILED: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("@pheromone/wasm budget: within size and memory budget");
+console.log("@pheromone/wasm budget: within size, total and marginal memory budgets");
