@@ -297,6 +297,7 @@ impl SqliteLog {
         decode_seq(v)
     }
 
+    #[cfg(test)]
     pub fn floor(&self) -> Result<u64, TrailError> {
         let conn = self.conn.lock().expect("sqlite log mutex");
         Self::get_state(&conn, "floor")
@@ -308,6 +309,7 @@ impl SqliteLog {
     }
 
     /// 2 = FULL. Used to verify writer durability config.
+    #[cfg(test)]
     pub fn synchronous_pragma(&self) -> Result<i64, TrailError> {
         let conn = self.conn.lock().expect("sqlite log mutex");
         Ok(conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?)
