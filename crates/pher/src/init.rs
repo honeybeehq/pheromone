@@ -97,7 +97,15 @@ pub fn run(paths: &Paths) -> anyhow::Result<()> {
 
     // Ingress.
     match std::env::var("PHER_HTTP") {
-        Ok(addr) => ok(&format!("http ingress configured on {addr}")),
+        Ok(addr) => {
+            ok(&format!("http ingress configured on {addr}"));
+            if !crate::webhook::any_configured(paths) {
+                gap(
+                    "no webhook secrets — POST /webhook/<name> rejects everything until a \
+                     [[webhook]] entry is applied or PHER_WEBHOOK_SECRET_<NAME> is set",
+                );
+            }
+        }
         Err(_) => {
             gap("http ingress off — set PHER_HTTP=127.0.0.1:4870 for webhooks/metrics/cross-node")
         }

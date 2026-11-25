@@ -115,15 +115,29 @@ pher listen 'on hive.seal'              # every seal across your agents
 pher listen 'on hive.** meaning novel > 0.5 over 7d'   # only surprising agent behavior
 ```
 
-## 9. Webhooks in (HMAC-verified)
+## 9. Webhooks in (authenticated)
+
+Every hook needs a secret; until it has one, `POST /webhook/<name>` answers 403
+and admits nothing.
 
 ```bash
-# daemon env: PHER_WEBHOOK_SECRET_GITHUB=s3cret
+# pheromone.toml:
+#   [[webhook]]
+#   name = "github"
+#   secret-env = "GITHUB_WEBHOOK_SECRET"      # or secret-cmd = "hem get project/x/github-webhook secret"
+export GITHUB_WEBHOOK_SECRET=$(openssl rand -hex 24)
+pher apply && pher webhook ls                # fingerprints only, never the secret
+
 pher listen 'on webhook.github where payload.action == "opened"'
 BODY='{"action": "opened", "number": 42}'
-SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac s3cret | cut -d' ' -f2)
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$GITHUB_WEBHOOK_SECRET" | awk '{print $NF}')
 curl -s -X POST http://127.0.0.1:4870/webhook/github -H "x-hub-signature-256: sha256=$SIG" -d "$BODY"
+# Senders that cannot sign send the secret as a token instead:
+curl -s -X POST http://127.0.0.1:4870/webhook/github -H "x-pher-webhook-token: $GITHUB_WEBHOOK_SECRET" -d "$BODY"
 ```
+
+`PHER_WEBHOOK_SECRET_<NAME>` (or `PHER_WEBHOOK_SECRET` for every hook) in the
+daemon's environment works too; a `[[webhook]]` entry wins over both.
 
 ## 10. Cursors: never miss an event
 

@@ -2712,6 +2712,10 @@ pub(crate) fn handle_rpc(request: Request, state: &Arc<Mutex<State>>) -> Value {
             let _ = s.persist_grants();
             ok(json!({ "removed": removed }))
         }
+        request @ (Request::WebhookSet { .. } | Request::WebhookLs | Request::WebhookRm { .. }) => {
+            let paths = state.lock().unwrap().paths_clone();
+            crate::webhook::handle_rpc(request, &paths)
+        }
     }
 }
 

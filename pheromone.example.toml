@@ -64,6 +64,24 @@ token-env = "PHER_TOKEN_ANNA"
 allow = 'on team.**, ci.**'
 emit = 'on team.anna.**'
 
+# -- webhooks: authenticated push ingress ---------------------------------------
+# POST /webhook/<name> admits an event only when the request proves it holds
+# that hook's secret: an HMAC-SHA256 signature of the raw body in
+# X-Hub-Signature-256 (GitHub format, "sha256=<hex>"), or the secret itself in
+# X-Pher-Webhook-Token / X-Gitlab-Token. A hook with no secret rejects every
+# request (403). Secrets are at least 16 characters and resolve at apply time:
+# secret-env reads the environment, secret-cmd runs a command (a Hem ref, 1Password, …).
+# The daemon keeps them in webhooks.json (0600); `pher webhook ls` shows
+# fingerprints only.
+
+[[webhook]]
+name = "github"                       # receives POST /webhook/github
+secret-cmd = "hem get project/yourproject/github-webhook secret"
+
+[[webhook]]
+name = "sentry"
+secret-env = "PHER_SENTRY_WEBHOOK_SECRET"
+
 # -- connectors: SaaS vendors as event sources --------------------------------
 # One generic engine executes catalog manifests (pher connect catalog);
 # tokens resolve at apply time — token-env reads the environment, token-cmd

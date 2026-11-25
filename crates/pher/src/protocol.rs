@@ -86,6 +86,13 @@ pub enum Request {
     GrantRm {
         name: String,
     },
+    WebhookSet {
+        def: Value,
+    },
+    WebhookLs,
+    WebhookRm {
+        name: String,
+    },
     Why {
         #[serde(rename = "deliveryId")]
         delivery_id: String,

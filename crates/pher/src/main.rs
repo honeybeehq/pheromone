@@ -14,6 +14,7 @@ mod service;
 mod store;
 mod tap;
 mod traillog;
+mod webhook;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
@@ -177,6 +178,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GrantCmd,
     },
+    /// Inspect or remove webhook secrets (set them via pher apply)
+    Webhook {
+        #[command(subcommand)]
+        cmd: WebhookCmd,
+    },
     /// Show the full match record for a delivery
     Why {
         #[arg(name = "delivery-id")]
@@ -274,6 +280,17 @@ enum GrantCmd {
         json: bool,
     },
     /// Remove a grant
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum WebhookCmd {
+    /// List webhooks with a configured secret (secrets shown as fingerprints only)
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a webhook's secret (the hook then rejects every request)
     Rm { name: String },
 }
 
@@ -807,6 +824,34 @@ fn run() -> anyhow::Result<()> {
                     println!("removed {name}");
                 } else {
                     bail!("no grant '{name}'");
+                }
+            }
+        },
+        Cmd::Webhook { cmd } => match cmd {
+            WebhookCmd::Ls { json } => {
+                let response = client::call_target(&target, &Request::WebhookLs)?;
+                let webhooks = response["webhooks"].as_array().cloned().unwrap_or_default();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&webhooks)?);
+                } else if webhooks.is_empty() {
+                    println!("no webhook secrets in config (PHER_WEBHOOK_SECRET[_<NAME>] env still applies)");
+                } else {
+                    for w in webhooks {
+                        println!(
+                            "{}  [{}]",
+                            w["name"].as_str().unwrap_or("?"),
+                            w["secretFingerprint"].as_str().unwrap_or("?"),
+                        );
+                    }
+                }
+            }
+            WebhookCmd::Rm { name } => {
+                let response =
+                    client::call_target(&target, &Request::WebhookRm { name: name.clone() })?;
+                if response["removed"].as_bool() == Some(true) {
+                    println!("removed {name}");
+                } else {
+                    bail!("no webhook '{name}'");
                 }
             }
         },

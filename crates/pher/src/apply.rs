@@ -49,6 +49,57 @@ pub struct Config {
     pub grants: Vec<GrantEntry>,
     #[serde(default, rename = "connector")]
     pub connectors: Vec<ConnectorEntry>,
+    #[serde(default, rename = "webhook")]
+    pub webhooks: Vec<WebhookEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookEntry {
+    pub name: String,
+    #[serde(default, rename = "secret-env")]
+    pub secret_env: Option<String>,
+    #[serde(default, rename = "secret-cmd")]
+    pub secret_cmd: Option<String>,
+}
+
+impl WebhookEntry {
+    fn validate(&self) -> anyhow::Result<()> {
+        if !crate::webhook::is_valid_name(&self.name) {
+            bail!(
+                "webhook '{}': names are lowercase letters, digits, '-' or '_' \
+                 (they are the /webhook/<name> path)",
+                self.name
+            );
+        }
+        match (&self.secret_env, &self.secret_cmd) {
+            (Some(_), None) | (None, Some(_)) => Ok(()),
+            _ => bail!(
+                "webhook '{}': set exactly one of secret-env or secret-cmd",
+                self.name
+            ),
+        }
+    }
+
+    fn resolve_secret(&self) -> anyhow::Result<String> {
+        let secret = match (&self.secret_env, &self.secret_cmd) {
+            (Some(var), _) => std::env::var(var)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .with_context(|| format!("webhook '{}': secret-env {var} is unset", self.name))?,
+            (None, Some(cmd)) => crate::connector::resolve_token(&format!("cmd:{cmd}"))
+                .with_context(|| format!("webhook '{}': secret-cmd failed", self.name))?,
+            (None, None) => bail!("webhook '{}': secret-env or secret-cmd required", self.name),
+        };
+        if secret.len() < crate::webhook::MIN_SECRET_LEN {
+            bail!(
+                "webhook '{}': secret must be at least {} characters",
+                self.name,
+                crate::webhook::MIN_SECRET_LEN
+            );
+        }
+        Ok(secret)
+    }
 }
 
 /// A vendor extractor instance (see `pher connect catalog`).
@@ -243,6 +294,15 @@ pub fn run(
         for (name, _) in &desired_subs {
             if !seen.insert(name.clone()) {
                 bail!("duplicate subscription name '{name}' in config");
+            }
+        }
+    }
+    {
+        let mut seen = std::collections::HashSet::new();
+        for entry in &config.webhooks {
+            entry.validate()?;
+            if !seen.insert(entry.name.as_str()) {
+                bail!("duplicate webhook name '{}' in config", entry.name);
             }
         }
     }
@@ -621,6 +681,54 @@ pub fn run(
                     act(format!("connector {name}: pruned"));
                     if !dry_run {
                         client::call_target(target, &Request::ConnectorRm { name: name.clone() })?;
+                    }
+                }
+            }
+        }
+    }
+
+    if !config.webhooks.is_empty() || prune {
+        let wls = client::call_target(target, &Request::WebhookLs)?;
+        let existing: HashMap<String, Value> = wls["webhooks"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|w| Some((w.get("name")?.as_str()?.to_string(), w)))
+            .collect();
+        for entry in &config.webhooks {
+            let secret = entry.resolve_secret()?;
+            let same = existing.get(&entry.name).is_some_and(|w| {
+                w["secretFingerprint"].as_str()
+                    == Some(crate::connector::token_fingerprint(&secret).as_str())
+            });
+            if same {
+                println!("  webhook {}: unchanged", entry.name);
+                continue;
+            }
+            let existed = existing.contains_key(&entry.name);
+            act(format!(
+                "webhook {}: {}",
+                entry.name,
+                if existed { "secret updated" } else { "created" }
+            ));
+            if !dry_run {
+                client::call_target(
+                    target,
+                    &Request::WebhookSet {
+                        def: json!({ "name": entry.name, "secret": secret }),
+                    },
+                )?;
+            }
+        }
+        if prune {
+            let desired: std::collections::HashSet<&str> =
+                config.webhooks.iter().map(|w| w.name.as_str()).collect();
+            for name in existing.keys() {
+                if !desired.contains(name.as_str()) {
+                    act(format!("webhook {name}: pruned"));
+                    if !dry_run {
+                        client::call_target(target, &Request::WebhookRm { name: name.clone() })?;
                     }
                 }
             }

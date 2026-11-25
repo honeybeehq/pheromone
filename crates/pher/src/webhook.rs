@@ -1,0 +1,293 @@
+use std::io::Write;
+use std::sync::Mutex;
+
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
+use crate::protocol::{err, ok, Request};
+use crate::store::Paths;
+
+const SIGNATURE_HEADERS: [&str; 3] = ["x-hub-signature-256", "x-signature", "x-pher-signature"];
+const TOKEN_HEADERS: [&str; 2] = ["x-pher-webhook-token", "x-gitlab-token"];
+pub(crate) const MIN_SECRET_LEN: usize = 16;
+
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Serialize, Deserialize)]
+struct WebhookDef {
+    name: String,
+    secret: String,
+}
+
+pub(crate) enum Rejection {
+    NotConfigured,
+    BadCredentials,
+    SecretsUnreadable,
+}
+
+impl Rejection {
+    pub(crate) fn status(&self) -> u16 {
+        match self {
+            Rejection::NotConfigured => 403,
+            Rejection::BadCredentials => 401,
+            Rejection::SecretsUnreadable => 500,
+        }
+    }
+
+    pub(crate) fn message(&self, name: &str) -> String {
+        match self {
+            Rejection::NotConfigured => format!(
+                "webhook '{name}' has no secret configured; add a [[webhook]] entry and run \
+                 `pher apply`, or set {} on the daemon",
+                env_var_for(name)
+            ),
+            Rejection::BadCredentials => format!(
+                "webhook '{name}' authentication failed: send X-Hub-Signature-256: \
+                 sha256=<hmac of the body> or X-Pher-Webhook-Token"
+            ),
+            Rejection::SecretsUnreadable => {
+                "webhook secrets are unreadable; check webhooks.json".to_string()
+            }
+        }
+    }
+}
+
+pub(crate) fn sanitize_name(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+pub(crate) fn is_valid_name(name: &str) -> bool {
+    !name.is_empty() && sanitize_name(name) == name
+}
+
+pub(crate) fn authenticate(
+    paths: &Paths,
+    name: &str,
+    body: &[u8],
+    header: impl Fn(&str) -> Option<String>,
+) -> Result<(), Rejection> {
+    let secret = secret_for(paths, name)?.ok_or(Rejection::NotConfigured)?;
+    let signed = SIGNATURE_HEADERS
+        .iter()
+        .find_map(|h| header(h))
+        .is_some_and(|sig| verify_hmac(&secret, body, &sig));
+    let tokened = TOKEN_HEADERS
+        .iter()
+        .find_map(|h| header(h))
+        .is_some_and(|token| tokens_match(&secret, &token));
+    if signed || tokened {
+        Ok(())
+    } else {
+        Err(Rejection::BadCredentials)
+    }
+}
+
+pub(crate) fn any_configured(paths: &Paths) -> bool {
+    load(paths).is_ok_and(|defs| !defs.is_empty())
+        || std::env::vars().any(|(k, v)| k.starts_with("PHER_WEBHOOK_SECRET") && !v.is_empty())
+}
+
+pub(crate) fn handle_rpc(request: Request, paths: &Paths) -> Value {
+    match request {
+        Request::WebhookSet { def } => set(paths, def),
+        Request::WebhookLs => list(paths),
+        Request::WebhookRm { name } => remove(paths, &name),
+        _ => err("not a webhook op"),
+    }
+}
+
+fn set(paths: &Paths, def: Value) -> Value {
+    let Ok(def) = serde_json::from_value::<WebhookDef>(def) else {
+        return err("invalid webhook: expected {name, secret} with string values");
+    };
+    if !is_valid_name(&def.name) {
+        return err(format!(
+            "webhook name '{}' must be lowercase letters, digits, '-' or '_'",
+            sanitize_name(&def.name)
+        ));
+    }
+    if def.secret.len() < MIN_SECRET_LEN {
+        return err(format!(
+            "webhook '{}': secret must be at least {MIN_SECRET_LEN} characters",
+            def.name
+        ));
+    }
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut defs = match load(paths) {
+        Ok(defs) => defs,
+        Err(e) => return err(format!("cannot read webhooks.json: {e}")),
+    };
+    let name = def.name.clone();
+    defs.retain(|d| d.name != name);
+    defs.push(def);
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
+    match save(paths, &defs) {
+        Ok(()) => ok(json!({ "name": name })),
+        Err(e) => err(format!("cannot persist webhook: {e}")),
+    }
+}
+
+fn list(paths: &Paths) -> Value {
+    match load(paths) {
+        Ok(defs) => {
+            let webhooks: Vec<Value> = defs
+                .iter()
+                .map(|d| {
+                    json!({
+                        "name": d.name,
+                        "secretFingerprint": crate::connector::token_fingerprint(&d.secret),
+                    })
+                })
+                .collect();
+            ok(json!({ "webhooks": webhooks }))
+        }
+        Err(e) => err(format!("cannot read webhooks.json: {e}")),
+    }
+}
+
+fn remove(paths: &Paths, name: &str) -> Value {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut defs = match load(paths) {
+        Ok(defs) => defs,
+        Err(e) => return err(format!("cannot read webhooks.json: {e}")),
+    };
+    let before = defs.len();
+    defs.retain(|d| d.name != name);
+    let removed = defs.len() != before;
+    if removed {
+        if let Err(e) = save(paths, &defs) {
+            return err(format!("cannot persist webhook removal: {e}"));
+        }
+    }
+    ok(json!({ "removed": removed }))
+}
+
+fn secret_for(paths: &Paths, name: &str) -> Result<Option<String>, Rejection> {
+    let defs = load(paths).map_err(|_| Rejection::SecretsUnreadable)?;
+    if let Some(def) = defs.into_iter().find(|d| d.name == name) {
+        return Ok(Some(def.secret));
+    }
+    Ok(std::env::var(env_var_for(name))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("PHER_WEBHOOK_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+        }))
+}
+
+fn env_var_for(name: &str) -> String {
+    format!(
+        "PHER_WEBHOOK_SECRET_{}",
+        name.to_uppercase().replace('-', "_")
+    )
+}
+
+fn load(paths: &Paths) -> Result<Vec<WebhookDef>, String> {
+    match std::fs::read(paths.webhooks()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| "webhooks.json is corrupt".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.kind().to_string()),
+    }
+}
+
+fn save(paths: &Paths, defs: &[WebhookDef]) -> anyhow::Result<()> {
+    let path = paths.webhooks();
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&serde_json::to_vec_pretty(defs)?)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn verify_hmac(secret: &str, body: &[u8], signature: &str) -> bool {
+    let hex_part = signature.trim();
+    let hex_part = hex_part.strip_prefix("sha256=").unwrap_or(hex_part);
+    let Ok(expected) = hex::decode(hex_part) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
+fn tokens_match(secret: &str, presented: &str) -> bool {
+    let expected = Sha256::digest(secret.as_bytes());
+    let actual = Sha256::digest(presented.as_bytes());
+    expected.ct_eq(&actual).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hmac_verification() {
+        let secret = "topsecret";
+        let body = b"{\"hello\": \"world\"}";
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let sig = hex::encode(mac.finalize().into_bytes());
+
+        assert!(verify_hmac(secret, body, &format!("sha256={sig}")));
+        assert!(verify_hmac(secret, body, &sig));
+        assert!(!verify_hmac(secret, body, "sha256=deadbeef"));
+        assert!(!verify_hmac(secret, body, ""));
+        assert!(!verify_hmac("wrong", body, &format!("sha256={sig}")));
+    }
+
+    #[test]
+    fn hook_names_sanitized() {
+        assert_eq!(sanitize_name("Sentry"), "sentry");
+        assert_eq!(sanitize_name("my_hook-1"), "my_hook-1");
+        assert_eq!(sanitize_name("../etc/passwd"), "etc-passwd");
+        assert_eq!(sanitize_name("//"), "");
+    }
+
+    #[test]
+    fn hooks_without_a_secret_are_closed() {
+        let home = std::env::temp_dir().join(format!("pher-webhook-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = Paths { home: home.clone() };
+        let name = "closed-by-default-probe";
+        let no_headers = |_: &str| None;
+        assert!(matches!(
+            authenticate(&paths, name, b"{}", no_headers),
+            Err(Rejection::NotConfigured)
+        ));
+
+        let secret = "0123456789abcdef-probe";
+        assert!(set(&paths, json!({"name": name, "secret": secret}))["ok"] == true);
+        assert!(matches!(
+            authenticate(&paths, name, b"{}", no_headers),
+            Err(Rejection::BadCredentials)
+        ));
+        let token = |h: &str| (h == "x-pher-webhook-token").then(|| secret.to_string());
+        assert!(authenticate(&paths, name, b"{}", token).is_ok());
+        assert!(!list(&paths).to_string().contains(secret));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}

@@ -72,8 +72,11 @@ What works today:
   run taps with no local daemon: `pher --node hub tap hive`.
 - **HTTP ingress** (`PHER_HTTP=127.0.0.1:4870`, or a tailnet address +
   `PHER_HTTP_TOKEN` — public binds without a token are refused at startup):
-  `POST /webhook/<name>` (generic webhook tap, HMAC-SHA256 verified via
-  `PHER_WEBHOOK_SECRET[_<NAME>]`, events land as `webhook.<name>`),
+  `POST /webhook/<name>` (generic webhook tap, events land as
+  `webhook.<name>`; every request must carry the hook's HMAC-SHA256 signature
+  (`X-Hub-Signature-256`) or secret token (`X-Pher-Webhook-Token`), and a hook
+  with no secret rejects everything — secrets come from `[[webhook]]` in
+  pheromone.toml via `pher apply`, or `PHER_WEBHOOK_SECRET[_<NAME>]`),
   `POST /emit` (remote emit from other nodes), `POST /metric` (datapoint
   intake), `GET /healthz`.
 - **Metric condition engine** (`pher condition add p95_high --metric

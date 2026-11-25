@@ -1,24 +1,24 @@
 //! HTTP ingress: the push-tap runtime. Three endpoints, one listener:
 //!
 //! - `POST /webhook/<name>` — generic webhook tap (Sentry, Vercel, PostHog,
-//!   GitHub, anything that can POST JSON). HMAC-SHA256 verification when a
-//!   secret is configured; events land as `webhook.<name>`.
+//!   GitHub, anything that can POST JSON). Every request must carry the
+//!   hook's HMAC-SHA256 signature or secret token; a hook without a secret is
+//!   closed. Events land as `webhook.<name>`.
 //! - `POST /emit` — remote emit (other tailnet nodes, scripts, taps).
 //! - `POST /metric` — datapoint intake for the condition engine; only
 //!   condition transitions reach the trail, never the datapoints themselves.
 //!
 //! Bind via `PHER_HTTP` (e.g. `127.0.0.1:4870`, or a tailnet address).
 //! Binding beyond loopback REQUIRES `PHER_HTTP_TOKEN` — refused otherwise.
-//! Webhook secrets: `PHER_WEBHOOK_SECRET` (all hooks) or
-//! `PHER_WEBHOOK_SECRET_<NAME>` (per hook, name uppercased).
+//! Webhook secrets: `[[webhook]]` in pheromone.toml (via `pher apply`),
+//! `PHER_WEBHOOK_SECRET_<NAME>` (per hook, name uppercased), or
+//! `PHER_WEBHOOK_SECRET` (all hooks). See `webhook.rs`.
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
-use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
-use sha2::Sha256;
 
 use crate::daemon::State;
 use crate::protocol::{PartialEvent, Request};
@@ -466,7 +466,7 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
             );
         }
         ("POST", p) if p.starts_with("/webhook/") => {
-            let name = sanitize_hook_name(&p["/webhook/".len()..]);
+            let name = crate::webhook::sanitize_name(&p["/webhook/".len()..]);
             if name.is_empty() {
                 return respond(
                     request,
@@ -474,17 +474,15 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                     json!({"ok": false, "error": "missing hook name"}),
                 );
             }
-            if let Some(secret) = webhook_secret(&name) {
-                let sig = header("x-hub-signature-256")
-                    .or_else(|| header("x-signature"))
-                    .or_else(|| header("x-pher-signature"));
-                if !verify_hmac(&secret, &body, sig.as_deref()) {
-                    return respond(
-                        request,
-                        401,
-                        json!({"ok": false, "error": "signature verification failed"}),
-                    );
-                }
+            let paths = state.lock().unwrap().paths_clone();
+            if let Err(rejection) = crate::webhook::authenticate(&paths, &name, &body, header) {
+                let message = rejection.message(&name);
+                eprintln!("pherd: webhook '{name}' rejected ({})", rejection.status());
+                return respond(
+                    request,
+                    rejection.status(),
+                    json!({"ok": false, "error": message}),
+                );
             }
             let payload = serde_json::from_slice::<Value>(&body)
                 .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&body).to_string() }));
@@ -534,72 +532,4 @@ fn respond(request: tiny_http::Request, code: u16, body: Value) {
                 .expect("static header"),
         );
     let _ = request.respond(response);
-}
-
-fn sanitize_hook_name(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
-fn webhook_secret(name: &str) -> Option<String> {
-    let specific = format!(
-        "PHER_WEBHOOK_SECRET_{}",
-        name.to_uppercase().replace('-', "_")
-    );
-    std::env::var(specific)
-        .ok()
-        .or_else(|| std::env::var("PHER_WEBHOOK_SECRET").ok())
-        .filter(|s| !s.is_empty())
-}
-
-/// GitHub-style `sha256=<hex>` (bare hex also accepted). Constant-time via
-/// the hmac crate's verify.
-fn verify_hmac(secret: &str, body: &[u8], signature: Option<&str>) -> bool {
-    let Some(sig) = signature else { return false };
-    let hex_part = sig.strip_prefix("sha256=").unwrap_or(sig);
-    let Ok(expected) = hex::decode(hex_part.trim()) else {
-        return false;
-    };
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(body);
-    mac.verify_slice(&expected).is_ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hmac_verification() {
-        let secret = "topsecret";
-        let body = b"{\"hello\": \"world\"}";
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(body);
-        let sig = hex::encode(mac.finalize().into_bytes());
-
-        assert!(verify_hmac(secret, body, Some(&format!("sha256={sig}"))));
-        assert!(verify_hmac(secret, body, Some(&sig)));
-        assert!(!verify_hmac(secret, body, Some("sha256=deadbeef")));
-        assert!(!verify_hmac(secret, body, None));
-        assert!(!verify_hmac("wrong", body, Some(&format!("sha256={sig}"))));
-    }
-
-    #[test]
-    fn hook_names_sanitized() {
-        assert_eq!(sanitize_hook_name("Sentry"), "sentry");
-        assert_eq!(sanitize_hook_name("my_hook-1"), "my_hook-1");
-        assert_eq!(sanitize_hook_name("../etc/passwd"), "etc-passwd");
-        assert_eq!(sanitize_hook_name("//"), "");
-    }
 }

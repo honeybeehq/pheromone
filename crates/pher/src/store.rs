@@ -91,6 +91,10 @@ impl Paths {
         self.home.join("grants.json")
     }
 
+    pub fn webhooks(&self) -> PathBuf {
+        self.home.join("webhooks.json")
+    }
+
     pub fn connectors(&self) -> PathBuf {
         self.home.join("connectors.json")
     }
