@@ -71,8 +71,22 @@ const sub = await hub.on(
 - `cursor` names a hub-side position. On attach, the hub replays exactly the
   deliveries this cursor missed (`sub.ack.resumedFrom` / `.replayed` /
   `.gapExpired`), then goes live. With `autoCommit` (default), the position
-  advances as your handler processes deliveries — crash and restart, and you
-  get redelivery from the last commit: at-least-once, no gaps, no dupes.
+  advances only after your handler finishes a delivery: when it returns, or
+  when the promise it returns resolves. Crash and restart, and you get
+  redelivery from the last commit: at-least-once, no gaps.
+- Async handlers run concurrently. The cursor commits the highest seq whose
+  handler and every earlier handler have finished, so a slow delivery holds
+  the cursor until it completes.
+- A handler that throws or rejects is not committed. The listener emits
+  `'error'` with the error (its `delivery` property is the failed delivery),
+  and the cursor stops advancing for the rest of that connection. With
+  `cursor`, the next attach (restart or `reconnect` after a connection loss)
+  resumes from the last commit, so the failed delivery comes back. Without
+  `cursor`, resume state is the client-side `lastSeq`, which counts a failed
+  delivery as seen. Without an `'error'` listener, Node treats the failure
+  as uncaught.
+- The `'delivery'` event fires when a delivery arrives, right after the
+  handler is called; it does not wait for an async handler.
 - `reconnect` re-attaches with backoff on connection loss and resumes from
   the cursor (or the last seen `seq`); the listener emits `'reconnect'`.
 - Catch-up replay is bounded by the hub's retention (default 7d) and

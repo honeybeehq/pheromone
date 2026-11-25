@@ -188,12 +188,65 @@ export class PherClient {
       commitTimer.unref?.();
     };
 
-    const onDelivery = (delivery) => {
+    const runHandler = (delivery) => {
+      try {
+        return Promise.resolve(handler ? handler(delivery) : undefined);
+      } catch (e) {
+        return Promise.reject(e);
+      }
+    };
+
+    const reportHandlerFailure = (delivery, cause) => {
+      const err = cause instanceof Error ? cause : new Error(String(cause));
+      err.delivery = delivery;
+      listener.emit("error", err);
+    };
+
+    const createCommitQueue = () => {
+      const pending = [];
+      let blocked = false;
+      const advance = () => {
+        let committable = 0;
+        while (pending.length && pending[0].state === "done") {
+          committable = pending.shift().seq;
+        }
+        if (committable) scheduleCommit(committable);
+      };
+      return {
+        track(seq) {
+          if (blocked) return null;
+          const entry = { seq, state: "running" };
+          let at = pending.length;
+          while (at > 0 && pending[at - 1].seq > seq) at--;
+          pending.splice(at, 0, entry);
+          return entry;
+        },
+        settle(entry, ok) {
+          if (!entry || blocked) return;
+          if (!ok) {
+            blocked = true;
+            pending.length = 0;
+            return;
+          }
+          entry.state = "done";
+          advance();
+        },
+      };
+    };
+
+    const deliveryHandlerFor = (commitQueue) => (delivery) => {
+      let entry = null;
       if (delivery.seq) {
         listener.lastSeq = Math.max(listener.lastSeq, delivery.seq);
-        if (cursor && autoCommit) scheduleCommit(delivery.seq);
+        if (cursor && autoCommit) entry = commitQueue.track(delivery.seq);
       }
-      if (handler) handler(delivery);
+      runHandler(delivery).then(
+        () => commitQueue.settle(entry, true),
+        (e) => {
+          commitQueue.settle(entry, false);
+          reportHandlerFailure(delivery, e);
+        },
+      );
       listener.emit("delivery", delivery);
     };
 
@@ -209,6 +262,7 @@ export class PherClient {
       if (cursor) req.cursor = cursor;
       if (!cursor && resumeAfter) req.after = resumeAfter;
       const sock = await this._t.stream(req);
+      const onDelivery = deliveryHandlerFor(createCommitQueue());
 
       // The delivery handler must be wired BEFORE awaiting the ack: with
       // catch-up replay, deliveries can arrive in the same chunk as the ack

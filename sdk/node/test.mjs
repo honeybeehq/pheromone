@@ -169,6 +169,78 @@ try {
   assert.ok(cursors.some((c) => c.name === "t-cur"));
   console.log("ok  cursor resume replays exactly the gap");
 
+  await pher.cursorCommit("t-hang", (await pher.cursors()).head);
+  const neverSettles = new Promise(() => {});
+  const handled = [];
+  const h1 = await pher.on(
+    "on hang.*",
+    (d) => {
+      handled.push(d.event.subject);
+      return d.event.subject === "hang.a" ? neverSettles : sleep(10);
+    },
+    { cursor: "t-hang" },
+  );
+  await pher.emit("hang.a", { n: 1 });
+  await pher.emit("hang.b", { n: 2 });
+  await until(() => handled.length >= 2, "both hang deliveries handled");
+  await sleep(500);
+  h1.close();
+  await until(
+    async () => !(await pher.ls()).some((s) => s.id === h1.id),
+    "hang listener teardown",
+  );
+  const redelivered = [];
+  const h2 = await pher.on("on hang.*", (d) => redelivered.push(d), {
+    cursor: "t-hang",
+  });
+  await until(() => redelivered.length >= 2, "unfinished delivery replay");
+  await sleep(200);
+  assert.deepEqual(
+    redelivered.map((d) => d.event.subject),
+    ["hang.a", "hang.b"],
+    "an unfinished handler holds the cursor before its seq",
+  );
+  h2.close();
+  console.log("ok  cursor waits for unfinished handlers");
+
+  await pher.cursorCommit("t-fail", (await pher.cursors()).head);
+  const handlerErrors = [];
+  const f1 = await pher.on(
+    "on fail.*",
+    async (d) => {
+      if (d.event.subject === "fail.a") throw new Error("handler blew up");
+    },
+    { cursor: "t-fail" },
+  );
+  f1.on("error", (e) => handlerErrors.push(e));
+  await pher.emit("fail.a", { n: 1 });
+  await pher.emit("fail.b", { n: 2 });
+  await until(() => handlerErrors.length >= 1, "handler rejection reported");
+  assert.equal(handlerErrors[0].message, "handler blew up");
+  assert.equal(handlerErrors[0].delivery.event.subject, "fail.a");
+  await sleep(500);
+  f1.close();
+  await until(
+    async () => !(await pher.ls()).some((s) => s.id === f1.id),
+    "fail listener teardown",
+  );
+  const retried = [];
+  const f2 = await pher.on("on fail.*", (d) => retried.push(d), {
+    cursor: "t-fail",
+  });
+  await until(() => retried.length >= 2, "rejected delivery replay");
+  await sleep(200);
+  assert.deepEqual(
+    retried.map((d) => d.event.subject),
+    ["fail.a", "fail.b"],
+    "a rejected handler is redelivered on resume",
+  );
+  await sleep(500);
+  f2.close();
+  const after = (await pher.cursors()).cursors.find((c) => c.name === "t-fail");
+  assert.equal(after.seq, retried[1].seq, "cursor advances once handlers succeed");
+  console.log("ok  rejected handler is redelivered on resume");
+
   // Reconnect: a server-side hangup (rm) triggers re-attach with backoff.
   const got3 = [];
   const r1 = await pher.on("on rec.*", (d) => got3.push(d), { reconnect: true });

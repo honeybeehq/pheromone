@@ -66,7 +66,10 @@ export declare class Listener extends EventEmitter {
   on(event: "delivery", cb: (delivery: Delivery) => void): this;
   on(event: "close", cb: () => void): this;
   on(event: "reconnect", cb: (id: string) => void): this;
-  on(event: "error", cb: (err: Error) => void): this;
+  on(
+    event: "error",
+    cb: (err: Error & { delivery?: Delivery }) => void,
+  ): this;
 }
 
 export interface TailHandle extends EventEmitter {
@@ -98,14 +101,15 @@ export declare class PherClient {
    */
   on(
     subscription: string,
-    handler?: (delivery: Delivery) => void,
+    handler?: (delivery: Delivery) => void | Promise<unknown>,
     opts?: {
       client?: string;
       /** Resume: replay matches from log seq > after, then live. */
       after?: number;
       /** Named hub-side cursor: resume from its committed position. */
       cursor?: string;
-      /** Commit the cursor as deliveries are handled (default true). */
+      /** Commit the cursor after the handler (or its promise) completes,
+       * never past an unfinished or failed delivery (default true). */
       autoCommit?: boolean;
       /** Re-attach with backoff on connection loss (default false). */
       reconnect?: boolean;
