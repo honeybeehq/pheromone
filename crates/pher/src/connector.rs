@@ -80,8 +80,8 @@ pub struct PollSpec {
     #[serde(default)]
     pub ts: Option<String>,
     /// Record field to watermark on (only records with field > stored
-    /// watermark are emitted). Usually a timestamp; compared as strings for
-    /// ISO-8601, numerically when both sides parse as numbers.
+    /// watermark are emitted). Compared exactly as numbers when both sides are
+    /// numbers, chronologically when both are RFC 3339 timestamps, else as strings.
     #[serde(default)]
     pub watermark: Option<String>,
     #[serde(default)]
@@ -274,15 +274,123 @@ fn sanitize_token(s: &str) -> String {
     }
 }
 
-/// Watermark comparison: numeric when both parse, else lexicographic
-/// (correct for ISO-8601 timestamps).
-fn wm_newer(candidate: &str, stored: &str) -> bool {
-    if stored.is_empty() {
-        return true;
+fn wm_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (WmKey::parse(a), WmKey::parse(b)) {
+        (WmKey::Number(x), WmKey::Number(y)) => x.cmp(&y),
+        (WmKey::Instant(x), WmKey::Instant(y)) => x.cmp(&y),
+        _ => a.cmp(b),
     }
-    match (candidate.parse::<f64>(), stored.parse::<f64>()) {
-        (Ok(c), Ok(s)) => c > s,
-        _ => candidate > stored,
+}
+
+fn wm_newer(candidate: &str, stored: &str) -> bool {
+    stored.is_empty() || wm_cmp(candidate, stored) == std::cmp::Ordering::Greater
+}
+
+fn sort_oldest_first<T>(items: &mut [(String, String, T)]) {
+    let kinds: HashSet<_> = items
+        .iter()
+        .filter(|item| !item.0.is_empty())
+        .map(|item| std::mem::discriminant(&WmKey::parse(&item.0)))
+        .collect();
+    if kinds.len() <= 1 {
+        items.sort_by(|a, b| wm_cmp(&a.0, &b.0));
+    } else {
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+}
+
+enum WmKey {
+    Number(Decimal),
+    Instant(std::time::SystemTime),
+    Text,
+}
+
+impl WmKey {
+    fn parse(text: &str) -> WmKey {
+        if let Some(number) = Decimal::parse(text) {
+            WmKey::Number(number)
+        } else if let Some(instant) = rfc3339_instant(text) {
+            WmKey::Instant(instant)
+        } else {
+            WmKey::Text
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct Decimal {
+    negative: bool,
+    digits: String,
+    magnitude: i64,
+}
+
+impl Decimal {
+    fn parse(text: &str) -> Option<Decimal> {
+        let (negative, unsigned) = match text.as_bytes().first()? {
+            b'-' => (true, &text[1..]),
+            b'+' => (false, &text[1..]),
+            _ => (false, text),
+        };
+        let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+            Some(at) => (&unsigned[..at], unsigned[at + 1..].parse::<i32>().ok()?),
+            None => (unsigned, 0),
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if (whole.is_empty() && fraction.is_empty())
+            || !whole.bytes().all(|b| b.is_ascii_digit())
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let all = format!("{whole}{fraction}");
+        let significant = all.trim_start_matches('0');
+        let leading_zeros = all.len() - significant.len();
+        let digits = significant.trim_end_matches('0').to_string();
+        if digits.is_empty() {
+            return Some(Decimal {
+                negative: false,
+                digits,
+                magnitude: 0,
+            });
+        }
+        let magnitude = whole.len() as i64 - leading_zeros as i64 + i64::from(exponent);
+        Some(Decimal {
+            negative,
+            digits,
+            magnitude,
+        })
+    }
+
+    fn sign(&self) -> i8 {
+        match (self.digits.is_empty(), self.negative) {
+            (true, _) => 0,
+            (false, true) => -1,
+            (false, false) => 1,
+        }
+    }
+}
+
+impl Ord for Decimal {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let by_sign = self.sign().cmp(&other.sign());
+        if by_sign != std::cmp::Ordering::Equal || self.sign() == 0 {
+            return by_sign;
+        }
+        let by_size = self
+            .magnitude
+            .cmp(&other.magnitude)
+            .then_with(|| self.digits.cmp(&other.digits));
+        if self.negative {
+            by_size.reverse()
+        } else {
+            by_size
+        }
+    }
+}
+
+impl PartialOrd for Decimal {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -318,16 +426,17 @@ pub fn filter_new(
         };
         let version = record_version(r, spec);
         let key = seen_key(&id, &version);
-        let legacy_tie = version == state.watermark && state.recent.contains(&id);
+        let legacy_tie = !state.watermark.is_empty()
+            && wm_cmp(&version, &state.watermark).is_eq()
+            && state.recent.contains(&id);
         if legacy_tie || state.recent.contains(&key) || batch.contains(&key) {
             continue;
         }
         if spec.watermark.is_some() {
             // Admit strictly-newer, AND watermark ties (two events in the
             // same second) — the recent-ids window dedups tie repeats.
-            let admissible = state.watermark.is_empty()
-                || wm_newer(&version, &state.watermark)
-                || version == state.watermark;
+            let admissible =
+                state.watermark.is_empty() || wm_cmp(&version, &state.watermark).is_ge();
             if !admissible {
                 continue;
             }
@@ -335,7 +444,7 @@ pub fn filter_new(
         batch.insert(key.clone());
         fresh.push((version, key, r.clone()));
     }
-    fresh.sort_by(|a, b| a.0.cmp(&b.0)); // oldest first
+    sort_oldest_first(&mut fresh);
     for (wm, key, _) in &fresh {
         if wm_newer(wm, &new_state.watermark) {
             new_state.watermark = wm.clone();
@@ -776,9 +885,7 @@ fn is_known(record: &Value, spec: &PollSpec, stored: &PollState) -> bool {
     match &spec.watermark {
         Some(wm_field) => {
             let wm = field_str(record, wm_field).unwrap_or_default();
-            !stored.watermark.is_empty()
-                && wm != stored.watermark
-                && !wm_newer(&wm, &stored.watermark)
+            !stored.watermark.is_empty() && wm_cmp(&wm, &stored.watermark).is_lt()
         }
         None => {
             field_str(record, &spec.id).is_some_and(|id| stored.recent.contains(&seen_key(&id, "")))
@@ -1100,6 +1207,28 @@ mod tests {
         assert!(wm_newer("100", "99"));
         assert!(!wm_newer("99", "100")); // lexicographic would say true
         assert!(wm_newer("2026-08-12T11:00:00Z", "2026-08-12T10:59:59Z"));
+        assert!(wm_newer("9007199254740993", "9007199254740992"));
+        assert!(wm_newer("1e3", "999.5"));
+        assert!(wm_newer("-1", "-2"));
+        assert!(wm_newer(".5", "0.4"));
+        assert!(wm_cmp("10.0", "1e1").is_eq());
+        assert!(wm_newer(
+            "2026-08-12T09:45:00-01:00",
+            "2026-08-12T10:00:00Z"
+        ));
+        assert!(wm_newer("2026-08-12T11:00:00.500Z", "2026-08-12T11:00:00Z"));
+        assert!(wm_cmp("2026-08-12T12:30:00+02:00", "2026-08-12T10:30:00Z").is_eq());
+
+        let mut s = spec();
+        s.watermark = Some("seq".into());
+        let batch: Vec<Value> = [11, 9, 10]
+            .iter()
+            .map(|n| json!({"id": format!("n{n}"), "seq": n}))
+            .collect();
+        let (fresh, st) = filter_new(&batch, &s, &PollState::default());
+        let order: Vec<_> = fresh.iter().map(|r| r["seq"].clone()).collect();
+        assert_eq!(order, [json!(9), json!(10), json!(11)]);
+        assert_eq!(st.watermark, "11");
     }
 
     #[test]
