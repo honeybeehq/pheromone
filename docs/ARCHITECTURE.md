@@ -32,6 +32,8 @@ plugins, inside a customer's own service — and only survivors cross the wire. 
 a browser playground for subscription authoring (regex101-for-pher), which is how a matching
 language gets adopted.
 
+Apiary's design hosts the WASM build in its kernel instead of the napi addon; see [APIARY.md](APIARY.md).
+
 ## Why Rust (and not Go, and not TS)
 
 **Not TS:** the original TS lean was premised on personal-fleet scale (single-digit
