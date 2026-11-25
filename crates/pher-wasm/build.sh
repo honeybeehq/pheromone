@@ -12,9 +12,15 @@ if [ "$installed" != "$bindgen_version" ]; then
   exit 1
 fi
 
-cargo build --locked --release -p pher-wasm --target wasm32-unknown-unknown
+binaryen_version=132.0.0
+
+cargo build --locked --profile wasm-release -p pher-wasm --target wasm32-unknown-unknown
 rm -rf pkg
 wasm-bindgen --target web --omit-default-module-path --out-dir pkg \
-  "$target_dir/wasm32-unknown-unknown/release/pher_wasm.wasm"
+  "$target_dir/wasm32-unknown-unknown/wasm-release/pher_wasm.wasm"
+npx --yes --package "binaryen@$binaryen_version" -- wasm-opt -Oz \
+  --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
+  --enable-mutable-globals --enable-reference-types --enable-multivalue \
+  pkg/pher_wasm_bg.wasm -o pkg/pher_wasm_bg.wasm
 node bytes-glue.mjs pkg "$crate_version" "$bindgen_version"
 echo "built pkg/ (@pheromone/wasm $crate_version, wasm-bindgen $bindgen_version); test with: node test.mjs"
