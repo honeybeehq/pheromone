@@ -12,4 +12,4 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pher-core = { path = "../pher-core" }
 serde_json.workspace = true
-wasm-bindgen = "0.2"
+wasm-bindgen = "=0.2.127"

@@ -32,6 +32,7 @@ jobs:
         with:
           toolchain: 1.93.0
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -63,4 +64,19 @@ jobs:
 
       - name: pher-node suite
         working-directory: crates/pher-node
+        run: node test.mjs
+
+      - name: Install wasm-bindgen-cli at the crate's pinned version
+        run: |
+          version="$(cargo pkgid --locked -p wasm-bindgen | sed 's/.*[@#]//')"
+          if [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" != "$version" ]; then
+            cargo install wasm-bindgen-cli --version "$version" --locked --force
+          fi
+
+      - name: Build pher-wasm
+        working-directory: crates/pher-wasm
+        run: bash ./build.sh
+
+      - name: pher-wasm suite
+        working-directory: crates/pher-wasm
         run: node test.mjs

@@ -79,7 +79,7 @@ then hive spawn --flow rerun-and-triage</textarea>
 </div>
 
 <script type="module">
-import init, { canon, validate, evaluate, whyNot } from "../crates/pher-wasm/pkg/pher_wasm.js";
+import { initSync, canon, validate, evaluate, whyNot } from "../crates/pher-wasm/pkg/pher_wasm.js";
 
 const $ = (id) => document.getElementById(id);
 const presets = [
@@ -137,7 +137,9 @@ function refresh() {
 
 const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
-await init();
+const wasmResponse = await fetch(new URL("../crates/pher-wasm/pkg/pher_wasm_bg.wasm", import.meta.url));
+if (!wasmResponse.ok) throw new Error(`pher_wasm_bg.wasm: HTTP ${wasmResponse.status}; build it with crates/pher-wasm/build.sh`);
+initSync({ module: await WebAssembly.compileStreaming(wasmResponse) });
 for (const [name, sub, ev] of presets) {
   const b = document.createElement("button");
   b.textContent = name;
