@@ -290,7 +290,8 @@ enum WebhookCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a webhook's secret (the hook then rejects every request)
+    /// Remove a webhook's applied secret; the hook rejects every request
+    /// unless the daemon has PHER_WEBHOOK_SECRET[_<NAME>] set
     Rm { name: String },
 }
 

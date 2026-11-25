@@ -74,9 +74,10 @@ What works today:
   `PHER_HTTP_TOKEN` — public binds without a token are refused at startup):
   `POST /webhook/<name>` (generic webhook tap, events land as
   `webhook.<name>`; every request must carry the hook's HMAC-SHA256 signature
-  (`X-Hub-Signature-256`) or secret token (`X-Pher-Webhook-Token`), and a hook
-  with no secret rejects everything — secrets come from `[[webhook]]` in
-  pheromone.toml via `pher apply`, or `PHER_WEBHOOK_SECRET[_<NAME>]`),
+  (`X-Hub-Signature-256`, `Sentry-Hook-Signature`, `Linear-Signature`) or
+  secret token (`X-Pher-Webhook-Token`, `X-Gitlab-Token`), and a hook with no
+  secret rejects everything — secrets (16+ characters) come from `[[webhook]]`
+  in pheromone.toml via `pher apply`, or `PHER_WEBHOOK_SECRET[_<NAME>]`),
   `POST /emit` (remote emit from other nodes), `POST /metric` (datapoint
   intake), `GET /healthz`.
 - **Metric condition engine** (`pher condition add p95_high --metric

@@ -136,8 +136,12 @@ curl -s -X POST http://127.0.0.1:4870/webhook/github -H "x-hub-signature-256: sh
 curl -s -X POST http://127.0.0.1:4870/webhook/github -H "x-pher-webhook-token: $GITHUB_WEBHOOK_SECRET" -d "$BODY"
 ```
 
-`PHER_WEBHOOK_SECRET_<NAME>` (or `PHER_WEBHOOK_SECRET` for every hook) in the
-daemon's environment works too; a `[[webhook]]` entry wins over both.
+Sentry (`Sentry-Hook-Signature`) and Linear (`Linear-Signature`) signatures
+verify the same way; GitLab's `X-Gitlab-Token` counts as a token. Secrets need
+at least 16 characters. `PHER_WEBHOOK_SECRET_<NAME>` in the daemon's
+environment works too, and a `[[webhook]]` entry wins over it.
+`PHER_WEBHOOK_SECRET` covers every hook but accepts signatures only, so one
+leaked token never opens all hooks.
 
 ## 10. Cursors: never miss an event
 

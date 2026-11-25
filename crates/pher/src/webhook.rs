@@ -10,7 +10,13 @@ use subtle::ConstantTimeEq;
 use crate::protocol::{err, ok, Request};
 use crate::store::Paths;
 
-const SIGNATURE_HEADERS: [&str; 3] = ["x-hub-signature-256", "x-signature", "x-pher-signature"];
+const SIGNATURE_HEADERS: [&str; 5] = [
+    "x-hub-signature-256",
+    "sentry-hook-signature",
+    "linear-signature",
+    "x-pher-signature",
+    "x-signature",
+];
 const TOKEN_HEADERS: [&str; 2] = ["x-pher-webhook-token", "x-gitlab-token"];
 pub(crate) const MIN_SECRET_LEN: usize = 16;
 
@@ -20,6 +26,11 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 struct WebhookDef {
     name: String,
     secret: String,
+}
+
+struct Secret {
+    value: String,
+    hook_specific: bool,
 }
 
 pub(crate) enum Rejection {
@@ -41,12 +52,13 @@ impl Rejection {
         match self {
             Rejection::NotConfigured => format!(
                 "webhook '{name}' has no secret configured; add a [[webhook]] entry and run \
-                 `pher apply`, or set {} on the daemon",
+                 `pher apply`, or set {} (at least {MIN_SECRET_LEN} characters) on the daemon",
                 env_var_for(name)
             ),
             Rejection::BadCredentials => format!(
-                "webhook '{name}' authentication failed: send X-Hub-Signature-256: \
-                 sha256=<hmac of the body> or X-Pher-Webhook-Token"
+                "webhook '{name}' authentication failed: sign the body with HMAC-SHA256 \
+                 (X-Hub-Signature-256: sha256=<hex>) or send the hook's own secret in \
+                 X-Pher-Webhook-Token"
             ),
             Rejection::SecretsUnreadable => {
                 "webhook secrets are unreadable; check webhooks.json".to_string()
@@ -83,11 +95,12 @@ pub(crate) fn authenticate(
     let signed = SIGNATURE_HEADERS
         .iter()
         .find_map(|h| header(h))
-        .is_some_and(|sig| verify_hmac(&secret, body, &sig));
-    let tokened = TOKEN_HEADERS
-        .iter()
-        .find_map(|h| header(h))
-        .is_some_and(|token| tokens_match(&secret, &token));
+        .is_some_and(|sig| verify_hmac(&secret.value, body, &sig));
+    let tokened = secret.hook_specific
+        && TOKEN_HEADERS
+            .iter()
+            .find_map(|h| header(h))
+            .is_some_and(|token| tokens_match(&secret.value, &token));
     if signed || tokened {
         Ok(())
     } else {
@@ -95,9 +108,8 @@ pub(crate) fn authenticate(
     }
 }
 
-pub(crate) fn any_configured(paths: &Paths) -> bool {
+pub(crate) fn any_applied(paths: &Paths) -> bool {
     load(paths).is_ok_and(|defs| !defs.is_empty())
-        || std::env::vars().any(|(k, v)| k.starts_with("PHER_WEBHOOK_SECRET") && !v.is_empty())
 }
 
 pub(crate) fn handle_rpc(request: Request, paths: &Paths) -> Value {
@@ -175,19 +187,29 @@ fn remove(paths: &Paths, name: &str) -> Value {
     ok(json!({ "removed": removed }))
 }
 
-fn secret_for(paths: &Paths, name: &str) -> Result<Option<String>, Rejection> {
+fn secret_for(paths: &Paths, name: &str) -> Result<Option<Secret>, Rejection> {
     let defs = load(paths).map_err(|_| Rejection::SecretsUnreadable)?;
-    if let Some(def) = defs.into_iter().find(|d| d.name == name) {
-        return Ok(Some(def.secret));
-    }
-    Ok(std::env::var(env_var_for(name))
+    let hook_specific = defs
+        .into_iter()
+        .find(|d| d.name == name)
+        .map(|d| d.secret)
+        .or_else(|| usable_env(&env_var_for(name)))
+        .map(|value| Secret {
+            value,
+            hook_specific: true,
+        });
+    Ok(hook_specific.or_else(|| {
+        usable_env("PHER_WEBHOOK_SECRET").map(|value| Secret {
+            value,
+            hook_specific: false,
+        })
+    }))
+}
+
+fn usable_env(var: &str) -> Option<String> {
+    std::env::var(var)
         .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("PHER_WEBHOOK_SECRET")
-                .ok()
-                .filter(|s| !s.is_empty())
-        }))
+        .filter(|s| s.len() >= MIN_SECRET_LEN)
 }
 
 fn env_var_for(name: &str) -> String {

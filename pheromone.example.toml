@@ -66,13 +66,15 @@ emit = 'on team.anna.**'
 
 # -- webhooks: authenticated push ingress ---------------------------------------
 # POST /webhook/<name> admits an event only when the request proves it holds
-# that hook's secret: an HMAC-SHA256 signature of the raw body in
-# X-Hub-Signature-256 (GitHub format, "sha256=<hex>"), or the secret itself in
-# X-Pher-Webhook-Token / X-Gitlab-Token. A hook with no secret rejects every
-# request (403). Secrets are at least 16 characters and resolve at apply time:
-# secret-env reads the environment, secret-cmd runs a command (a Hem ref, 1Password, …).
+# that hook's secret: an HMAC-SHA256 signature of the raw body (GitHub's
+# X-Hub-Signature-256: sha256=<hex>, Sentry-Hook-Signature, Linear-Signature,
+# X-Pher-Signature), or the secret itself in X-Pher-Webhook-Token /
+# X-Gitlab-Token. A hook with no secret rejects every request (403).
+# Secrets are at least 16 characters and resolve at apply time: secret-env
+# reads the environment, secret-cmd runs a command (a Hem ref, 1Password, …).
 # The daemon keeps them in webhooks.json (0600); `pher webhook ls` shows
-# fingerprints only.
+# fingerprints only. PHER_WEBHOOK_SECRET_<NAME> on the daemon also works;
+# the all-hooks PHER_WEBHOOK_SECRET accepts signatures only, never tokens.
 
 [[webhook]]
 name = "github"                       # receives POST /webhook/github

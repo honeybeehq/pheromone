@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::daemon::State;
 use crate::protocol::{PartialEvent, Request};
+use crate::store::Paths;
 
 const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
 
@@ -53,17 +54,24 @@ pub(crate) fn start(state: Arc<Mutex<State>>, config: HttpConfig) -> anyhow::Res
     let server = tiny_http::Server::http(&config.addr)
         .map_err(|e| anyhow::anyhow!("cannot bind http ingress on {}: {e}", config.addr))?;
     eprintln!("pherd http ingress on {}", config.addr);
+    let paths = state.lock().unwrap().paths_clone();
     std::thread::spawn(move || {
         for request in server.incoming_requests() {
             let state = Arc::clone(&state);
             let token = config.token.clone();
-            std::thread::spawn(move || handle(request, state, token));
+            let paths = paths.clone();
+            std::thread::spawn(move || handle(request, state, token, &paths));
         }
     });
     Ok(())
 }
 
-fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Option<String>) {
+fn handle(
+    mut request: tiny_http::Request,
+    state: Arc<Mutex<State>>,
+    token: Option<String>,
+    paths: &Paths,
+) {
     let method = request.method().to_string();
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
@@ -474,10 +482,8 @@ fn handle(mut request: tiny_http::Request, state: Arc<Mutex<State>>, token: Opti
                     json!({"ok": false, "error": "missing hook name"}),
                 );
             }
-            let paths = state.lock().unwrap().paths_clone();
-            if let Err(rejection) = crate::webhook::authenticate(&paths, &name, &body, header) {
+            if let Err(rejection) = crate::webhook::authenticate(paths, &name, &body, header) {
                 let message = rejection.message(&name);
-                eprintln!("pherd: webhook '{name}' rejected ({})", rejection.status());
                 return respond(
                     request,
                     rejection.status(),

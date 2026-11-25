@@ -99,10 +99,10 @@ pub fn run(paths: &Paths) -> anyhow::Result<()> {
     match std::env::var("PHER_HTTP") {
         Ok(addr) => {
             ok(&format!("http ingress configured on {addr}"));
-            if !crate::webhook::any_configured(paths) {
+            if !crate::webhook::any_applied(paths) {
                 gap(
-                    "no webhook secrets — POST /webhook/<name> rejects everything until a \
-                     [[webhook]] entry is applied or PHER_WEBHOOK_SECRET_<NAME> is set",
+                    "no [[webhook]] secrets applied — POST /webhook/<name> rejects every \
+                     request unless the daemon has PHER_WEBHOOK_SECRET[_<NAME>] set",
                 );
             }
         }
