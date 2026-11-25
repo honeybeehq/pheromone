@@ -111,7 +111,7 @@ for i in $(seq 1 10); do pher emit noisy.tick --payload "{\"n\": $i}"; done
 
 ```bash
 pher tap hive --since 15m &
-pher listen 'on hive.seal'              # every seal across your agents
+pher listen 'on hive.bee.archived'      # every bee your agents retire
 pher listen 'on hive.** meaning novel > 0.5 over 7d'   # only surprising agent behavior
 ```
 

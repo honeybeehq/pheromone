@@ -85,9 +85,14 @@ What works today:
   the tap edge and only transitions become events (`metric.condition.entered`
   / `.cleared`) — the raw firehose never hits the matcher or the log.
 - **Hive ledger tap** (`pher tap hive`) — the flagship: follows
-  `hive events --follow --json` and puts every ledger event on the trail as
-  `hive.<type>`, correlation mapped from session/bee fields. The ~160-type
-  stream with zero programmatic subscribers has its subscriber.
+  the Honeybee v2 ledger (`hive events --follow --json`) and puts every row on
+  the trail as `hive.<kind>` (`hive.bee.created`, `hive.question.asked`, …),
+  correlated by `beeId`. While the tap runs it tracks the last ledger `seq`, so
+  a hive or pherd outage delays rows instead of duplicating or dropping them;
+  rows `hive events` could not deliver (more than 1000 at once) are reported as
+  one `pher.tap.gap` event. Restarting the tap itself starts again from
+  `--since`. The ledger stream with zero programmatic subscribers has its
+  subscriber.
 - **Code-based subscribers** — `then stream` + the `@pheromone/client` Node SDK
   (`sdk/node`): `pher.on('on ci.* where …', handler)` registers a
   connection-scoped subscription; the daemon evaluates the full cascade and

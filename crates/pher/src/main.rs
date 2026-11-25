@@ -354,13 +354,13 @@ enum ConditionCmd {
 
 #[derive(Subcommand)]
 enum TapCmd {
-    /// Follow the Honeybee ledger and emit `hive.<type>` events
+    /// Follow the Honeybee v2 ledger (`hive events`) and emit `hive.<kind>` events
     Hive {
-        /// Backlog lookback for the first attach (e.g. 15m); default: live only
+        /// Backlog lookback for the first attach (e.g. 15m, at most the last 1000 ledger rows); default: live only
         #[arg(long, default_value = "1s")]
         since: String,
-        /// Ledger type prefixes to drop at the tap edge (repeatable),
-        /// e.g. --exclude state.verified for liveness-probe heartbeats
+        /// Ledger kind prefixes to drop at the tap edge (repeatable),
+        /// e.g. --exclude runtime.updated --exclude transcript_segment
         #[arg(long = "exclude")]
         excludes: Vec<String>,
     },

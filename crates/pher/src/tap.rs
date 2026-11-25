@@ -1,14 +1,5 @@
-//! Ecosystem taps. The flagship is the hive ledger tap: the Honeybee ledger
-//! stream (~160 well-namespaced event types, zero programmatic subscribers
-//! until now) piped onto the trail as `hive.<type>` events.
-//!
-//! Prototype note: this consumes `hive events --follow --json` (the CLI is the
-//! stable read surface and works even while the hive daemon is down) rather
-//! than importing the TS `followLedgerEvents` module; the TS-module tap
-//! arrives with the `@pheromone/client` SDK.
-
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
@@ -18,8 +9,6 @@ use crate::client::{self, Conn, Target};
 use crate::protocol::{PartialEvent, Request};
 use crate::store::Paths;
 
-/// How the tap reaches its trail: a persistent local socket, or per-event
-/// HTTP to a remote hub (leaf machines need no local daemon at all).
 enum Sender<'a> {
     Local(Conn),
     Remote(&'a Target),
@@ -32,27 +21,45 @@ impl Sender<'_> {
             Sender::Remote(target) => client::call_target(target, request),
         }
     }
+
+    fn emit_event(&mut self, subject: &str, payload: Value) -> anyhow::Result<()> {
+        self.emit(&Request::Emit {
+            event: PartialEvent {
+                subject: subject.to_string(),
+                payload: Some(payload),
+                event_type: None,
+                source: Some(TAP_SOURCE.to_string()),
+                correlation: None,
+            },
+        })
+        .map(|_| ())
+    }
 }
 
-/// Ledger fields that identify the acting session/bee, in preference order.
-/// The first one present becomes the envelope correlation, so threads join
-/// spawn → prompt → seal across the whole vocabulary.
-const CORRELATION_FIELDS: &[&str] = &["session", "bee", "name", "flight", "id"];
+const TAP_SOURCE: &str = "tap.hive";
+const HIVE_TAIL_MAX: usize = 1000;
 
-/// Reconnect bookkeeping: where the tap was in the ledger, and what it has
-/// already forwarded. `seen` dedups the resume overlap — re-emitting a
-/// ledger line would mint a fresh envelope id, so without this, retries
-/// would duplicate events on the trail.
 struct TapState {
-    /// Unix secs of the last forwarded ledger event.
-    last_ts: Option<u64>,
-    /// Recent raw ledger lines (the ledger is append-only; identical lines
-    /// mean the same event).
-    seen: std::collections::VecDeque<String>,
+    after_seq: Option<u64>,
+    lookback_floor_ms: u64,
     forwarded: u64,
 }
 
-const TAP_SEEN_WINDOW: usize = 1000;
+struct HiveEvents(Child);
+
+impl Drop for HiveEvents {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct LedgerRow {
+    seq: u64,
+    ts_ms: u64,
+    kind: String,
+    value: Value,
+}
 
 pub fn run_hive_tap(
     target: &Target,
@@ -60,38 +67,26 @@ pub fn run_hive_tap(
     since: &str,
     excludes: &[String],
 ) -> anyhow::Result<()> {
+    let lookback = humantime::parse_duration(since)
+        .with_context(|| format!("--since {since:?} is not a duration like 30s or 15m"))?;
     let mut tap = TapState {
-        last_ts: None,
-        seen: std::collections::VecDeque::new(),
+        after_seq: None,
+        lookback_floor_ms: now_ms().saturating_sub(lookback.as_millis() as u64),
         forwarded: 0,
     };
     if !excludes.is_empty() {
         eprintln!(
-            "pher tap hive: dropping ledger types: {}",
+            "pher tap hive: dropping ledger kinds: {}",
             excludes.join(", ")
         );
     }
-    let mut backlog_since = since.to_string();
     let mut delay = 2u64;
     loop {
-        let before = tap.forwarded;
-        match follow_once(target, paths, &backlog_since, excludes, &mut tap) {
-            Ok(()) => unreachable!("follow_once only returns by error"),
-            Err(e) => eprintln!("pher tap hive: {e:#}; retrying in {delay}s"),
-        }
-        // Resume from the last forwarded event (with a 2s overlap the seen-
-        // window dedups), so an outage delays ledger events instead of
-        // dropping them. Cap the re-read at a day.
-        backlog_since = match tap.last_ts {
-            Some(t) => {
-                let gap = (now_unix().saturating_sub(t) + 2).min(86_400);
-                format!("{gap}s")
-            }
-            None => backlog_since, // never connected: keep the requested lookback
-        };
+        let before = tap.after_seq;
+        let Err(e) = follow_once(target, paths, since, excludes, &mut tap);
+        eprintln!("pher tap hive: {e:#}; retrying in {delay}s");
         std::thread::sleep(Duration::from_secs(delay));
-        // Progress resets the backoff; persistent failure walks it to 30s.
-        delay = if tap.forwarded > before {
+        delay = if tap.after_seq > before {
             2
         } else {
             (delay * 2).min(30)
@@ -99,10 +94,10 @@ pub fn run_hive_tap(
     }
 }
 
-fn now_unix() -> u64 {
+fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -112,113 +107,155 @@ fn follow_once(
     since: &str,
     excludes: &[String],
     tap: &mut TapState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::convert::Infallible> {
     let mut conn = match target {
         Target::Local(_) => Sender::Local(Conn::connect(paths)?),
         remote => Sender::Remote(remote),
     };
-    let mut child = Command::new("hive")
-        .args(["events", "--follow", "--json", "--since", since])
-        .stdout(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .context("cannot spawn `hive events` (is the hive CLI installed?)")?;
-    let stdout = child.stdout.take().expect("stdout piped");
+    let mut child = HiveEvents(
+        Command::new("hive")
+            .args([
+                "events",
+                "--follow",
+                "--json",
+                "--tail",
+                &HIVE_TAIL_MAX.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .context("cannot spawn `hive events` (is the hive CLI installed?)")?,
+    );
+    let stdout = child.0.stdout.take().expect("stdout piped");
 
-    let announce = conn.emit(&Request::Emit {
-        event: PartialEvent {
-            subject: "pher.tap.up".to_string(),
-            payload: Some(json!({ "tap": "hive", "since": since })),
-            event_type: None,
-            source: Some("tap.hive".to_string()),
-            correlation: None,
-        },
-    });
-    if let Err(e) = announce {
-        let _ = child.kill();
-        return Err(e).context("cannot reach pherd");
+    conn.emit_event(
+        "pher.tap.up",
+        json!({ "tap": "hive", "since": since, "after_seq": tap.after_seq }),
+    )
+    .context("cannot reach pherd")?;
+    match tap.after_seq {
+        Some(seq) => eprintln!("pher tap hive: resuming the hive ledger after seq {seq}"),
+        None => eprintln!("pher tap hive: following the hive ledger (since {since})"),
     }
-    eprintln!("pher tap hive: following the hive ledger (since {since})");
 
+    let mut first_line = true;
     for line in BufReader::new(stdout).lines() {
         let line = line.context("hive events stream read failed")?;
-        let trimmed = line.trim().to_string();
-        let Some(event) = map_ledger_line(&trimmed) else {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        // Edge filtering: heartbeat-grade ledger types (e.g. state.verified
-        // liveness probes at hundreds/min) never reach the trail or its log.
-        let typ = event
-            .subject
-            .strip_prefix("hive.")
-            .unwrap_or(&event.subject);
-        if excludes.iter().any(|x| typ.starts_with(x.as_str())) {
-            if let Some(ts) = ledger_ts(&trimmed) {
-                tap.last_ts = Some(ts); // resume position still advances
-            }
-            continue;
+        let rows = match value.get("rows").and_then(|r| r.as_array()) {
+            Some(batch) if first_line => batch.iter().filter_map(parse_row).collect(),
+            _ => parse_row(&value).into_iter().collect::<Vec<_>>(),
+        };
+        if first_line {
+            first_line = false;
+            detect_ledger_reset(tap, &rows);
         }
-        if tap.seen.contains(&trimmed) {
-            continue; // resume overlap: already forwarded before the retry
+        for row in rows {
+            forward_row(&mut conn, tap, excludes, row)?;
         }
-        if let Err(e) = conn.emit(&Request::Emit { event }) {
-            let _ = child.kill();
-            return Err(e).context("emit to pherd failed");
-        }
-        tap.seen.push_back(trimmed.clone());
-        while tap.seen.len() > TAP_SEEN_WINDOW {
-            tap.seen.pop_front();
-        }
-        if let Some(ts) = ledger_ts(&trimmed) {
-            tap.last_ts = Some(ts);
-        }
+    }
+    bail!("`hive events --follow` exited")
+}
+
+fn detect_ledger_reset(tap: &mut TapState, rows: &[LedgerRow]) {
+    let Some(after) = tap.after_seq else {
+        return;
+    };
+    let newest = rows.last().map(|row| row.seq);
+    if newest.is_none_or(|seq| seq < after) {
+        eprintln!(
+            "pher tap hive: the hive ledger restarted below seq {after} (newest is {newest:?}); following it from the start"
+        );
+        tap.after_seq = None;
+    }
+}
+
+fn report_gap(conn: &mut Sender, tap: &mut TapState, next_seq: u64) -> anyhow::Result<()> {
+    let Some(after) = tap.after_seq else {
+        return Ok(());
+    };
+    if next_seq <= after + 1 {
+        return Ok(());
+    }
+    let (from_seq, to_seq) = (after + 1, next_seq - 1);
+    let missed = to_seq - from_seq + 1;
+    eprintln!(
+        "pher tap hive: {missed} ledger rows (seq {from_seq}..={to_seq}) were not delivered by `hive events` (more than {HIVE_TAIL_MAX} rows arrived at once)"
+    );
+    conn.emit_event(
+        "pher.tap.gap",
+        json!({ "tap": "hive", "from_seq": from_seq, "to_seq": to_seq, "missed": missed }),
+    )
+    .context("emit to pherd failed")?;
+    tap.after_seq = Some(to_seq);
+    Ok(())
+}
+
+fn forward_row(
+    conn: &mut Sender,
+    tap: &mut TapState,
+    excludes: &[String],
+    row: LedgerRow,
+) -> anyhow::Result<()> {
+    if tap.after_seq.is_some_and(|after| row.seq <= after) {
+        return Ok(());
+    }
+    report_gap(conn, tap, row.seq)?;
+    let wanted = row.ts_ms >= tap.lookback_floor_ms
+        && !excludes.iter().any(|x| row.kind.starts_with(x.as_str()));
+    if wanted {
+        conn.emit(&Request::Emit {
+            event: map_row(row.value),
+        })
+        .context("emit to pherd failed")?;
         tap.forwarded += 1;
         if tap.forwarded.is_multiple_of(500) {
             eprintln!("pher tap hive: {} events forwarded", tap.forwarded);
         }
     }
-    let _ = child.wait();
-    bail!("`hive events --follow` exited")
+    tap.after_seq = Some(row.seq);
+    Ok(())
 }
 
-/// Unix secs of a ledger line's `ts` field (RFC3339), if parseable.
-fn ledger_ts(line: &str) -> Option<u64> {
-    let v: Value = serde_json::from_str(line).ok()?;
-    let ts = v.get("ts")?.as_str()?;
-    humantime::parse_rfc3339_weak(ts)
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-}
-
-/// Map one ledger JSON line to a trail event. Returns None for unparseable
-/// lines (the ledger is append-only JSONL; torn lines happen at rotation).
-fn map_ledger_line(line: &str) -> Option<PartialEvent> {
-    let v: Value = serde_json::from_str(line.trim()).ok()?;
-    let obj = v.as_object()?;
-    let typ = obj
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("unknown");
-    let subject = format!("hive.{}", sanitize_subject(typ));
-    let correlation = CORRELATION_FIELDS
-        .iter()
-        .find_map(|k| obj.get(*k).and_then(|x| x.as_str()))
-        .map(|s| s.to_string());
-    Some(PartialEvent {
-        event_type: Some(subject.clone()),
-        subject,
-        payload: Some(v),
-        source: Some("tap.hive".to_string()),
-        correlation,
+fn parse_row(value: &Value) -> Option<LedgerRow> {
+    let obj = value.as_object()?;
+    let seq = obj.get("seq")?.as_u64()?;
+    let ts_ms = obj.get("ts")?.as_u64()?;
+    let kind = obj.get("kind")?.as_str()?.to_string();
+    let mut row = obj.clone();
+    row.remove("daemonTarget");
+    Some(LedgerRow {
+        seq,
+        ts_ms,
+        kind,
+        value: Value::Object(row),
     })
 }
 
-/// Ledger types are dotted already (`session.save`, `spawn.timing`); replace
-/// anything outside the subject-token alphabet so exotic types can't break
-/// subject parsing.
-fn sanitize_subject(typ: &str) -> String {
-    typ.split('.')
+fn map_row(row: Value) -> PartialEvent {
+    let kind = row
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("unknown");
+    let subject = format!("hive.{}", sanitize_subject(kind));
+    let correlation = row
+        .get("beeId")
+        .and_then(|b| b.as_str())
+        .or_else(|| row.get("payload")?.get("beeId")?.as_str())
+        .map(str::to_string);
+    PartialEvent {
+        event_type: Some(subject.clone()),
+        subject,
+        payload: Some(row),
+        source: Some(TAP_SOURCE.to_string()),
+        correlation,
+    }
+}
+
+fn sanitize_subject(kind: &str) -> String {
+    kind.split('.')
         .map(|tok| {
             let cleaned: String = tok
                 .chars()
@@ -245,19 +282,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_ledger_lines() {
-        let e = map_ledger_line(
-            r#"{"ts":"2026-08-09T08:15:23.993Z","type":"session.save","name":"CO.0af3","status":"running","session":"CO.0af3"}"#,
-        )
-        .unwrap();
-        assert_eq!(e.subject, "hive.session.save");
-        assert_eq!(e.correlation.as_deref(), Some("CO.0af3"));
+    fn maps_v2_ledger_rows() {
+        let line = r#"{"seq":2771725,"ts":1795592324497,"kind":"runtime.updated","beeId":"e0115ec9","payload":{"runtime":{"state":"running"}},"daemonTarget":{"kind":"local"}}"#;
+        let row = parse_row(&serde_json::from_str(line).unwrap()).unwrap();
+        assert_eq!(row.seq, 2771725);
+        assert_eq!(row.ts_ms, 1795592324497);
+        let e = map_row(row.value);
+        assert_eq!(e.subject, "hive.runtime.updated");
+        assert_eq!(e.correlation.as_deref(), Some("e0115ec9"));
         assert_eq!(e.source.as_deref(), Some("tap.hive"));
+        let payload = e.payload.unwrap();
+        assert!(payload.get("daemonTarget").is_none());
+        assert_eq!(payload["payload"]["runtime"]["state"], "running");
 
-        assert!(map_ledger_line("not json").is_none());
-        assert!(map_ledger_line("").is_none());
+        let nested =
+            r#"{"seq":1,"ts":1,"kind":"account_limits.put","beeId":null,"payload":{"beeId":"b1"}}"#;
+        let row = parse_row(&serde_json::from_str(nested).unwrap()).unwrap();
+        assert_eq!(map_row(row.value).correlation.as_deref(), Some("b1"));
 
-        let e = map_ledger_line(r#"{"type":"weird$type.x!","ts":"t"}"#).unwrap();
-        assert_eq!(e.subject, "hive.weird-type.x-");
+        let batch = r#"{"rows":[],"daemonTarget":{}}"#;
+        assert!(parse_row(&serde_json::from_str(batch).unwrap()).is_none());
+        let v1 = r#"{"ts":"2026-08-09T08:15:23.993Z","type":"session.save"}"#;
+        assert!(parse_row(&serde_json::from_str(v1).unwrap()).is_none());
+
+        assert_eq!(sanitize_subject("weird$kind.x!"), "weird-kind.x-");
     }
 }
