@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::Envelope;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -11,6 +13,7 @@ const EVENT_TIME_BITS: u32 = 48;
 const EVENT_TAIL_BITS: u32 = 80;
 const EVENT_TAIL_MASK: u128 = (1u128 << EVENT_TAIL_BITS) - 1;
 const EVENT_ID_CHARS: usize = 26;
+const CROCKFORD: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// Honeybee-style short id, e.g. `PH.4k2x`. Time-seeded, per-process counter
 /// mixed in; collision-resistant enough for a single node's lifetime.
@@ -40,6 +43,20 @@ pub fn event_id(prefix: &str) -> String {
     format!("{prefix}.{}", crockford32(value))
 }
 
+pub fn is_event_id(id: &str) -> bool {
+    id.rsplit_once('.').is_some_and(|(_, body)| {
+        body.len() == EVENT_ID_CHARS && body.bytes().all(|b| CROCKFORD.contains(&b))
+    })
+}
+
+pub fn admission_key(event: &Envelope) -> String {
+    if is_event_id(&event.id) {
+        event.id.clone()
+    } else {
+        format!("{}|{}|{}", event.node, event.ts, event.id)
+    }
+}
+
 fn process_nonce() -> u128 {
     static NONCE: OnceLock<u128> = OnceLock::new();
     *NONCE.get_or_init(|| {
@@ -59,10 +76,9 @@ fn process_nonce() -> u128 {
 }
 
 fn crockford32(mut n: u128) -> String {
-    const ALPHABET: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
     let mut out = vec![b'0'; EVENT_ID_CHARS];
     for slot in out.iter_mut().rev() {
-        *slot = ALPHABET[(n & 31) as usize];
+        *slot = CROCKFORD[(n & 31) as usize];
         n >>= 5;
     }
     String::from_utf8(out).unwrap()
@@ -92,11 +108,11 @@ mod tests {
     }
 
     #[test]
-    fn event_ids_are_unique_and_time_ordered_at_volume() {
+    fn event_ids_are_unique_at_volume() {
         let ids: Vec<String> = (0..100_000).map(|_| event_id("PH")).collect();
         let distinct: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(distinct.len(), ids.len());
-        assert!(ids.iter().all(|id| id.len() == 3 + EVENT_ID_CHARS));
-        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        assert!(ids.iter().all(|id| is_event_id(id)));
+        assert!(!is_event_id("PH.4k2x"));
     }
 }

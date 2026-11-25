@@ -73,7 +73,7 @@ velocity-to-v1 ever trumps differentiation, Go + embedded NATS is the coherent p
 | Event bodies | `TrailLog` trait: SQLite locally; **Comb Log** (object storage, S3/MinIO) for hub/cloud | Local: SQLite, µs acks. Cloud: Comb Log (honeybee/comb spec §8) — stateless pherds, object store the only durable state, epoch-fenced leader, compaction, opt-in partitions. Pheromone's side of the boundary: [SCALE.md](SCALE.md) |
 | Embeddings | Local ONNX, bge-small class (384-dim), ort/fastembed-rs | ~30–80MB quantized, CPU ms-scale. One embed per event, shared across subscriptions. Provider API (Voyage/OpenAI) optional config — must work offline on a laptop |
 | Judge | claude-haiku-class, batched, prompt-cached | Stable question prefix → cached; pluggable provider interface, one great default; hard budgets, fail-closed |
-| IDs | Honeybee-style short ids (`PH.4k2`) | House style |
+| IDs | Subscriptions: Honeybee-style short ids (`PH.4k2`). Events: ULID-style `PH.<26 Crockford base32>` (48-bit ms + 80-bit per-process random nonce and counter) | Short ids are house style for things people type; event ids are the cross-node dedup key and must be globally unique. Legacy short event ids are deduped by (node, ts, id) |
 | Request plane | HTTP/JSON on unix socket local; tailnet TCP remote | Kit-style identity: machine tokens → `tailscale whois` → local ambient |
 | Event plane | WebSocket push, cursor resume | Comb protocol generalized: monotonic `sequence`, `after`/`nextAfter`/`hasMore` per consumer. Reconnect = resume from offset (HSR re-adoption mechanics) |
 | Cross-node | Filter-at-source, ship matches only | Subscriptions registered anywhere, pushed to origin nodes; tiers 3–4 run where budget/CPU lives. Hub-and-leaf, not full mesh |

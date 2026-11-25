@@ -51,7 +51,9 @@ Orientation for agents working in this repo.
 
 - Follow ecosystem house style: CLI-first, `--json` on every read command, daemonized via
   launchd/systemd like `pol daemon`, state under `~/.pheromone/`.
-- IDs are Honeybee-style short ids (`PH.4k2`).
+- Subscription ids are Honeybee-style short ids (`PH.4k2`). Event ids are globally unique ULID-style
+  ids (`PH.01jdq3v8k2x9m4n7p0r5s6t8wz`) from `pher_core::ids::event_id`; dedup keys come from
+  `ids::admission_key`.
 - Always typecheck/lint/build; high test coverage on logic. The matcher gets a golden test
   corpus and (eventually) fuzzing — it is the crown jewel.
 - Use `trash` or POSIX equivalent for deleting.
