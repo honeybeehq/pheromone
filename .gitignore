@@ -3,3 +3,4 @@
 .DS_Store
 *.node
 crates/pher-wasm/pkg/
+crates/pher-wasm/node_modules/
