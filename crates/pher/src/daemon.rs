@@ -728,7 +728,7 @@ impl State {
             ));
         }
         let event = Envelope {
-            id: ids::short_id("PH"),
+            id: ids::event_id("PH"),
             ts: now_ts(),
             node: self.node.clone(),
             source: partial.source.unwrap_or_else(|| "cli".to_string()),
