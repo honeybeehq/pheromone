@@ -174,6 +174,8 @@ pub(crate) struct State {
     fail_persist_on_nth: Option<u32>,
     #[cfg(test)]
     persist_call_n: u32,
+    #[cfg(test)]
+    forced_sub_ids: std::collections::VecDeque<String>,
 }
 
 /// Evaporation bound for the forwarded-delivery dedup window.
@@ -497,6 +499,8 @@ impl State {
             fail_persist_on_nth: None,
             #[cfg(test)]
             persist_call_n: 0,
+            #[cfg(test)]
+            forced_sub_ids: std::collections::VecDeque::new(),
         };
         let has_judge_subs = state
             .matcher
@@ -530,6 +534,42 @@ impl State {
     fn persist_subs(&self) -> anyhow::Result<()> {
         let list: Vec<&SubMeta> = self.metas.values().collect();
         write_json_atomic(&self.paths.subs(), &serde_json::to_value(list)?)
+    }
+
+    fn unused_sub_id(&mut self) -> Result<String, String> {
+        #[cfg(test)]
+        let forced = &mut self.forced_sub_ids;
+        #[cfg(test)]
+        let mut mint = || forced.pop_front().unwrap_or_else(|| ids::short_id("PH"));
+        #[cfg(not(test))]
+        let mint = || ids::short_id("PH");
+        let held_in_memory = |id: &str| {
+            let key_prefix = format!("{id}:");
+            self.metas.contains_key(id)
+                || self.pending.contains_key(id)
+                || self.listeners.contains_key(id)
+                || self.judge_budgets.contains_key(id)
+                || self.applied_seqs.contains_key(id)
+                || self.timers.iter().any(|t| t.sub_id == id)
+                || self
+                    .verdict_cache
+                    .keys()
+                    .any(|k| k.starts_with(&key_prefix))
+        };
+        let db = &self.db;
+        ids::first_unused(mint, |id| {
+            if held_in_memory(id) {
+                return Ok(true);
+            }
+            db.sub_id_has_history(id)
+        })
+        .map_err(|e| format!("cannot mint a subscription id: {e:#}"))?
+        .ok_or_else(|| {
+            format!(
+                "cannot mint a free subscription id after {} attempts",
+                ids::SHORT_ID_ATTEMPTS
+            )
+        })
     }
 
     fn persist_timers(&mut self) -> anyhow::Result<()> {
@@ -667,7 +707,7 @@ impl State {
             }
         }
 
-        let id = ids::short_id("PH");
+        let id = self.unused_sub_id()?;
         if let Some(meaning) = &sub.meaning {
             self.semantic
                 .on_register(&id, meaning)
@@ -3623,6 +3663,60 @@ mod follower_tests {
             .register_listener("on a.b then stream while CL.live alive", &[], "CL.live")
             .unwrap();
         assert!(s.metas.contains_key(ack["id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn colliding_subscription_ids_never_overwrite() {
+        let paths = fresh_home("sub-collide");
+        let mut s = State::load(paths.clone()).unwrap();
+        s.forced_sub_ids = [
+            "PH.aaaa", "PH.aaaa", "PH.bbbb", "PH.aaaa", "PH.bbbb", "PH.cccc",
+        ]
+        .map(String::from)
+        .into();
+        let first = s.register("on a.b then emit c.d", &[], None).unwrap();
+        let second = s.register("on x.y then emit z.w", &[], None).unwrap();
+        assert_eq!(first["id"], "PH.aaaa");
+        assert_eq!(second["id"], "PH.bbbb");
+        assert_eq!(s.metas.len(), 2);
+        assert!(s.metas["PH.aaaa"].string.contains("a.b"));
+        assert!(s.metas["PH.bbbb"].string.contains("x.y"));
+
+        s.ingest(partial("x.y"), 0).unwrap();
+        s.drain();
+        assert!(s.remove_sub("PH.bbbb", "test"));
+        let third = s.register("on q.r then emit s.t", &[], None).unwrap();
+        assert_eq!(
+            third["id"], "PH.cccc",
+            "a removed id with delivery history is not reused"
+        );
+
+        let reloaded = State::load(paths).unwrap();
+        let mut ids: Vec<&String> = reloaded.metas.keys().collect();
+        ids.sort();
+        assert_eq!(ids, ["PH.aaaa", "PH.cccc"]);
+
+        let mut s = reloaded;
+        s.verdict_cache.insert(
+            "PH.dddd:fingerprint".to_string(),
+            crate::judge::Verdict {
+                verdict: true,
+                rationale: "old subscription".to_string(),
+            },
+        );
+        s.forced_sub_ids = ["PH.dddd", "PH.eeee"].map(String::from).into();
+        let fourth = s.register("on k.l then emit k.m", &[], None).unwrap();
+        assert_eq!(
+            fourth["id"], "PH.eeee",
+            "an id with cached verdicts is not reused"
+        );
+
+        s.forced_sub_ids =
+            std::iter::repeat_n("PH.aaaa".to_string(), ids::SHORT_ID_ATTEMPTS).collect();
+        let exhausted = s.register("on m.n then emit o.p", &[], None).unwrap_err();
+        assert!(exhausted.contains("cannot mint"), "{exhausted}");
+        assert_eq!(s.metas.len(), 3);
+        assert!(s.metas["PH.aaaa"].string.contains("a.b"));
     }
 
     #[test]

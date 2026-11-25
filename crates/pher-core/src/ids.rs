@@ -31,6 +31,21 @@ pub fn short_id(prefix: &str) -> String {
     format!("{prefix}.{}", base36(x % 36u64.pow(4), 4))
 }
 
+pub const SHORT_ID_ATTEMPTS: usize = 64;
+
+pub fn first_unused<E>(
+    mut mint: impl FnMut() -> String,
+    mut taken: impl FnMut(&str) -> Result<bool, E>,
+) -> Result<Option<String>, E> {
+    for _ in 0..SHORT_ID_ATTEMPTS {
+        let id = mint();
+        if !taken(&id)? {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 pub fn event_id(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -242,6 +242,23 @@ impl Db {
             .collect()
     }
 
+    pub fn sub_id_has_history(&self, sub_id: &str) -> anyhow::Result<bool> {
+        let low = format!("{sub_id}:");
+        let high = format!("{sub_id};");
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM deliveries WHERE delivery_id >= ?1 AND delivery_id < ?2
+                 UNION ALL
+                 SELECT 1 FROM verdicts WHERE key >= ?1 AND key < ?2
+                 LIMIT 1",
+                params![low, high],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     // -- verdicts ------------------------------------------------------------
 
     pub fn append_verdict(&self, key: &str, ts: u64, record: &Value) -> anyhow::Result<()> {
